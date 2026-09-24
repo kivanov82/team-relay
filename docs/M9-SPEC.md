@@ -76,3 +76,34 @@ delete with credential revocation and batched removal, resume), login flow creat
 Plugin/console: proxy routes and team parameter validation, switcher, create form, admin page,
 not-on-team create; e2e: a new account creates a team, invites a member, both sign in and
 exchange a question; an admin deletes the team and both are refused.
+
+## 7. Corrections
+
+### 24 Sep 2026: after the M9 security review
+
+1. **A file team never adopts a created team.** At startup, a config team id that has a
+   created-team record (active or deleted, `seed=False`) is a startup error naming the id;
+   the "mark as seed" path is removed from both stores. Before creating a team the relay also
+   checks that nothing is left under that id (no documents at all), else `409 team_exists`.
+2. **Invitations, not silent membership.** A member an owner adds (any team, seed or created)
+   is `invited` until they accept. Invited entries grant nothing: not listed as a team in
+   `/v1/me/teams` (listed under `invitations: [{team, name, invited_by_member}]` instead), no
+   access to any team route, cannot sign in to that team. They accept (or decline) in the
+   login chooser ("<name> — invited by <member>: Accept / Decline") or in the console
+   (`POST /v1/me/invitations/{team}` `{"accept": true|false}`, Google identity or the delegate
+   on their behalf). Declining removes the entry. Seed members from the file are `active`
+   from the start. Existing roster entries are `active` (migration). Team names equal
+   (case-insensitively, after whitespace folding) to a config team's name are refused.
+3. The `"*"` delegate answers `404` both for a missing team and for a team the email is not on.
+4. `team_exists` and `team_id_reserved` become one answer (`409 team_id_unavailable`), and every
+   refused create counts against a per-account quota of 30 attempts per hour.
+5. The admin audit records `via` (direct or delegate) on every entry and also records refused
+   admin actions.
+6. **Limits through the console:** the console server forwards `X-Relay-Client-IP-Hash`
+   (sha256 of the IAP-reported client address with a per-deployment salt); the relay applies
+   the per-IP creation limit to it for delegate calls, and a per-delegate cap of 60 creations
+   per hour. The per-account limits key on the Google `sub` as well as the email hash.
+7. **Owners can delete a team they own** (not a config team): `DELETE /v1/teams/{team}` with
+   `{"confirm": "<id>"}`, same removal as the admin delete; frees the creator's slot.
+8. **Admin deletes through the delegate** are capped at 5 per hour.
+9. Authenticated non-members are rate limited per principal before the membership check.
