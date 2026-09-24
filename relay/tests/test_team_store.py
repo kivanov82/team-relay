@@ -372,7 +372,7 @@ async def test_delete_marks_the_team_frees_the_slot_and_audits(store: Store):
     assert record.purge_complete is False
     account = await store.get_account(email_hash(email))
     assert account.created == [] and account.memberships == {team: "owner1"}
-    admin = [e.action for e in await store.list_admin_audit(100000) if e.team == team]
+    admin = sorted(e.action for e in await store.list_admin_audit(100000) if e.team == team)
     assert admin == ["team.create", "team.delete"]
     # Again: the function sees the deleted record; the slot is not freed twice.
     assert await store.delete_team(team, deleting()) == "already"

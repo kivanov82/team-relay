@@ -54,6 +54,8 @@ LOGIN_LIMITS = {
     "login_starts_per_minute": 10000,
     "login_pages_per_minute": 10000,
     "login_tokens_per_minute": 10000,
+    # M9-SPEC §2: team creations per client IP are counted relay-wide too.
+    "team_creations_per_ip_per_hour": 10000,
 }
 
 # Each member also has a Google principal: the email a delegate names in
@@ -62,10 +64,17 @@ EMAILS = {m: f"{m}@example.com" for m in TOKENS}
 
 # The read-only delegates (M3-SPEC §2), one per team. Their principals are Google service
 # accounts, which the static verifier cannot produce, so the test apps use DelegateVerifier.
-DELEGATE_TOKENS = {"demo": "dev-token-console-demo-0005", "other": "dev-token-console-other-0006"}
+# "any" is the multi-team console's delegate (M9-SPEC §5, ``team: "*"``), configured only by
+# the tests that use it.
+DELEGATE_TOKENS = {
+    "demo": "dev-token-console-demo-0005",
+    "other": "dev-token-console-other-0006",
+    "any": "dev-token-console-any-0007",
+}
 DELEGATES = {
     "demo": "google:console-demo@example-project.iam.gserviceaccount.com",
     "other": "google:console-other@example-project.iam.gserviceaccount.com",
+    "any": "google:console-any@example-project.iam.gserviceaccount.com",
 }
 
 

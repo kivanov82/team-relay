@@ -208,6 +208,7 @@ class Teams:
                 if team in self._seeded_records:
                     continue
                 spec = self._config.teams[team]
+                await self._roster.ensure_seeded(team)  # so the counts are the seeded roster's
                 record = await self._store.ensure_seed_team(team, spec.display_name, self._now())
                 if record.status == TEAM_DELETED:
                     log_event("seed_team_deleted", severity="ERROR", team=team)
@@ -430,11 +431,11 @@ class Teams:
                 body.id, creator, fn, self._quotas(email, ip_hash, now)
             )
         except QuotaExceeded as exc:
-            per = "day" if ".account." in exc.quota.key else "hour from this address"
+            per = "a day" if ".account." in exc.quota.key else "an hour from this address"
             raise ApiError(
                 429,
                 "rate_limited",
-                f"At most {exc.quota.limit} new teams a {per}; try again later.",
+                f"At most {exc.quota.limit} new teams {per}; try again later.",
             ) from None
         self._roster.invalidate(body.id)
         self._remember_name(body.id, body.name)
