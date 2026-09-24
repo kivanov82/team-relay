@@ -221,7 +221,7 @@ fi
 TTLS="$(gcloud firestore fields ttls list --database="$DATABASE" --project="$PROJECT" \
   --format='csv[no-heading](name,ttlConfig.state)' 2>/dev/null || true)"
 for group in messages requests progress idempotency audit counters credentials logins \
-    login_codes login_limits retired; do
+    login_codes login_limits retired credential_teams admin_audit; do
   state="$(grep "/collectionGroups/${group}/fields/expire_at," <<<"$TTLS" | cut -d, -f2 || true)"
   if [[ "$state" == "ACTIVE" || "$state" == "CREATING" ]]; then
     echo "   ttl ${group}.expire_at: exists (${state})"

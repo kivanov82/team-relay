@@ -16,8 +16,13 @@
 #                            /team-relay:login, or sends a Google-signed ID token
 #   token:sha256:<hex>       a static bearer token, stored only as its SHA-256; local
 #                            development only, refused when the relay runs on Cloud Run
+# Relay admins (M9-SPEC §4): may list and delete any team; no access to any team's data.
+admins:
+  - "google:alice@example.com"
+
 teams:
   - id: demo
+    name: "Demo team"
     members:
       - id: alice
         role: owner
@@ -35,5 +40,12 @@ teams:
 # (M6-SPEC §3).
 # delegates:
 #   - principal: "google:team-relay-console@<project>.iam.gserviceaccount.com"
-#     team: demo
-#     scope: [read, manage-roster]
+#     team: "*"
+#     scope: [read, manage-roster, manage-teams]
+
+# Limits for teams created by signed-in accounts (M9-SPEC §2); these are the defaults.
+# limits:
+#   teams_per_account: 3
+#   members_per_team: 50
+#   team_creations_per_account_per_day: 10
+#   team_creations_per_ip_per_hour: 30
