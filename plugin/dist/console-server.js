@@ -603,8 +603,8 @@ var require_Node = __commonJS({
         };
         const res = toJS.toJS(this, "", ctx);
         if (typeof onAnchor === "function")
-          for (const { count, res: res2 } of ctx.anchors.values())
-            onAnchor(res2, count);
+          for (const { count: count2, res: res2 } of ctx.anchors.values())
+            onAnchor(res2, count2);
         return typeof reviver === "function" ? applyReviver.applyReviver(reviver, { "": res }, "", res) : res;
       }
     };
@@ -712,13 +712,13 @@ var require_Alias = __commonJS({
         const anchor = anchors2 && source && anchors2.get(source);
         return anchor ? anchor.count * anchor.aliasCount : 0;
       } else if (identity.isCollection(node)) {
-        let count = 0;
+        let count2 = 0;
         for (const item of node.items) {
           const c = getAliasCount(doc, item, anchors2);
-          if (c > count)
-            count = c;
+          if (c > count2)
+            count2 = c;
         }
-        return count;
+        return count2;
       } else if (identity.isPair(node)) {
         const kc = getAliasCount(doc, node.key, anchors2);
         const vc = getAliasCount(doc, node.value, anchors2);
@@ -3671,8 +3671,8 @@ var require_Document = __commonJS({
         };
         const res = toJS.toJS(this.contents, jsonArg ?? "", ctx);
         if (typeof onAnchor === "function")
-          for (const { count, res: res2 } of ctx.anchors.values())
-            onAnchor(res2, count);
+          for (const { count: count2, res: res2 } of ctx.anchors.values())
+            onAnchor(res2, count2);
         return typeof reviver === "function" ? applyReviver.applyReviver(reviver, { "": res }, "", res) : res;
       }
       /**
@@ -3749,12 +3749,12 @@ var require_errors = __commonJS({
         lineStr = prev + lineStr;
       }
       if (/[^ ]/.test(lineStr)) {
-        let count = 1;
+        let count2 = 1;
         const end = error.linePos[1];
         if (end?.line === line && end.col > col) {
-          count = Math.max(1, Math.min(end.col - col, 80 - ci));
+          count2 = Math.max(1, Math.min(end.col - col, 80 - ci));
         }
-        const pointer = " ".repeat(ci) + "^".repeat(count);
+        const pointer = " ".repeat(ci) + "^".repeat(count2);
         error.message += `:
 
 ${lineStr}
@@ -9552,20 +9552,20 @@ var require_resolve = __commonJS({
       return false;
     }
     function countKeys(schema) {
-      let count = 0;
+      let count2 = 0;
       for (const key in schema) {
         if (key === "$ref")
           return Infinity;
-        count++;
+        count2++;
         if (SIMPLE_INLINED.has(key))
           continue;
         if (typeof schema[key] == "object") {
-          (0, util_1.eachItem)(schema[key], (sch) => count += countKeys(sch));
+          (0, util_1.eachItem)(schema[key], (sch) => count2 += countKeys(sch));
         }
-        if (count === Infinity)
+        if (count2 === Infinity)
           return Infinity;
       }
-      return count;
+      return count2;
     }
     function getFullPath(resolver, id = "", normalize) {
       if (normalize !== false)
@@ -10672,8 +10672,8 @@ var require_utils = __commonJS({
     var HOST_DELIMS = { "@": "%40", "/": "%2F", "?": "%3F", "#": "%23", ":": "%3A" };
     var HOST_DELIM_RE = /[@/?#:]/g;
     var HOST_DELIM_NO_COLON_RE = /[@/?#]/g;
-    function reescapeHostDelimiters(host, isIP) {
-      const re = isIP ? HOST_DELIM_NO_COLON_RE : HOST_DELIM_RE;
+    function reescapeHostDelimiters(host, isIP2) {
+      const re = isIP2 ? HOST_DELIM_NO_COLON_RE : HOST_DELIM_RE;
       re.lastIndex = 0;
       return host.replace(re, (ch) => HOST_DELIMS[ch]);
     }
@@ -11362,8 +11362,8 @@ var require_fast_uri = __commonJS({
       const host = matches[4];
       return hasMalformedPercentEncoding(matches[3]) || host !== void 0 && !isIPLiteral(host) && hasMalformedPercentEncoding(host) || hasMalformedPercentEncoding(matches[6]) || hasMalformedPercentEncoding(matches[7]) || hasMalformedPercentEncoding(matches[8]);
     }
-    function canonicalizeHost(parsed, options, schemeHandler, isIP) {
-      if (!options.unicodeSupport && (!schemeHandler || !schemeHandler.unicodeSupport) && parsed.host && !isIPLiteral(parsed.host) && (options.domainHost || schemeHandler && schemeHandler.domainHost) && isIP === false && nonSimpleDomain(parsed.host)) {
+    function canonicalizeHost(parsed, options, schemeHandler, isIP2) {
+      if (!options.unicodeSupport && (!schemeHandler || !schemeHandler.unicodeSupport) && parsed.host && !isIPLiteral(parsed.host) && (options.domainHost || schemeHandler && schemeHandler.domainHost) && isIP2 === false && nonSimpleDomain(parsed.host)) {
         try {
           parsed.host = new URL("http://" + parsed.host).hostname;
         } catch (e) {
@@ -11390,7 +11390,7 @@ var require_fast_uri = __commonJS({
       let malformedHost = false;
       let malformedIPLiteral = false;
       let malformedScheme = false;
-      let isIP = false;
+      let isIP2 = false;
       if (options.reference === "suffix") {
         if (options.scheme) {
           uri = options.scheme + ":" + uri;
@@ -11453,15 +11453,15 @@ var require_fast_uri = __commonJS({
             const bracketedIPLiteral = isIPLiteral(parsed.host);
             const hasIPLiteralBracket = parsed.host.indexOf("[") !== -1 || parsed.host.indexOf("]") !== -1;
             const ipv6result = normalizeIPv6(parsed.host);
-            isIP = ipv6result.isIPV6 || ipv6result.isIPVFuture === true;
+            isIP2 = ipv6result.isIPV6 || ipv6result.isIPVFuture === true;
             malformedIPLiteral = hasIPLiteralBracket && (!bracketedIPLiteral || ipv6result.error === true);
-            parsed.host = isIP ? ipv6result.host : ipv6result.host.toLowerCase();
+            parsed.host = isIP2 ? ipv6result.host : ipv6result.host.toLowerCase();
             if (malformedIPLiteral) {
               parsed.error = parsed.error || "URI host is malformed.";
               malformedAuthorityOrPort = true;
             }
           } else {
-            isIP = true;
+            isIP2 = true;
           }
         }
         if (parsed.scheme === void 0 && parsed.userinfo === void 0 && parsed.host === void 0 && parsed.port === void 0 && parsed.query === void 0 && !parsed.path) {
@@ -11478,14 +11478,14 @@ var require_fast_uri = __commonJS({
         }
         const schemeHandler = getSchemeHandler(options.scheme || parsed.scheme);
         if (!malformedIPLiteral) {
-          malformedHost = canonicalizeHost(parsed, options, schemeHandler, isIP);
+          malformedHost = canonicalizeHost(parsed, options, schemeHandler, isIP2);
         }
         if (uri.indexOf("%") !== -1 && parsed.host !== void 0 && !malformedIPLiteral) {
-          let host = isIP ? parsed.host : normalizePercentEncoding(parsed.host, true);
-          if (!isIP) {
+          let host = isIP2 ? parsed.host : normalizePercentEncoding(parsed.host, true);
+          if (!isIP2) {
             host = normalizePercentEncoding(host.toLowerCase());
           }
-          parsed.host = reescapeHostDelimiters(host, isIP);
+          parsed.host = reescapeHostDelimiters(host, isIP2);
         }
         if (!schemeHandler || schemeHandler && !schemeHandler.skipNormalize) {
           if (parsed.path) {
@@ -13047,8 +13047,8 @@ var require_contains = __commonJS({
         cxt.result(valid, () => cxt.reset());
         function validateItemsWithCount() {
           const schValid = gen.name("_valid");
-          const count = gen.let("count", 0);
-          validateItems(schValid, () => gen.if(schValid, () => checkLimits(count)));
+          const count2 = gen.let("count", 0);
+          validateItems(schValid, () => gen.if(schValid, () => checkLimits(count2)));
         }
         function validateItems(_valid, block) {
           gen.forRange("i", 0, len, (i) => {
@@ -13061,16 +13061,16 @@ var require_contains = __commonJS({
             block();
           });
         }
-        function checkLimits(count) {
-          gen.code((0, codegen_1._)`${count}++`);
+        function checkLimits(count2) {
+          gen.code((0, codegen_1._)`${count2}++`);
           if (max === void 0) {
-            gen.if((0, codegen_1._)`${count} >= ${min}`, () => gen.assign(valid, true).break());
+            gen.if((0, codegen_1._)`${count2} >= ${min}`, () => gen.assign(valid, true).break());
           } else {
-            gen.if((0, codegen_1._)`${count} > ${max}`, () => gen.assign(valid, false).break());
+            gen.if((0, codegen_1._)`${count2} > ${max}`, () => gen.assign(valid, false).break());
             if (min === 1)
               gen.assign(valid, true);
             else
-              gen.if((0, codegen_1._)`${count} >= ${min}`, () => gen.assign(valid, true));
+              gen.if((0, codegen_1._)`${count2} >= ${min}`, () => gen.assign(valid, true));
           }
         }
       }
@@ -14795,6 +14795,7 @@ import { fileURLToPath as fileURLToPath3 } from "node:url";
 
 // src/console-app.ts
 import { createHash as createHash2, timingSafeEqual } from "node:crypto";
+import { isIP } from "node:net";
 import { existsSync, readFileSync as readFileSync5, realpathSync, statSync } from "node:fs";
 import { createServer } from "node:http";
 import { extname, join as join2, sep } from "node:path";
@@ -21777,8 +21778,12 @@ var BadRequest = class extends Error {
   detail;
 };
 var DemoTeam = class {
-  constructor(now = Date.now, manifestPath = defaultManifestPath()) {
+  constructor(now = Date.now, manifestPath = defaultManifestPath(), options = {}) {
     this.now = now;
+    this.team = options.team ?? DEMO_TEAM;
+    this.name = options.name ?? "Demo";
+    this.quiet = options.roster !== void 0;
+    this.viewer = options.viewer ?? DEMO_ME;
     const start = now();
     this.epoch = Math.floor(start / DEMO_CYCLE_MS) * DEMO_CYCLE_MS - WARMUP_CYCLES * DEMO_CYCLE_MS;
     const manifest = loadManifest(manifestPath);
@@ -21794,27 +21799,54 @@ var DemoTeam = class {
     };
     this.publishedAt = iso(this.epoch - 36e5);
     const added = iso(this.epoch - 7 * DAY_MS);
-    this.rosterEntries = [
-      { member: "alice", emails: ["alice@example.com"], role: "owner", added_by: "alice", added_at: added },
-      { member: "bob", emails: ["bob@example.com"], role: "member", added_by: "alice", added_at: added },
-      { member: "carol", emails: ["carol@example.com", "carol.w@example.org"], role: "member", added_by: "alice", added_at: added }
+    this.rosterEntries = options.roster ? options.roster.map((e) => ({ ...e, emails: [...e.emails] })) : [
+      { member: "alice", emails: ["alice@example.com"], role: "owner", added_by: "alice", added_at: added, status: "active" },
+      { member: "bob", emails: ["bob@example.com"], role: "member", added_by: "alice", added_at: added, status: "active" },
+      { member: "carol", emails: ["carol@example.com", "carol.w@example.org"], role: "member", added_by: "alice", added_at: added, status: "active" },
+      // M9-SPEC §7.2: an invitation dana has not answered yet.
+      { member: "dana", emails: ["dana@example.com"], role: "member", added_by: "alice", added_at: iso(this.epoch - DAY_MS), status: "invited" }
     ];
   }
   now;
+  team;
+  name;
+  /** No scripted traffic: a team created (or joined) in the demo. */
+  quiet;
+  viewer;
   epoch;
   manifests;
   environments = /* @__PURE__ */ new Map();
   publishedAt;
   /** M6-SPEC §1, in memory: alice owns the demo team; bob and carol are members. */
   rosterEntries;
+  /** The viewer's role here, by the roster's active entries. */
+  viewerRole() {
+    return this.rosterEntries.find((e) => e.member === this.viewer && e.status === "active")?.role ?? "member";
+  }
+  /** Active members and owners, as the admin listing counts them. */
+  counts() {
+    const active = this.rosterEntries.filter((e) => e.status === "active");
+    return { members: active.length, owners: active.filter((e) => e.role === "owner").length };
+  }
+  requireOwner() {
+    if (this.viewerRole() !== "owner") throw new RosterRefusal(403, "forbidden", "Only owners can change the roster.");
+  }
   /**
    * M6-SPEC §2 as alice (an owner) reads it: every member with emails and role. The demo keeps
    * changes in memory, under the relay's invariants (§1): unique ids and emails, at most 50
    * members, 1 to 5 emails each, and always at least one owner.
    */
   roster() {
+    const owner = this.viewerRole() === "owner";
     return {
-      members: this.rosterEntries.map((e) => ({ member: e.member, emails: [...e.emails], role: e.role, added_by: e.added_by, added_at: e.added_at }))
+      members: this.rosterEntries.filter((e) => owner || e.status === "active").map((e) => ({
+        member: e.member,
+        emails: owner || e.member === this.viewer ? [...e.emails] : e.emails.map(() => null),
+        role: e.role,
+        added_by: e.added_by,
+        added_at: e.added_at,
+        status: e.status
+      }))
     };
   }
   entry(member) {
@@ -21826,14 +21858,23 @@ var DemoTeam = class {
     return this.rosterEntries.some((e) => e !== except && e.emails.includes(email2));
   }
   addMember(body) {
-    if (this.rosterEntries.some((e) => e.member === body.member)) throw new RosterRefusal(409, "conflict", "That member id is already on the team.");
-    if (this.emailTaken(body.email)) throw new RosterRefusal(409, "conflict", "That email already belongs to a member of the team.");
-    if (this.rosterEntries.length >= ROSTER_MAX) throw new RosterRefusal(409, "roster_full", `A team has at most ${ROSTER_MAX} members.`);
-    const entry = { member: body.member, emails: [body.email], role: body.role ?? "member", added_by: DEMO_ME, added_at: iso(this.now()) };
+    this.requireOwner();
+    if (this.rosterEntries.some((e) => e.member === body.member)) throw new RosterRefusal(409, "member_exists", "That member id is already on the team.");
+    if (this.emailTaken(body.email)) throw new RosterRefusal(409, "email_taken", "That email already belongs to a member of the team.");
+    if (this.rosterEntries.length >= ROSTER_MAX) throw new RosterRefusal(409, "team_full", `A team has at most ${ROSTER_MAX} members, invitations included.`);
+    const entry = {
+      member: body.member,
+      emails: [body.email],
+      role: body.role ?? "member",
+      added_by: this.viewer,
+      added_at: iso(this.now()),
+      status: "invited"
+    };
     this.rosterEntries.push(entry);
     return { ...entry, emails: [...entry.emails] };
   }
   updateMember(member, body) {
+    this.requireOwner();
     const e = this.entry(member);
     const emails = [...e.emails];
     if (body.add_email !== void 0) {
@@ -21846,16 +21887,21 @@ var DemoTeam = class {
       if (emails.length === 1) throw new RosterRefusal(409, "last_email", "A member needs at least one email.");
       emails.splice(emails.indexOf(body.remove_email), 1);
     }
-    if (body.role === "member" && e.role === "owner" && this.rosterEntries.filter((x) => x.role === "owner").length === 1) {
+    if (body.role === "member" && e.role === "owner" && e.status === "active" && this.activeOwners() === 1) {
       throw new RosterRefusal(409, "last_owner", "A team always has at least one owner.");
     }
     e.emails = emails;
     if (body.role !== void 0) e.role = body.role;
-    return { member: e.member, emails: [...e.emails], role: e.role, added_by: e.added_by, added_at: e.added_at };
+    return { member: e.member, emails: [...e.emails], role: e.role, added_by: e.added_by, added_at: e.added_at, status: e.status };
   }
+  activeOwners() {
+    return this.rosterEntries.filter((x) => x.role === "owner" && x.status === "active").length;
+  }
+  /** Remove a member, or withdraw an invitation (which retires nothing, M9-SPEC §7.2). */
   removeMember(member) {
+    this.requireOwner();
     const e = this.entry(member);
-    if (e.role === "owner" && this.rosterEntries.filter((x) => x.role === "owner").length === 1) {
+    if (e.role === "owner" && e.status === "active" && this.activeOwners() === 1) {
       throw new RosterRefusal(409, "last_owner", "A team always has at least one owner.");
     }
     this.rosterEntries.splice(this.rosterEntries.indexOf(e), 1);
@@ -21864,6 +21910,7 @@ var DemoTeam = class {
   /** Every request created by `now`; expired ones only when asked for (the feed passes them). */
   all(now, withExpired = false) {
     const out = [];
+    if (this.quiet) return out;
     const first = Math.max(0, Math.floor((now - DEMO_TTL_MS - this.epoch) / DEMO_CYCLE_MS) - 1);
     const last = Math.floor((now - this.epoch) / DEMO_CYCLE_MS);
     for (let c = first; c <= last; c++) {
@@ -21876,7 +21923,8 @@ var DemoTeam = class {
     return out;
   }
   me() {
-    return { team: DEMO_TEAM, member: DEMO_ME, teammates: DEMO_MEMBERS.filter((m) => m !== DEMO_ME) };
+    const teammates = this.quiet ? this.rosterEntries.filter((e) => e.status === "active" && e.member !== this.viewer).map((e) => e.member) : DEMO_MEMBERS.filter((m) => m !== DEMO_ME);
+    return { team: this.team, name: this.name, member: this.viewer, role: this.viewerRole(), teammates };
   }
   presence(member, now) {
     const tick = (offset) => iso(Math.floor((now - offset) / 15e3) * 15e3);
@@ -21895,6 +21943,7 @@ var DemoTeam = class {
    * what arrives at once and nothing waits.
    */
   inboxSummary() {
+    if (this.quiet) return { pending: 0, more: false, oldest_at: null, from: [], answering: { last_seen: null } };
     const p = this.presence(DEMO_ME, this.now());
     return { pending: 0, more: false, oldest_at: null, from: [], answering: { last_seen: p.answering } };
   }
@@ -21908,6 +21957,18 @@ var DemoTeam = class {
     const now = this.now();
     const start = now - DAY_MS;
     const read = this.all(now).map((m) => m.doc).filter((d) => Date.parse(d.updated_at) > start).sort((a, b) => Date.parse(b.updated_at) - Date.parse(a.updated_at) || b.request_id.localeCompare(a.request_id)).slice(0, STATS_READ_CAP);
+    if (this.quiet) {
+      const members2 = this.me().teammates.map((member) => ({
+        member,
+        last_seen: null,
+        manifest: null,
+        published_at: null,
+        sessions: { working: { last_seen: null }, answering: { last_seen: null } },
+        stats: { asked: 0, answered: 0, open: 0, median_answer_seconds: null },
+        inbox_waiting: 0
+      }));
+      return { members: members2, stats_complete: true };
+    }
     const members = DEMO_MEMBERS.filter((m) => m !== DEMO_ME).map((member) => {
       const p = this.presence(member, now);
       const seen = [p.working, p.answering].filter((x) => x !== null).sort();
@@ -21986,6 +22047,186 @@ var DemoTeam = class {
         (p) => p.kind === "progress" ? { seq: p.seq, member: p.member, kind: p.kind, text: p.text, pct: p.pct, tool: null, status: null, duration_ms: null, time: p.time } : { seq: p.seq, member: p.member, kind: p.kind, text: null, pct: null, tool: p.tool, status: p.status, duration_ms: p.duration_ms, time: p.time }
       )
     };
+  }
+};
+var DEMO_MAX_TEAMS_CREATED = 3;
+var RESERVED_TEAM_IDS = /* @__PURE__ */ new Set(["admin", "api", "login", "v1", "health", "static", "www", "team", "teams", "relay", "console", "demo", "test"]);
+var NEW_TEAM_ID = /^[a-z][a-z0-9-]{2,31}$/;
+var RESERVE_MS = 31 * DAY_MS;
+function teamIdFromName(name) {
+  let id = name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+  if (!/^[a-z]/.test(id)) id = `team-${id}`;
+  id = id.slice(0, 32).replace(/-+$/, "");
+  return id.length >= 3 ? id : `${id}-team`.slice(0, 32);
+}
+var DemoAccount = class {
+  constructor(now = Date.now, manifestPath = defaultManifestPath()) {
+    this.now = now;
+    this.manifestPath = manifestPath;
+    const t = now();
+    const at = (daysAgo) => iso(t - daysAgo * DAY_MS);
+    const entry = (member, role2, status, by, daysAgo) => ({
+      member,
+      emails: [`${member}@example.com`],
+      role: role2,
+      added_by: by,
+      added_at: at(daysAgo),
+      status
+    });
+    this.held.set(DEMO_TEAM, new DemoTeam(now, manifestPath));
+    this.world.set(DEMO_TEAM, { id: DEMO_TEAM, name: "Demo", seed: true, status: "active", created_at: at(30), created_by_member: null, members: 0, owners: 0, last_activity_at: null });
+    this.held.set(
+      "research",
+      new DemoTeam(now, manifestPath, {
+        team: "research",
+        name: "Research",
+        roster: [entry("alice", "owner", "active", "alice", 5), entry("erin", "member", "active", "alice", 4), entry("frank", "member", "invited", "alice", 1)]
+      })
+    );
+    this.createdByMe.add("research");
+    this.world.set("research", { id: "research", name: "Research", seed: false, status: "active", created_at: at(5), created_by_member: "alice", members: 0, owners: 0, last_activity_at: at(1) });
+    this.invitations = [
+      {
+        team: "ops",
+        name: "Operations",
+        member: "alice",
+        role: "member",
+        invited_by_member: "olga",
+        roster: [entry("olga", "owner", "active", "olga", 12), entry("pat", "member", "active", "olga", 9), entry("alice", "member", "active", "olga", 0)]
+      }
+    ];
+    this.world.set("ops", { id: "ops", name: "Operations", seed: false, status: "active", created_at: at(12), created_by_member: "olga", members: 2, owners: 1, last_activity_at: at(0.2) });
+    this.world.set("design-guild", { id: "design-guild", name: "Design guild", seed: false, status: "active", created_at: at(20), created_by_member: "hana", members: 4, owners: 2, last_activity_at: at(2) });
+    this.world.set("field-notes", { id: "field-notes", name: "Field notes", seed: false, status: "active", created_at: at(8), created_by_member: "ivo", members: 1, owners: 1, last_activity_at: null });
+    this.world.set("old-pilot", {
+      id: "old-pilot",
+      name: "Old pilot",
+      seed: false,
+      status: "deleted",
+      created_at: at(40),
+      created_by_member: "jun",
+      members: 0,
+      owners: 0,
+      last_activity_at: at(4),
+      deleted_at: at(3),
+      reserved_until: iso(t - 3 * DAY_MS + RESERVE_MS)
+    });
+  }
+  now;
+  manifestPath;
+  defaultTeam = DEMO_TEAM;
+  held = /* @__PURE__ */ new Map();
+  /** Teams alice created and has not deleted (M9-SPEC §2's per-account count). */
+  createdByMe = /* @__PURE__ */ new Set();
+  world = /* @__PURE__ */ new Map();
+  invitations;
+  /** One of alice's active teams (the default when none is named), else NotFound. */
+  team(id = DEMO_TEAM) {
+    const t = this.held.get(id);
+    if (!t) throw new NotFound();
+    return t;
+  }
+  /** GET /v1/me/teams as alice reads it: the file's team first, then the created ones by id. */
+  myTeams() {
+    const ids = [...this.held.keys()].sort((a, b) => a === DEMO_TEAM ? -1 : b === DEMO_TEAM ? 1 : a.localeCompare(b));
+    return {
+      teams: ids.map((id) => {
+        const t = this.held.get(id);
+        const me = t.me();
+        return { team: id, name: t.name, member: me.member, role: me.role };
+      }),
+      invitations: this.invitations.map((i) => ({ team: i.team, name: i.name, member: i.member, role: i.role, invited_by_member: i.invited_by_member })),
+      admin: true,
+      teams_created: this.createdByMe.size,
+      max_teams_created: DEMO_MAX_TEAMS_CREATED,
+      suggested_member: DEMO_ME
+    };
+  }
+  taken(id) {
+    const w = this.world.get(id);
+    return RESERVED_TEAM_IDS.has(id) || w !== void 0 && (w.status === "active" || Date.parse(w.reserved_until ?? "") > this.now());
+  }
+  /** POST /v1/teams, with the relay's refusals (M9-SPEC §2, §7.4). */
+  createTeam(body) {
+    const name = body.name.trim();
+    const id = body.id ?? teamIdFromName(name);
+    if (!NEW_TEAM_ID.test(id)) throw new RosterRefusal(422, "invalid_body", "The team id must be 3 to 32 characters: a lower-case letter, then lower-case letters, digits or -.");
+    if (this.taken(id)) throw new RosterRefusal(409, "team_id_unavailable", "That team id is not available. Choose another.");
+    if (name.replace(/\s+/g, " ").toLowerCase() === "demo") {
+      throw new RosterRefusal(409, "team_name_unavailable", "That name belongs to a team in the relay's configuration. Choose another.");
+    }
+    if (this.createdByMe.size >= DEMO_MAX_TEAMS_CREATED) {
+      throw new RosterRefusal(409, "team_limit", `You have created ${DEMO_MAX_TEAMS_CREATED} teams, the most one account may. Delete one to create another.`);
+    }
+    const created = iso(this.now());
+    const member = body.owner_member_id;
+    const team = new DemoTeam(this.now, this.manifestPath, {
+      team: id,
+      name,
+      viewer: member,
+      roster: [{ member, emails: ["alice@example.com"], role: "owner", added_by: member, added_at: created, status: "active" }]
+    });
+    this.held.set(id, team);
+    this.createdByMe.add(id);
+    this.world.set(id, { id, name, seed: false, status: "active", created_at: created, created_by_member: member, members: 0, owners: 0, last_activity_at: null });
+    return { team: id, name, status: "active", created_at: created, member, role: "owner" };
+  }
+  /** POST /v1/me/invitations/{team} (M9-SPEC §7.2). */
+  answerInvitation(team, accept) {
+    const inv = this.invitations.find((i) => i.team === team);
+    if (!inv) throw new RosterRefusal(404, "not_found", "That invitation is no longer open.");
+    this.invitations = this.invitations.filter((i) => i !== inv);
+    if (!accept) return { team, member: inv.member, status: "declined" };
+    this.held.set(team, new DemoTeam(this.now, this.manifestPath, { team, name: inv.name, viewer: inv.member, roster: inv.roster }));
+    return { team, name: inv.name, member: inv.member, role: inv.role, status: "active" };
+  }
+  remove(team, confirm) {
+    const w = this.world.get(team);
+    if (!w || w.status !== "active") throw new NotFound();
+    if (w.seed) throw new RosterRefusal(409, "seed_team", "This team comes from the relay's team file; it cannot be deleted here.");
+    if (confirm !== team) throw new RosterRefusal(422, "confirm_mismatch", 'Send {"confirm": "<team id>"} to delete the team.');
+    const t = this.now();
+    w.status = "deleted";
+    w.deleted_at = iso(t);
+    w.reserved_until = iso(t + RESERVE_MS);
+    this.held.delete(team);
+    this.createdByMe.delete(team);
+    this.invitations = this.invitations.filter((i) => i.team !== team);
+    return { team, status: "deleted", removal: "complete", deleted_at: w.deleted_at, reserved_until: w.reserved_until };
+  }
+  /** DELETE /v1/teams/{team}: an owner deletes a team the API created (M9-SPEC §7.7). */
+  deleteTeam(team, confirm) {
+    const held = this.team(team);
+    if (held.viewerRole() !== "owner") throw new RosterRefusal(403, "forbidden", "Only an owner can delete the team.");
+    return this.remove(team, confirm);
+  }
+  /** GET /v1/admin/teams (M9-SPEC §4): the file's teams first, then the others by id. */
+  adminTeams(q = {}) {
+    const limit = q.limit ?? 200;
+    const row = (w) => {
+      const held = this.held.get(w.id);
+      const counts = held ? held.counts() : { members: w.members, owners: w.owners };
+      return {
+        id: w.id,
+        name: w.name,
+        status: w.status,
+        seed: w.seed,
+        created_at: w.created_at,
+        created_by_member: w.created_by_member,
+        ...counts,
+        last_activity_at: w.id === DEMO_TEAM ? iso(this.now() - 2e4) : w.last_activity_at,
+        ...w.status === "deleted" ? { removal: "complete", deleted_at: w.deleted_at, reserved_until: w.reserved_until } : {}
+      };
+    };
+    const all = [...this.world.values()];
+    const seeds = q.after === void 0 ? all.filter((w) => w.seed) : [];
+    const rest = all.filter((w) => !w.seed && (q.after === void 0 || w.id > q.after)).filter((w) => w.status === "active" || Date.parse(w.reserved_until ?? "") > this.now()).sort((a, b) => a.id.localeCompare(b.id));
+    const page = rest.slice(0, limit);
+    return { teams: [...seeds, ...page].map(row), next: rest.length > limit ? page.at(-1).id : null };
+  }
+  /** DELETE /v1/admin/teams/{team} (M9-SPEC §4). */
+  adminDeleteTeam(team, confirm) {
+    return this.remove(team, confirm);
   }
 };
 
@@ -23043,10 +23284,13 @@ function configValue(v) {
   if (!t || /^\$\{user_config\.[A-Za-z0-9_]+\}$/.test(t)) return void 0;
   return t;
 }
+function staticTokenProvider(read) {
+  return Object.assign(typeof read === "string" ? () => read : read, { kind: "static" });
+}
 function tokenProviderFromEnv(env) {
   const file = configValue(env.RELAY_TOKEN_FILE);
   if (file) {
-    return () => {
+    return staticTokenProvider(() => {
       let raw;
       try {
         raw = readFileSync4(file, "utf8");
@@ -23056,11 +23300,11 @@ function tokenProviderFromEnv(env) {
       const token2 = raw.replace(/[\r\n]+$/, "");
       if (!token2) throw new Error("RELAY_TOKEN_FILE is empty");
       return token2;
-    };
+    });
   }
   const token = configValue(env.RELAY_TOKEN);
   if (!token) throw new Error('RELAY_AUTH is "token", so RELAY_TOKEN or RELAY_TOKEN_FILE must be set');
-  return () => token;
+  return staticTokenProvider(token);
 }
 var TOKEN_REFRESH_MARGIN_MS = 5 * 6e4;
 var JWT_RE = /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/;
@@ -23249,10 +23493,12 @@ function connectionFromEnv(env, gcloud = {}) {
   }
   return { mode, url, team, token };
 }
+var CLIENT_IP_HASH_RE = /^[0-9a-f]{64}$/;
 var ON_BEHALF_OF_RE = /^[a-z0-9._%+-]{1,64}@[a-z0-9.-]{1,253}$/;
 var defaultSleep = (ms) => new Promise((r) => setTimeout(r, ms));
-var RelayClient = class {
+var RelayClient = class _RelayClient {
   team;
+  opts;
   base;
   token;
   backoff;
@@ -23263,6 +23509,7 @@ var RelayClient = class {
   userAgent;
   constructor(opts) {
     if (!TEAM_RE.test(opts.team)) throw new Error("RELAY_TEAM is not a valid team id");
+    this.opts = opts;
     this.team = opts.team;
     const base = parseRelayUrl(opts.url);
     if (!base.pathname.endsWith("/")) base.pathname += "/";
@@ -23275,6 +23522,21 @@ var RelayClient = class {
     this.random = opts.random ?? Math.random;
     this.userAgent = opts.userAgent ?? "team-relay-plugin/0.1.0";
   }
+  /**
+   * The same relay, sign-in and settings for another team (M9-SPEC §5: the hosted console's
+   * delegate reads any team its viewer is on). The team id is checked like RELAY_TEAM.
+   */
+  withTeam(team) {
+    if (team === this.team) return this;
+    return new _RelayClient({ ...this.opts, team });
+  }
+  /**
+   * True when this client signs in with a stored device credential or a static token, which
+   * are bound to one team (no Google identity for the account routes).
+   */
+  get boundToTeam() {
+    return isCredentialProvider(this.token) || this.token.kind === "static";
+  }
   /** The relay's base URL (without a trailing slash). */
   get url() {
     return this.base.toString().replace(/\/$/, "");
@@ -23282,7 +23544,7 @@ var RelayClient = class {
   teamPath(...parts) {
     return ["v1", "teams", this.team, ...parts].map(encodeURIComponent).join("/");
   }
-  async once(method, path, body, timeoutMs, signal, onBehalfOf) {
+  async once(method, path, body, timeoutMs, signal, onBehalfOf, clientIpHash2) {
     const url = new URL(path, this.base);
     const headers = {
       Accept: "application/json",
@@ -23292,6 +23554,10 @@ var RelayClient = class {
     if (onBehalfOf !== void 0) {
       if (!ON_BEHALF_OF_RE.test(onBehalfOf)) throw new Error("X-Relay-On-Behalf-Of must be a lower-case email address");
       headers["X-Relay-On-Behalf-Of"] = onBehalfOf;
+    }
+    if (clientIpHash2 !== void 0) {
+      if (!CLIENT_IP_HASH_RE.test(clientIpHash2)) throw new Error("X-Relay-Client-IP-Hash must be 64 lower-case hex characters");
+      headers["X-Relay-Client-IP-Hash"] = clientIpHash2;
     }
     let payload;
     if (body !== void 0) {
@@ -23341,7 +23607,7 @@ var RelayClient = class {
     let refreshed = false;
     for (let attempt = 0; ; ) {
       try {
-        return await this.once(method, path, body, timeoutMs, opts.signal, opts.onBehalfOf);
+        return await this.once(method, path, body, timeoutMs, opts.signal, opts.onBehalfOf, opts.clientIpHash);
       } catch (err) {
         if (opts.signal?.aborted) throw err;
         if (err instanceof RelayError && err.status === 401 && !refreshed && this.token.invalidate) {
@@ -23457,6 +23723,48 @@ var RelayClient = class {
   revokeSelf(opts) {
     return this.call("DELETE", this.teamPath("credentials", "self"), void 0, { attempts: 1, ...opts });
   }
+  // M9-SPEC §2, §4, §7: the account routes. They take a Google identity (a Google ID token,
+  // or a delegate on behalf of an email); a device credential or a static token is refused
+  // with 403 google_identity_required. The mutations are sent once.
+  /** The teams (and invitations) of the signed-in Google account. */
+  myTeams(opts) {
+    return this.call("GET", "v1/me/teams", void 0, opts);
+  }
+  /** Create a team; the caller becomes its first owner. */
+  createTeam(body, opts) {
+    return this.call("POST", "v1/teams", body, { attempts: 1, ...opts });
+  }
+  /** Accept or decline an invitation to `team`. */
+  answerInvitation(team, accept, opts) {
+    if (!TEAM_RE.test(team)) throw new Error("invalid team id");
+    return this.call("POST", ["v1", "me", "invitations", team].map(encodeURIComponent).join("/"), { accept }, {
+      attempts: 1,
+      ...opts
+    });
+  }
+  /** An owner deletes this client's team (M9-SPEC §7.7); `confirm` is the team id typed again. */
+  deleteTeam(confirm, opts) {
+    return this.call("DELETE", ["v1", "teams", this.team].map(encodeURIComponent).join("/"), { confirm }, {
+      attempts: 1,
+      ...opts
+    });
+  }
+  /** Relay admins (M9-SPEC §4): every team, a page at a time. */
+  adminTeams(q = {}, opts) {
+    const params = new URLSearchParams();
+    if (q.after !== void 0) params.set("after", q.after);
+    if (q.limit !== void 0) params.set("limit", String(q.limit));
+    const qs = params.toString();
+    return this.call("GET", "v1/admin/teams" + (qs ? `?${qs}` : ""), void 0, opts);
+  }
+  /** Relay admins (M9-SPEC §4): delete a team; `confirm` is its id typed again. */
+  adminDeleteTeam(team, confirm, opts) {
+    if (!TEAM_RE.test(team)) throw new Error("invalid team id");
+    return this.call("DELETE", ["v1", "admin", "teams", team].map(encodeURIComponent).join("/"), { confirm }, {
+      attempts: 1,
+      ...opts
+    });
+  }
   /** M2-SPEC §3.5: the team's activity feed. */
   activity(q = {}, opts) {
     const params = new URLSearchParams();
@@ -23510,36 +23818,89 @@ var MIME = {
   ".ttf": "font/ttf",
   ".txt": "text/plain; charset=utf-8"
 };
+var TEAMS_TTL_MS = 15e3;
+var TEAMS_CACHE_MAX = 1e3;
 var RFC33392 = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,9})?(Z|[+-]\d{2}:\d{2})$/;
+var TEAM_CLIENTS_MAX = 256;
 function relayBackend(client) {
   const opts = (ctx) => ({
     attempts: 1,
     timeoutMs: 15e3,
     ...ctx?.viewer !== void 0 ? { onBehalfOf: ctx.viewer } : {}
   });
+  const bound = client.boundToTeam;
+  const clients = /* @__PURE__ */ new Map();
+  const on = (ctx) => {
+    const team = ctx?.team;
+    if (team === void 0 || team === client.team) return client;
+    let c = clients.get(team);
+    if (!c) {
+      if (clients.size >= TEAM_CLIENTS_MAX) clients.delete(clients.keys().next().value);
+      c = client.withTeam(team);
+      clients.set(team, c);
+    }
+    return c;
+  };
   return {
-    me: (ctx) => client.me(opts(ctx)),
-    directory: (ctx) => client.directory(opts(ctx)),
-    activity: (q, ctx) => client.activity(q, opts(ctx)),
-    request: (id, ctx) => client.getRequest(id, opts(ctx)),
-    roster: (ctx) => client.roster(opts(ctx)),
-    inboxSummary: (ctx) => client.inboxSummary(opts(ctx)),
-    addMember: (body, ctx) => client.addMember(body, opts(ctx)),
-    updateMember: (member, body, ctx) => client.updateMember(member, body, opts(ctx)),
-    removeMember: (member, ctx) => client.removeMember(member, opts(ctx))
+    defaultTeam: client.team,
+    fixedTeam: bound ? client.team : null,
+    me: (ctx) => on(ctx).me(opts(ctx)),
+    directory: (ctx) => on(ctx).directory(opts(ctx)),
+    activity: (q, ctx) => on(ctx).activity(q, opts(ctx)),
+    request: (id, ctx) => on(ctx).getRequest(id, opts(ctx)),
+    roster: (ctx) => on(ctx).roster(opts(ctx)),
+    inboxSummary: (ctx) => on(ctx).inboxSummary(opts(ctx)),
+    addMember: (body, ctx) => on(ctx).addMember(body, opts(ctx)),
+    updateMember: (member, body, ctx) => on(ctx).updateMember(member, body, opts(ctx)),
+    removeMember: (member, ctx) => on(ctx).removeMember(member, opts(ctx)),
+    myTeams: async (ctx) => {
+      if (!bound) {
+        try {
+          return await client.myTeams(opts(ctx));
+        } catch (err) {
+          if (!(err instanceof RelayError && err.status === 403 && err.code === "google_identity_required")) throw err;
+        }
+      }
+      return boundTeams(await client.me(opts(ctx)), client.team);
+    },
+    createTeam: (body, ctx) => client.createTeam(body, { ...opts(ctx), ...ctx?.clientIpHash !== void 0 ? { clientIpHash: ctx.clientIpHash } : {} }),
+    answerInvitation: (team, accept, ctx) => client.answerInvitation(team, accept, opts(ctx)),
+    deleteTeam: (confirm, ctx) => on(ctx).deleteTeam(confirm, opts(ctx)),
+    adminTeams: (q, ctx) => client.adminTeams(q, opts(ctx)),
+    adminDeleteTeam: (team, confirm, ctx) => client.adminDeleteTeam(team, confirm, opts(ctx))
   };
 }
-function demoBackend(team) {
+function boundTeams(me, team) {
+  const m = me && typeof me === "object" ? me : {};
+  const member = typeof m.member === "string" ? m.member : null;
   return {
-    me: async () => team.me(),
-    directory: async () => team.directory(),
-    activity: async (q) => team.activity(q),
-    request: async (id) => team.request(id),
-    roster: async () => team.roster(),
-    inboxSummary: async () => team.inboxSummary(),
-    addMember: async (body) => team.addMember(body),
-    updateMember: async (member, body) => team.updateMember(member, body),
-    removeMember: async (member) => team.removeMember(member)
+    teams: member ? [{ team, name: typeof m.name === "string" ? m.name : team, member, role: m.role === "owner" ? "owner" : "member" }] : [],
+    invitations: [],
+    admin: false,
+    teams_created: null,
+    max_teams_created: null,
+    can_manage_teams: false
+  };
+}
+function demoBackend(account) {
+  return {
+    defaultTeam: account.defaultTeam,
+    fixedTeam: null,
+    me: async (ctx) => account.team(ctx?.team).me(),
+    directory: async (ctx) => account.team(ctx?.team).directory(),
+    activity: async (q, ctx) => account.team(ctx?.team).activity(q),
+    request: async (id, ctx) => account.team(ctx?.team).request(id),
+    roster: async (ctx) => account.team(ctx?.team).roster(),
+    inboxSummary: async (ctx) => account.team(ctx?.team).inboxSummary(),
+    addMember: async (body, ctx) => account.team(ctx?.team).addMember(body),
+    updateMember: async (member, body, ctx) => account.team(ctx?.team).updateMember(member, body),
+    removeMember: async (member, ctx) => account.team(ctx?.team).removeMember(member),
+    myTeams: async () => account.myTeams(),
+    createTeam: async (body) => account.createTeam(body),
+    answerInvitation: async (team, accept) => account.answerInvitation(team, accept),
+    deleteTeam: async (confirm, ctx) => account.deleteTeam(ctx?.team ?? account.defaultTeam, confirm),
+    adminTeams: async (q) => account.adminTeams(q),
+    adminDeleteTeam: async (team, confirm) => account.adminDeleteTeam(team, confirm)
   };
 }
 var ROSTER_EMAIL_RE = /^[a-z0-9._%+-]{1,64}@[a-z0-9-]{1,63}(\.[a-z0-9-]{1,63})+$/;
@@ -23581,6 +23942,126 @@ function checkUpdateMember(raw) {
   if (b.role !== void 0) out.role = role(b.role);
   if (Object.keys(out).length === 0) throw new BodyError("nothing to change: give add_email, remove_email or role");
   return out;
+}
+var NEW_TEAM_ID_RE = /^[a-z][a-z0-9-]{2,31}$/;
+var NAME_FORBIDDEN_RE = /[\p{Cc}\p{Cf}\p{Co}\p{Cn}\p{Zl}\p{Zp}]/u;
+function object(raw) {
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) throw new BodyError("the body must be a JSON object");
+  return raw;
+}
+function checkCreateTeam(raw) {
+  const b = object(raw);
+  onlyKeys(b, ["id", "name", "owner_member_id"]);
+  const name = typeof b.name === "string" ? b.name.trim() : "";
+  if ([...name].length < 1 || [...name].length > 60 || NAME_FORBIDDEN_RE.test(name)) {
+    throw new BodyError("name must be 1 to 60 characters, with no control or invisible characters");
+  }
+  if (typeof b.owner_member_id !== "string" || !MEMBER_RE.test(b.owner_member_id)) {
+    throw new BodyError("owner_member_id must be 2 to 32 characters: a lower-case letter, then lower-case letters, digits or _");
+  }
+  const out = { name, owner_member_id: b.owner_member_id };
+  if (b.id !== void 0) {
+    if (typeof b.id !== "string" || !NEW_TEAM_ID_RE.test(b.id)) {
+      throw new BodyError("id must be 3 to 32 characters: a lower-case letter, then lower-case letters, digits or -");
+    }
+    out.id = b.id;
+  }
+  return out;
+}
+function checkInvitationAnswer(raw) {
+  const b = object(raw);
+  onlyKeys(b, ["accept"]);
+  if (typeof b.accept !== "boolean") throw new BodyError('send {"accept": true} or {"accept": false}');
+  return b.accept;
+}
+function checkConfirm(raw, team) {
+  const b = object(raw);
+  onlyKeys(b, ["confirm"]);
+  if (b.confirm !== team) throw new BodyError('type the team id to confirm: {"confirm": "<team id>"}');
+  return team;
+}
+var count = (v) => typeof v === "number" && Number.isInteger(v) && v >= 0 && v <= 1e6 ? v : null;
+var displayName = (v, team) => typeof v === "string" && v.trim() !== "" && [...v].length <= 60 && !NAME_FORBIDDEN_RE.test(v) ? v : team;
+var roleOf = (v) => v === "owner" ? "owner" : "member";
+function parseTeams(raw) {
+  const r = raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {};
+  const list = (v) => Array.isArray(v) ? v.filter((x) => !!x && typeof x === "object" && !Array.isArray(x)).slice(0, 500) : [];
+  const seen = /* @__PURE__ */ new Set();
+  const teams = [];
+  for (const t of list(r.teams)) {
+    if (typeof t.team !== "string" || !TEAM_RE.test(t.team) || typeof t.member !== "string" || !MEMBER_RE.test(t.member) || seen.has(t.team)) continue;
+    seen.add(t.team);
+    teams.push({ team: t.team, name: displayName(t.name, t.team), member: t.member, role: roleOf(t.role) });
+  }
+  const invitations = [];
+  for (const t of list(r.invitations)) {
+    if (typeof t.team !== "string" || !TEAM_RE.test(t.team) || typeof t.member !== "string" || !MEMBER_RE.test(t.member) || seen.has(t.team)) continue;
+    seen.add(t.team);
+    invitations.push({
+      team: t.team,
+      name: displayName(t.name, t.team),
+      member: t.member,
+      role: roleOf(t.role),
+      invited_by_member: typeof t.invited_by_member === "string" && MEMBER_RE.test(t.invited_by_member) ? t.invited_by_member : null
+    });
+  }
+  return {
+    teams,
+    invitations,
+    admin: r.admin === true,
+    teams_created: count(r.teams_created),
+    max_teams_created: count(r.max_teams_created),
+    suggested_member: typeof r.suggested_member === "string" && MEMBER_RE.test(r.suggested_member) ? r.suggested_member : null,
+    can_manage_teams: r.can_manage_teams !== false
+  };
+}
+function clientAddress(req) {
+  const raw = req.headers["x-forwarded-for"];
+  const joined = Array.isArray(raw) ? raw.join(",") : raw;
+  if (joined) {
+    const last = joined.split(",").map((p) => p.trim()).filter((p) => p !== "").at(-1);
+    if (last !== void 0) return last;
+  }
+  return req.socket.remoteAddress ?? "";
+}
+function expandIpv6(a) {
+  let addr = a;
+  const v4 = /^(.*:)(\d{1,3}(?:\.\d{1,3}){3})$/.exec(addr);
+  if (v4) {
+    const o = v4[2].split(".").map(Number);
+    addr = `${v4[1]}${(o[0] << 8 | o[1]).toString(16)}:${(o[2] << 8 | o[3]).toString(16)}`;
+  }
+  const halves = addr.split("::");
+  if (halves.length > 2) return null;
+  const head = halves[0] ? halves[0].split(":") : [];
+  const tail = halves.length === 2 && halves[1] ? halves[1].split(":") : [];
+  const fill = halves.length === 2 ? 8 - head.length - tail.length : 0;
+  if (fill < 0) return null;
+  const groups = [...head, ...Array(fill).fill("0"), ...tail];
+  return groups.length === 8 ? groups.map((g) => g.toLowerCase().replace(/^0+(?=.)/, "")) : null;
+}
+function addressKey(address) {
+  let a = address.trim();
+  const bracketed = /^\[([^\]]+)\](?::\d{1,5})?$/.exec(a);
+  if (bracketed) a = bracketed[1];
+  a = a.replace(/%.*$/, "");
+  const mapped = /^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/i.exec(a);
+  if (mapped) a = mapped[1];
+  const kind = isIP(a);
+  if (kind === 4) return a;
+  if (kind === 6) {
+    const groups = expandIpv6(a);
+    return groups ? `${groups.slice(0, 4).join(":")}::/64` : "unknown";
+  }
+  return "unknown";
+}
+function clientIpHash(salt, req) {
+  return createHash2("sha256").update(salt + addressKey(clientAddress(req)), "utf8").digest("hex");
+}
+function checkIpHashSalt(raw) {
+  const v = raw?.trim();
+  if (!v || v.length < 32 || v.length > 4096) throw new Error("CONSOLE_IP_HASH_SALT must be set to at least 32 characters");
+  return v;
 }
 var JOIN_MARKETPLACE = "team-relay-dev";
 var JOIN_PLUGIN = "team-relay";
@@ -23697,8 +24178,10 @@ function createConsoleServer(opts) {
   const log2 = opts.log ?? (() => {
   });
   const hosted2 = opts.hosted ?? null;
-  if (hosted2) checkPublicHost(hosted2.publicHost);
-  else if (typeof opts.key !== "string" || opts.key === "") throw new Error("a console key is required in local mode");
+  if (hosted2) {
+    checkPublicHost(hosted2.publicHost);
+    checkIpHashSalt(hosted2.ipHashSalt);
+  } else if (typeof opts.key !== "string" || opts.key === "") throw new Error("a console key is required in local mode");
   let port = -1;
   let staticRoot = null;
   try {
@@ -23711,9 +24194,79 @@ function createConsoleServer(opts) {
     if (hosted2) return host === hosted2.publicHost;
     return host === `127.0.0.1:${port}` || host === `localhost:${port}`;
   }
-  function failure(res, err, viewer) {
-    if (hosted2 && viewer !== void 0 && err instanceof RelayError && err.status === 403 && err.code === "not_a_member") {
-      return sendJson(res, 403, { error: "not_on_team", email: viewer });
+  const now = opts.now ?? Date.now;
+  const teamsCache = /* @__PURE__ */ new Map();
+  function viewerTeams(ctx, fresh = false) {
+    const key = ctx.viewer ?? "";
+    const hit = teamsCache.get(key);
+    if (hit && !fresh && now() - hit.at < TEAMS_TTL_MS) return hit.view;
+    const view = opts.backend.myTeams(ctx.viewer !== void 0 ? { viewer: ctx.viewer } : {}).then(parseTeams);
+    if (teamsCache.size >= TEAMS_CACHE_MAX && !teamsCache.has(key)) teamsCache.delete(teamsCache.keys().next().value);
+    const entry = { at: now(), view };
+    teamsCache.set(key, entry);
+    view.catch(() => {
+      if (teamsCache.get(key) === entry) teamsCache.delete(key);
+    });
+    return view;
+  }
+  function forgetTeams(viewer) {
+    teamsCache.delete(viewer ?? "");
+  }
+  function notOnTeam(res, viewer, team) {
+    sendJson(res, 403, { error: "not_on_team", ...hosted2 && viewer !== void 0 ? { email: viewer } : {}, team });
+  }
+  async function resolveTeam(req, res, url, ctx) {
+    const asked = askedTeam(req, res, url);
+    if (asked === null) return null;
+    const team = asked === void 0 ? opts.backend.defaultTeam : asked;
+    const fixed = opts.backend.fixedTeam;
+    if (fixed !== null) {
+      if (team !== fixed) {
+        notOnTeam(res, ctx.viewer, team);
+        return null;
+      }
+      return team;
+    }
+    let view;
+    try {
+      view = await viewerTeams(ctx);
+    } catch (err) {
+      failure(res, err, ctx.viewer);
+      return null;
+    }
+    if (!view.teams.some((t) => t.team === team)) {
+      notOnTeam(res, ctx.viewer, team);
+      return null;
+    }
+    return team;
+  }
+  function askedTeam(req, res, url) {
+    const fromQuery = url.searchParams.getAll("team");
+    const header = req.headers["x-relay-team"];
+    if (fromQuery.length > 1 || Array.isArray(header)) {
+      sendJson(res, 400, { error: "bad_request", detail: "name the team once" });
+      return null;
+    }
+    const q = fromQuery[0];
+    if (q !== void 0 && header !== void 0 && q !== header) {
+      sendJson(res, 400, { error: "bad_request", detail: "the team parameter and X-Relay-Team differ" });
+      return null;
+    }
+    const asked = q ?? header;
+    if (asked !== void 0 && !TEAM_RE.test(asked)) {
+      sendJson(res, 400, { error: "bad_request", detail: "team must be a team id" });
+      return null;
+    }
+    return asked;
+  }
+  function failure(res, err, viewer, team) {
+    if (err instanceof RelayError && err.status === 403 && err.code === "not_a_member") {
+      forgetTeams(viewer);
+      return notOnTeam(res, viewer, team ?? opts.backend.defaultTeam);
+    }
+    if (team !== void 0 && (err instanceof NotFound || err instanceof RelayError && err.status === 404)) {
+      forgetTeams(viewer);
+      return notOnTeam(res, viewer, team);
     }
     if (err instanceof NotFound || err instanceof RelayError && err.status === 404) return sendJson(res, 404, { error: "not_found" });
     if (err instanceof BadRequest) return sendJson(res, 400, { error: "bad_request", detail: err.detail });
@@ -23732,14 +24285,25 @@ function createConsoleServer(opts) {
     const detail = err instanceof Error ? err.message.slice(0, 300) : "unexpected error";
     return sendJson(res, 502, { error: "relay_unavailable", detail });
   }
-  async function rosterChange(req, res, url, ctx, viewer) {
-    const path = url.pathname;
-    const one = /^\/api\/roster\/([^/]+)$/.exec(path);
-    const allowed = one ? ["PATCH", "DELETE"] : ["POST"];
+  function changeRoute(path) {
+    if (path === "/api/roster") return { methods: ["POST"], kind: "roster", id: null };
+    let m = /^\/api\/roster\/([^/]+)$/.exec(path);
+    if (m) return { methods: ["PATCH", "DELETE"], kind: "roster_one", id: m[1] };
+    if (path === "/api/teams") return { methods: ["POST"], kind: "teams", id: null };
+    m = /^\/api\/teams\/([^/]+)$/.exec(path);
+    if (m) return { methods: ["DELETE"], kind: "team", id: m[1] };
+    m = /^\/api\/invitations\/([^/]+)$/.exec(path);
+    if (m) return { methods: ["POST"], kind: "invitation", id: m[1] };
+    m = /^\/api\/admin\/teams\/([^/]+)$/.exec(path);
+    if (m) return { methods: ["DELETE"], kind: "admin_team", id: m[1] };
+    return null;
+  }
+  async function change(req, res, url, ctx, route2) {
     const method = req.method ?? "";
-    if (!allowed.includes(method)) {
+    const reads = route2.kind === "teams" || route2.kind === "roster" ? ["GET"] : [];
+    if (!route2.methods.includes(method)) {
       req.resume();
-      return sendJson(res, 405, { error: "method_not_allowed" }, { Allow: ["GET", ...allowed].filter((m) => !(one && m === "GET")).join(", ") });
+      return sendJson(res, 405, { error: "method_not_allowed" }, { Allow: [...reads, ...route2.methods].join(", ") });
     }
     if (headerValue(req, "sec-fetch-site") !== "same-origin") {
       req.resume();
@@ -23750,12 +24314,15 @@ function createConsoleServer(opts) {
       req.resume();
       return sendJson(res, 415, { error: "unsupported_media_type", detail: "Content-Type must be application/json" });
     }
-    if ([...url.searchParams.keys()].length > 0) {
+    const rosterKind = route2.kind === "roster" || route2.kind === "roster_one";
+    const extra = [...url.searchParams.keys()].filter((k) => !(rosterKind && k === "team"));
+    if (extra.length > 0) {
       req.resume();
       return sendJson(res, 400, { error: "bad_request", detail: "no query parameters here" });
     }
-    const member = one ? one[1] : null;
-    if (member !== null && !MEMBER_RE.test(member)) {
+    const id = route2.id;
+    const idOk = id === null || (route2.kind === "roster_one" ? MEMBER_RE.test(id) : TEAM_RE.test(id));
+    if (!idOk) {
       req.resume();
       return sendJson(res, 404, { error: "not_found" });
     }
@@ -23773,27 +24340,75 @@ function createConsoleServer(opts) {
         return sendJson(res, 400, { error: "bad_request", detail: "the body is not JSON" });
       }
     }
+    const viewer = ctx.viewer;
+    const who = viewer !== void 0 ? { viewer } : {};
     let call;
+    let status = 200;
+    let what;
+    let team;
     try {
-      if (method === "POST") {
-        const body = checkAddMember(raw);
-        call = () => opts.backend.addMember(body, ctx);
-      } else if (method === "PATCH") {
-        const body = checkUpdateMember(raw);
-        call = () => opts.backend.updateMember(member, body, ctx);
-      } else {
-        if (raw !== void 0 && (typeof raw !== "object" || raw === null || Array.isArray(raw) || Object.keys(raw).length > 0)) {
-          throw new BodyError("a removal takes no body");
+      switch (route2.kind) {
+        case "roster":
+        case "roster_one": {
+          let body;
+          if (method === "POST") body = checkAddMember(raw);
+          else if (method === "PATCH") body = checkUpdateMember(raw);
+          else if (raw !== void 0 && (typeof raw !== "object" || raw === null || Array.isArray(raw) || Object.keys(raw).length > 0)) {
+            throw new BodyError("a removal takes no body");
+          }
+          const resolved = await resolveTeam(req, res, url, who);
+          if (resolved === null) return;
+          team = resolved;
+          const on = { ...who, team: resolved };
+          if (method === "POST") {
+            status = 201;
+            call = () => opts.backend.addMember(body, on);
+          } else if (method === "PATCH") call = () => opts.backend.updateMember(id, body, on);
+          else call = () => opts.backend.removeMember(id, on);
+          what = `roster ${method === "POST" ? "add" : method === "PATCH" ? "update" : "remove"}${id ? ` ${id}` : ""} (team ${resolved})`;
+          break;
         }
-        call = () => opts.backend.removeMember(member, ctx);
+        case "teams": {
+          const body = checkCreateTeam(raw);
+          const ipHash = hosted2 ? { clientIpHash: clientIpHash(hosted2.ipHashSalt, req) } : {};
+          status = 201;
+          call = () => opts.backend.createTeam(body, { ...who, ...ipHash });
+          what = "team create";
+          break;
+        }
+        case "invitation": {
+          const accept = checkInvitationAnswer(raw);
+          call = () => opts.backend.answerInvitation(id, accept, who);
+          what = `invitation ${accept ? "accept" : "decline"} (team ${id})`;
+          break;
+        }
+        case "team": {
+          const confirm = checkConfirm(raw, id);
+          url.searchParams.set("team", id);
+          const resolved = await resolveTeam(req, res, url, who);
+          if (resolved === null) return;
+          call = () => opts.backend.deleteTeam(confirm, { ...who, team: resolved });
+          what = `team delete (team ${id})`;
+          break;
+        }
+        case "admin_team": {
+          const confirm = checkConfirm(raw, id);
+          call = () => opts.backend.adminDeleteTeam(id, confirm, who);
+          what = `admin team delete (team ${id})`;
+          break;
+        }
       }
     } catch (err) {
       return sendJson(res, 400, { error: "bad_request", detail: err instanceof BodyError ? err.message : "bad body" });
     }
-    log2(`roster ${method === "POST" ? "add" : method === "PATCH" ? "update" : "remove"}${member ? ` ${member}` : ""}`);
+    log2(what);
     try {
-      return sendJson(res, method === "POST" ? 201 : 200, await call());
+      const out = await call();
+      if (route2.kind !== "roster" && route2.kind !== "roster_one") forgetTeams(viewer);
+      return sendJson(res, status, out);
     } catch (err) {
+      if (route2.kind !== "roster" && route2.kind !== "roster_one") forgetTeams(viewer);
+      if (team !== void 0 && route2.kind === "roster" && err instanceof RelayError && err.status === 404) return failure(res, err, viewer, team);
       return failure(res, err, viewer);
     }
   }
@@ -23816,41 +24431,69 @@ function createConsoleServer(opts) {
     }
     const ctx = viewer !== void 0 ? { viewer } : {};
     const path = url.pathname;
-    const roster = path === "/api/roster" || /^\/api\/roster\/[^/]+$/.test(path);
+    const route2 = changeRoute(path);
     if (req.method !== "GET") {
-      if (roster) return rosterChange(req, res, url, ctx, viewer);
+      if (route2) return change(req, res, url, ctx, route2);
       req.resume();
       return sendJson(res, 405, { error: "method_not_allowed", detail: "the console is read-only" }, { Allow: "GET" });
     }
     req.resume();
     const query = [...url.searchParams.keys()];
-    if (path === "/api/join") {
-      if (query.length > 0) return sendJson(res, 400, { error: "bad_request", detail: "no query parameters here" });
-      if (hosted2) {
-        try {
-          await opts.backend.me(ctx);
-        } catch (err) {
-          return failure(res, err, viewer);
-        }
-      }
-      if (!opts.join) return sendJson(res, 404, { error: "not_found" });
-      return sendJson(res, 200, opts.join);
-    }
     if (path === "/api/approvals/summary") {
       if (query.length > 0) return sendJson(res, 400, { error: "bad_request", detail: "no query parameters here" });
       if (hosted2 || !opts.approvals) return sendJson(res, 404, { error: "not_found" });
       return sendJson(res, 200, opts.approvals());
     }
-    let call;
-    if (path === "/api/me" || path === "/api/directory" || path === "/api/roster" || path === "/api/inbox/summary") {
+    if (path === "/api/teams") {
       if (query.length > 0) return sendJson(res, 400, { error: "bad_request", detail: "no query parameters here" });
-      call = path === "/api/me" ? async () => {
-        const me = await opts.backend.me(ctx);
-        return ctx.viewer !== void 0 && me !== null && typeof me === "object" && !Array.isArray(me) ? { ...me, email: ctx.viewer } : me;
-      } : path === "/api/directory" ? () => opts.backend.directory(ctx) : path === "/api/inbox/summary" ? () => opts.backend.inboxSummary(ctx) : () => opts.backend.roster(ctx);
-    } else if (path === "/api/activity") {
-      const q = {};
+      let view;
+      try {
+        view = opts.backend.fixedTeam !== null ? parseTeams(await opts.backend.myTeams(ctx)) : await viewerTeams(ctx, true);
+      } catch (err) {
+        return failure(res, err, viewer);
+      }
+      return sendJson(res, 200, {
+        ...view,
+        default_team: opts.backend.defaultTeam,
+        // Hosted, the viewer's own IAP-verified email, for the not-on-team page; theirs only.
+        ...hosted2 && viewer !== void 0 ? { email: viewer } : {}
+      });
+    }
+    if (path === "/api/admin/teams") {
+      const q2 = {};
       for (const k of query) {
+        if (k !== "after" && k !== "limit") return sendJson(res, 400, { error: "bad_request", detail: `unknown parameter ${k.slice(0, 40)}` });
+      }
+      if (url.searchParams.getAll("after").length > 1 || url.searchParams.getAll("limit").length > 1) {
+        return sendJson(res, 400, { error: "bad_request", detail: "repeated parameter" });
+      }
+      const after = url.searchParams.get("after");
+      if (after !== null) {
+        if (!TEAM_RE.test(after)) return sendJson(res, 400, { error: "bad_request", detail: "after must be a team id" });
+        q2.after = after;
+      }
+      const limit = url.searchParams.get("limit");
+      if (limit !== null) {
+        if (!/^[0-9]{1,4}$/.test(limit) || Number(limit) < 1 || Number(limit) > 1e3) {
+          return sendJson(res, 400, { error: "bad_request", detail: "limit must be 1..1000" });
+        }
+        q2.limit = Number(limit);
+      }
+      try {
+        return sendJson(res, 200, await opts.backend.adminTeams(q2, ctx));
+      } catch (err) {
+        return failure(res, err, viewer);
+      }
+    }
+    const own = query.filter((k) => k !== "team");
+    const known = path === "/api/join" || path === "/api/me" || path === "/api/directory" || path === "/api/roster" || path === "/api/inbox/summary";
+    const requestMatch = /^\/api\/requests\/([^/]+)$/.exec(path);
+    if (!known && path !== "/api/activity" && !requestMatch) return sendJson(res, 404, { error: "not_found" });
+    if (requestMatch && (!REQUEST_ID_RE.test(requestMatch[1]) || own.length > 0)) return sendJson(res, 404, { error: "not_found" });
+    if (known && own.length > 0) return sendJson(res, 400, { error: "bad_request", detail: "no query parameters here" });
+    const q = {};
+    if (path === "/api/activity") {
+      for (const k of own) {
         if (k !== "since" && k !== "limit") return sendJson(res, 400, { error: "bad_request", detail: `unknown parameter ${k.slice(0, 40)}` });
       }
       if (url.searchParams.getAll("since").length > 1 || url.searchParams.getAll("limit").length > 1) {
@@ -23868,17 +24511,38 @@ function createConsoleServer(opts) {
         }
         q.limit = Number(limit);
       }
-      call = () => opts.backend.activity(q, ctx);
-    } else {
-      const m = /^\/api\/requests\/([^/]+)$/.exec(path);
-      if (!m || !REQUEST_ID_RE.test(m[1]) || query.length > 0) return sendJson(res, 404, { error: "not_found" });
-      const id = m[1];
-      call = () => opts.backend.request(id, ctx);
+    }
+    if (path === "/api/join" && !hosted2) {
+      const asked = askedTeam(req, res, url);
+      if (asked === null) return;
+      if (!opts.join) return sendJson(res, 404, { error: "not_found" });
+      return sendJson(res, 200, { ...opts.join, team: asked ?? opts.join.team });
+    }
+    const team = await resolveTeam(req, res, url, ctx);
+    if (team === null) return;
+    const on = { ...ctx, team };
+    if (path === "/api/join") {
+      if (!opts.join) return sendJson(res, 404, { error: "not_found" });
+      return sendJson(res, 200, { ...opts.join, team });
+    }
+    let call;
+    if (path === "/api/me") {
+      call = async () => {
+        const me = await opts.backend.me(on);
+        return on.viewer !== void 0 && me !== null && typeof me === "object" && !Array.isArray(me) ? { ...me, email: on.viewer } : me;
+      };
+    } else if (path === "/api/directory") call = () => opts.backend.directory(on);
+    else if (path === "/api/inbox/summary") call = () => opts.backend.inboxSummary(on);
+    else if (path === "/api/roster") call = () => opts.backend.roster(on);
+    else if (path === "/api/activity") call = () => opts.backend.activity(q, on);
+    else {
+      const rid = requestMatch[1];
+      call = () => opts.backend.request(rid, on);
     }
     try {
       return sendJson(res, 200, await call());
     } catch (err) {
-      return failure(res, err, viewer);
+      return failure(res, err, viewer, requestMatch ? void 0 : team);
     }
   }
   function staticFile(req, res, url) {
@@ -24124,7 +24788,7 @@ function describeError(err) {
 var log = makeLogger("console");
 var DEFAULT_PORT = 4317;
 var USAGE = `usage: bin/console [--demo] [--open]
-  --demo  serve a synthetic team (demo: alice, bob, carol) instead of calling the relay
+  --demo  serve synthetic teams (demo: alice, bob, carol) instead of calling the relay
   --open  open the console in the default browser (by way of a private, short-lived file)
 Signs in as you with the credential /team-relay:login stored; nothing else is needed.
 Environment: CONSOLE_PORT (default ${DEFAULT_PORT}; 0 picks a free port), and optionally
@@ -24132,7 +24796,7 @@ RELAY_URL, RELAY_TEAM, RELAY_AUTH (credential|google|token), RELAY_GCLOUD_ACCOUN
 JOIN_MARKETPLACE (optional; GitHub owner/repo or https URL) and JOIN_REPO_URL (optional, https):
 what the join panel tells new members to add as a plugin marketplace.
 CONSOLE_MODE=hosted is for the container only (PORT, CONSOLE_PUBLIC_HOST, IAP_AUDIENCE,
-RELAY_URL, RELAY_TEAM, RELAY_AUTH=metadata, JOIN_MARKETPLACE, JOIN_REPO_URL).`;
+CONSOLE_IP_HASH_SALT, RELAY_URL, RELAY_TEAM, RELAY_AUTH=metadata, JOIN_MARKETPLACE, JOIN_REPO_URL).`;
 function fail(message2, code = 1) {
   process.stderr.write(`console: ${message2}
 `);
@@ -24172,11 +24836,13 @@ async function hosted() {
   let backend;
   let team;
   let join6;
+  let ipHashSalt;
   try {
     const repoUrl = checkJoinRepoUrl(env.JOIN_REPO_URL);
     const marketplace = checkJoinMarketplace(env.JOIN_MARKETPLACE);
     publicHost = checkPublicHost(configValue(env.CONSOLE_PUBLIC_HOST));
     audience = checkIapAudience(configValue(env.IAP_AUDIENCE));
+    ipHashSalt = checkIpHashSalt(env.CONSOLE_IP_HASH_SALT);
     if (authModeFromEnv(env) !== "metadata") throw new Error("CONSOLE_MODE=hosted needs RELAY_AUTH=metadata");
     const client = relayClientFromEnv(env);
     backend = relayBackend(client);
@@ -24188,14 +24854,14 @@ async function hosted() {
   const keys = new IapKeySet({ log });
   const verify = iapVerifier({ audience, keys, log });
   const staticDir = fileURLToPath3(new URL("./console/", import.meta.url));
-  const app = createConsoleServer({ backend, hosted: { publicHost, verify }, staticDir, join: join6, log });
+  const app = createConsoleServer({ backend, hosted: { publicHost, verify, ipHashSalt }, staticDir, join: join6, log });
   let bound;
   try {
     bound = await app.listen(port);
   } catch (err) {
     fail(`cannot listen on 0.0.0.0:${port} (${err.code ?? describeError(err)})`);
   }
-  log(`hosted: serving team ${team} for ${publicHost} on 0.0.0.0:${bound}, behind IAP`);
+  log(`hosted: serving the viewer's teams (default ${team}) for ${publicHost} on 0.0.0.0:${bound}, behind IAP`);
   const stop = () => {
     void app.close().finally(() => process.exit(0));
     setTimeout(() => process.exit(0), 2e3).unref();
@@ -24221,8 +24887,8 @@ async function main() {
   let label;
   let join6;
   if (flags.demo) {
-    backend = demoBackend(new DemoTeam());
-    label = "demo team (synthetic: alice, bob, carol)";
+    backend = demoBackend(new DemoAccount());
+    label = "demo teams (synthetic: alice, bob, carol)";
     join6 = DEMO_JOIN;
   } else {
     let client;

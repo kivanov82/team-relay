@@ -14986,10 +14986,13 @@ function configValue(v) {
   if (!t || /^\$\{user_config\.[A-Za-z0-9_]+\}$/.test(t)) return void 0;
   return t;
 }
+function staticTokenProvider(read) {
+  return Object.assign(typeof read === "string" ? () => read : read, { kind: "static" });
+}
 function tokenProviderFromEnv(env) {
   const file = configValue(env.RELAY_TOKEN_FILE);
   if (file) {
-    return () => {
+    return staticTokenProvider(() => {
       let raw;
       try {
         raw = readFileSync3(file, "utf8");
@@ -14999,11 +15002,11 @@ function tokenProviderFromEnv(env) {
       const token2 = raw.replace(/[\r\n]+$/, "");
       if (!token2) throw new Error("RELAY_TOKEN_FILE is empty");
       return token2;
-    };
+    });
   }
   const token = configValue(env.RELAY_TOKEN);
   if (!token) throw new Error('RELAY_AUTH is "token", so RELAY_TOKEN or RELAY_TOKEN_FILE must be set');
-  return () => token;
+  return staticTokenProvider(token);
 }
 var TOKEN_REFRESH_MARGIN_MS = 5 * 6e4;
 var JWT_RE = /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/;

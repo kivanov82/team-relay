@@ -168,10 +168,13 @@ function configValue(v) {
   if (!t || /^\$\{user_config\.[A-Za-z0-9_]+\}$/.test(t)) return void 0;
   return t;
 }
+function staticTokenProvider(read) {
+  return Object.assign(typeof read === "string" ? () => read : read, { kind: "static" });
+}
 function tokenProviderFromEnv(env) {
   const file = configValue(env.RELAY_TOKEN_FILE);
   if (file) {
-    return () => {
+    return staticTokenProvider(() => {
       let raw;
       try {
         raw = readFileSync2(file, "utf8");
@@ -181,11 +184,11 @@ function tokenProviderFromEnv(env) {
       const token2 = raw.replace(/[\r\n]+$/, "");
       if (!token2) throw new Error("RELAY_TOKEN_FILE is empty");
       return token2;
-    };
+    });
   }
   const token = configValue(env.RELAY_TOKEN);
   if (!token) throw new Error('RELAY_AUTH is "token", so RELAY_TOKEN or RELAY_TOKEN_FILE must be set');
-  return () => token;
+  return staticTokenProvider(token);
 }
 var TOKEN_REFRESH_MARGIN_MS = 5 * 6e4;
 var JWT_RE = /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/;
@@ -279,10 +282,12 @@ function credentialTokenProvider(path, bound) {
 function isCredentialProvider(p) {
   return p.kind === "credential";
 }
+var CLIENT_IP_HASH_RE = /^[0-9a-f]{64}$/;
 var ON_BEHALF_OF_RE = /^[a-z0-9._%+-]{1,64}@[a-z0-9.-]{1,253}$/;
 var defaultSleep = (ms) => new Promise((r) => setTimeout(r, ms));
-var RelayClient = class {
+var RelayClient = class _RelayClient {
   team;
+  opts;
   base;
   token;
   backoff;
@@ -293,6 +298,7 @@ var RelayClient = class {
   userAgent;
   constructor(opts) {
     if (!TEAM_RE.test(opts.team)) throw new Error("RELAY_TEAM is not a valid team id");
+    this.opts = opts;
     this.team = opts.team;
     const base = parseRelayUrl(opts.url);
     if (!base.pathname.endsWith("/")) base.pathname += "/";
@@ -305,6 +311,21 @@ var RelayClient = class {
     this.random = opts.random ?? Math.random;
     this.userAgent = opts.userAgent ?? "team-relay-plugin/0.1.0";
   }
+  /**
+   * The same relay, sign-in and settings for another team (M9-SPEC §5: the hosted console's
+   * delegate reads any team its viewer is on). The team id is checked like RELAY_TEAM.
+   */
+  withTeam(team) {
+    if (team === this.team) return this;
+    return new _RelayClient({ ...this.opts, team });
+  }
+  /**
+   * True when this client signs in with a stored device credential or a static token, which
+   * are bound to one team (no Google identity for the account routes).
+   */
+  get boundToTeam() {
+    return isCredentialProvider(this.token) || this.token.kind === "static";
+  }
   /** The relay's base URL (without a trailing slash). */
   get url() {
     return this.base.toString().replace(/\/$/, "");
@@ -312,7 +333,7 @@ var RelayClient = class {
   teamPath(...parts) {
     return ["v1", "teams", this.team, ...parts].map(encodeURIComponent).join("/");
   }
-  async once(method, path, body, timeoutMs, signal, onBehalfOf) {
+  async once(method, path, body, timeoutMs, signal, onBehalfOf, clientIpHash) {
     const url = new URL(path, this.base);
     const headers = {
       Accept: "application/json",
@@ -322,6 +343,10 @@ var RelayClient = class {
     if (onBehalfOf !== void 0) {
       if (!ON_BEHALF_OF_RE.test(onBehalfOf)) throw new Error("X-Relay-On-Behalf-Of must be a lower-case email address");
       headers["X-Relay-On-Behalf-Of"] = onBehalfOf;
+    }
+    if (clientIpHash !== void 0) {
+      if (!CLIENT_IP_HASH_RE.test(clientIpHash)) throw new Error("X-Relay-Client-IP-Hash must be 64 lower-case hex characters");
+      headers["X-Relay-Client-IP-Hash"] = clientIpHash;
     }
     let payload;
     if (body !== void 0) {
@@ -371,7 +396,7 @@ var RelayClient = class {
     let refreshed = false;
     for (let attempt = 0; ; ) {
       try {
-        return await this.once(method, path, body, timeoutMs, opts.signal, opts.onBehalfOf);
+        return await this.once(method, path, body, timeoutMs, opts.signal, opts.onBehalfOf, opts.clientIpHash);
       } catch (err) {
         if (opts.signal?.aborted) throw err;
         if (err instanceof RelayError && err.status === 401 && !refreshed && this.token.invalidate) {
@@ -486,6 +511,48 @@ var RelayClient = class {
   /** M5-SPEC §3: revoke the credential this client signs in with (logout). */
   revokeSelf(opts) {
     return this.call("DELETE", this.teamPath("credentials", "self"), void 0, { attempts: 1, ...opts });
+  }
+  // M9-SPEC §2, §4, §7: the account routes. They take a Google identity (a Google ID token,
+  // or a delegate on behalf of an email); a device credential or a static token is refused
+  // with 403 google_identity_required. The mutations are sent once.
+  /** The teams (and invitations) of the signed-in Google account. */
+  myTeams(opts) {
+    return this.call("GET", "v1/me/teams", void 0, opts);
+  }
+  /** Create a team; the caller becomes its first owner. */
+  createTeam(body, opts) {
+    return this.call("POST", "v1/teams", body, { attempts: 1, ...opts });
+  }
+  /** Accept or decline an invitation to `team`. */
+  answerInvitation(team, accept, opts) {
+    if (!TEAM_RE.test(team)) throw new Error("invalid team id");
+    return this.call("POST", ["v1", "me", "invitations", team].map(encodeURIComponent).join("/"), { accept }, {
+      attempts: 1,
+      ...opts
+    });
+  }
+  /** An owner deletes this client's team (M9-SPEC §7.7); `confirm` is the team id typed again. */
+  deleteTeam(confirm, opts) {
+    return this.call("DELETE", ["v1", "teams", this.team].map(encodeURIComponent).join("/"), { confirm }, {
+      attempts: 1,
+      ...opts
+    });
+  }
+  /** Relay admins (M9-SPEC §4): every team, a page at a time. */
+  adminTeams(q = {}, opts) {
+    const params = new URLSearchParams();
+    if (q.after !== void 0) params.set("after", q.after);
+    if (q.limit !== void 0) params.set("limit", String(q.limit));
+    const qs = params.toString();
+    return this.call("GET", "v1/admin/teams" + (qs ? `?${qs}` : ""), void 0, opts);
+  }
+  /** Relay admins (M9-SPEC §4): delete a team; `confirm` is its id typed again. */
+  adminDeleteTeam(team, confirm, opts) {
+    if (!TEAM_RE.test(team)) throw new Error("invalid team id");
+    return this.call("DELETE", ["v1", "admin", "teams", team].map(encodeURIComponent).join("/"), { confirm }, {
+      attempts: 1,
+      ...opts
+    });
   }
   /** M2-SPEC §3.5: the team's activity feed. */
   activity(q = {}, opts) {
