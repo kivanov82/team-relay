@@ -13,7 +13,7 @@ import pytest
 from relay.credentials import CREDENTIAL_CACHE_TTL, LAST_USED_INTERVAL
 from relay.store import MAX_LIVE_CREDENTIALS
 
-from .conftest import Api, auth, delegate_auth
+from .conftest import Api, accept_invitation, auth, delegate_auth
 from .login_helpers import bearer, login
 
 pytestmark = pytest.mark.anyio
@@ -234,6 +234,7 @@ async def _add(api: Api, member: str, email: str) -> None:
         api.url("/roster"), headers=auth("alice"), json={"member": member, "email": email}
     )
     assert r.status_code == 201, r.text
+    await accept_invitation(api.client, api.team, email)  # M9-SPEC §7.2
 
 
 async def test_a_removed_member_is_refused_and_their_credentials_revoked(api: Api):

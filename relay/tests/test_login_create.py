@@ -211,7 +211,7 @@ async def test_a_refused_creation_shows_the_form_again_escaped(api: Api):
         started2.cookie,
         fields(hidden_csrf(page2.text), team=taken, member="ok2", action="create"),
     )
-    assert r.status_code == 409 and "That team id is taken" in r.text
+    assert r.status_code == 409 and "That team id is not available" in r.text
     assert field_value(r.text, "team") == taken
     # A reserved id made from the name is shown, to edit.
     r = await post_create(

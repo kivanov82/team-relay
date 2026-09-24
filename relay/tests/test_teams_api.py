@@ -30,6 +30,7 @@ from .conftest import (
     EMAILS,
     Api,
     FakeClock,
+    accept_invitation,
     auth,
     id_token,
     open_api,
@@ -91,8 +92,25 @@ def google(email: str, sub: str | None = None) -> dict[str, str]:
     return {"Authorization": f"Bearer {id_token(email, sub or google_sub(email))}"}
 
 
-def any_delegate(email: str) -> dict[str, str]:
-    return {"Authorization": f"Bearer {DELEGATE_TOKENS['any']}", "X-Relay-On-Behalf-Of": email}
+# M9-SPEC §7.6: the console reports its viewer's address, salted and hashed.
+CONSOLE_IP_HASH = hashlib.sha256(b"salt|203.0.113.7").hexdigest()
+
+
+def any_delegate(email: str, ip_hash: str | None = CONSOLE_IP_HASH) -> dict[str, str]:
+    """The any-team console's headers for the viewer ``email`` (and the address it saw)."""
+    headers = {"Authorization": f"Bearer {DELEGATE_TOKENS['any']}", "X-Relay-On-Behalf-Of": email}
+    if ip_hash is not None:
+        headers["X-Relay-Client-IP-Hash"] = ip_hash
+    return headers
+
+
+async def invite(api: Api, team: str, owner: str, member: str, email: str) -> None:
+    """``owner`` invites ``email`` as ``member`` and they accept (M9-SPEC §7.2)."""
+    r = await api.client.post(
+        f"/v1/teams/{team}/roster", json={"member": member, "email": email}, headers=google(owner)
+    )
+    assert r.status_code == 201, r.text
+    await accept_invitation(api.client, team, email)
 
 
 async def create(
@@ -241,7 +259,7 @@ async def test_reserved_ids_and_the_files_ids_are_refused(api: Api):
             continue  # "v1", "api"-like short ids never match the id shape anyway
         r = await create(api, email, team)
         assert r.status_code == 409, (team, r.text)
-        assert r.json()["error"] == "team_id_reserved"
+        assert r.json()["error"] == "team_id_unavailable"
     r = await create(api, email, "v1")
     assert r.status_code == 422
     account = await api.store.get_account(email_hash(email))
@@ -251,7 +269,7 @@ async def test_reserved_ids_and_the_files_ids_are_refused(api: Api):
 async def test_a_taken_id_is_409(api: Api):
     team = await made(api, new_email())
     r = await create(api, new_email(), team)
-    assert r.status_code == 409 and r.json()["error"] == "team_exists"
+    assert r.status_code == 409 and r.json()["error"] == "team_id_unavailable"
 
 
 async def test_concurrent_creations_of_one_id_create_one_team(api: Api):
@@ -260,7 +278,7 @@ async def test_concurrent_creations_of_one_id_create_one_team(api: Api):
     responses = await asyncio.gather(*(create(api, e, team) for e in emails))
     codes = sorted(r.status_code for r in responses)
     assert codes == [201, 409, 409, 409, 409], [r.text for r in responses]
-    assert {r.json()["error"] for r in responses if r.status_code == 409} == {"team_exists"}
+    assert {r.json()["error"] for r in responses if r.status_code == 409} == {"team_id_unavailable"}
     assert len((await api.store.read_roster(team)).entries) == 1
 
 
@@ -350,12 +368,13 @@ async def test_creations_per_ip_per_hour(kind: str, clock: FakeClock):
                 headers=google(new_email()),
             )
             assert r.status_code == 429 and "this address" in r.json()["detail"]
-            # The console's delegate calls from the console's address: the account limits
-            # alone count for it.
+            # The console's delegate calls from the console's address: the address it reports
+            # (M9-SPEC §7.6) counts instead, not this one.
+            reported = hashlib.sha256(uuid.uuid4().bytes).hexdigest()
             r = await client.post(
                 "/v1/teams",
                 json={"name": "N", "id": new_id(), "owner_member_id": "o1"},
-                headers=any_delegate(new_email()),
+                headers=any_delegate(new_email(), reported),
             )
             assert r.status_code == 201, r.text
 
@@ -384,10 +403,7 @@ async def test_a_created_team_works_like_any_other(api: Api):
     flow), and they exchange a question."""
     owner, member = new_email(), new_email()
     team = await made(api, owner, member="olga")
-    r = await api.client.post(
-        f"/v1/teams/{team}/roster", json={"member": "max", "email": member}, headers=google(owner)
-    )
-    assert r.status_code == 201, r.text
+    await invite(api, team, owner, "max", member)
     signed_in = await login(api, email=member, team=team)
     assert (signed_in["team"], signed_in["member"]) == (team, "max")
     credential = bearer(signed_in["credential"])
@@ -438,12 +454,7 @@ async def test_my_teams_lists_the_files_and_the_created_ones(kind: str, clock: F
         team = await made(api, email, new_id("z"), member="al")
         other_owner = new_email()
         joined = await made(api, other_owner, new_id("y"))
-        r = await api.client.post(
-            f"/v1/teams/{joined}/roster",
-            json={"member": "ally", "email": email},
-            headers=google(other_owner),
-        )
-        assert r.status_code == 201
+        await invite(api, joined, other_owner, "ally", email)
         r = await api.client.get("/v1/me/teams", headers=google(email))
         assert r.status_code == 200, r.text
         assert r.json() == {
@@ -452,6 +463,7 @@ async def test_my_teams_lists_the_files_and_the_created_ones(kind: str, clock: F
                 {"team": joined, "name": "Platform team", "member": "ally", "role": "member"},
                 {"team": team, "name": "Platform team", "member": "al", "role": "owner"},
             ],
+            "invitations": [],
             "admin": False,
             "teams_created": 1,
             "max_teams_created": 3,
@@ -516,11 +528,7 @@ async def test_the_admin_lists_every_team_without_emails_or_content(api: Api):
     prefix = new_id("a")[:12]
     owner = new_email()
     team = await made(api, owner, prefix + "-one", member="olga")
-    await api.client.post(
-        f"/v1/teams/{team}/roster",
-        json={"member": "max", "email": new_email()},
-        headers=google(owner),
-    )
+    await invite(api, team, owner, "max", new_email())
     r = await api.client.get("/v1/admin/teams", params={"limit": 1}, headers=google(ADMIN))
     assert r.status_code == 200, r.text
     listing = r.json()
@@ -616,9 +624,7 @@ async def test_delete_asks_for_the_id_typed_and_spares_the_files_teams(api: Api)
 async def test_deleting_a_team_refuses_everyone_at_once_on_every_instance(api: Api):
     owner, member = new_email(), new_email()
     team = await made(api, owner, member="olga")
-    await api.client.post(
-        f"/v1/teams/{team}/roster", json={"member": "max", "email": member}, headers=google(owner)
-    )
+    await invite(api, team, owner, "max", member)
     credential = bearer((await login(api, email=member, team=team))["credential"])
     async with api.instance() as (other, _):
         # Both instances have the team, the roster and the credential cached.
@@ -667,13 +673,11 @@ async def test_deleting_a_team_refuses_everyone_at_once_on_every_instance(api: A
 async def test_the_id_stays_reserved_for_31_days_then_starts_clean(api: Api):
     owner, member = new_email(), new_email()
     team = await made(api, owner, member="olga")
-    await api.client.post(
-        f"/v1/teams/{team}/roster", json={"member": "max", "email": member}, headers=google(owner)
-    )
+    await invite(api, team, owner, "max", member)
     credential = bearer((await login(api, email=member, team=team))["credential"])
     assert (await admin_delete(api, team)).status_code == 200
     r = await create(api, new_email(), team)
-    assert r.status_code == 409 and r.json()["error"] == "team_id_reserved"
+    assert r.status_code == 409 and r.json()["error"] == "team_id_unavailable"
     prefix = team
     rows = await admin_rows(api, prefix[:-1])
     assert rows[team]["status"] == "deleted" and rows[team]["removal"] == "complete"
@@ -688,7 +692,8 @@ async def test_the_id_stays_reserved_for_31_days_then_starts_clean(api: Api):
     r = await api.client.get(f"/v1/teams/{team}/me", headers=google(owner))
     assert r.status_code == 401
     record = (await api.store.get_teams([team]))[team]
-    assert record.roster_version == 4  # the old one's 3, then one: no stale cache matches
+    # The old one's 3 (created, invited, accepted), then one: no stale cache matches.
+    assert record.roster_version == 4
 
 
 async def test_a_removal_that_runs_out_of_budget_resumes(api: Api, monkeypatch):
@@ -753,7 +758,7 @@ async def test_a_roster_change_racing_a_deletion_writes_nothing(api: Api):
     owner = new_email()
     team = await made(api, owner, member="olga")
     service = api.app.state.service
-    await service.teams.delete(team, actor_email=ADMIN, confirm=team)
+    await service.teams.delete(team, actor_sha256=email_hash(ADMIN), confirm=team)
     with pytest.raises(Exception) as caught:
         await service.roster_add(
             Caller(team=team, member="olga"), {"member": "x1", "email": new_email()}
@@ -786,9 +791,9 @@ async def test_the_any_team_delegate_acts_per_team_as_the_member_is(kind: str, c
         assert (r.json()["member"], r.json()["role"]) == ("bo", "owner")
         r = await api.client.get(api.url("/me"), headers=headers)
         assert (r.json()["member"], r.json()["role"]) == ("bob", "member")
-        # Not theirs: 403 not_a_member; not a team (or not any more): 404.
+        # Not theirs and not a team (or not any more) are one answer (M9-SPEC §7.3): 404.
         r = await api.client.get(f"/v1/teams/{stranger}/me", headers=headers)
-        assert r.status_code == 403 and r.json()["error"] == "not_a_member"
+        assert r.status_code == 404 and r.json() == {"error": "not_found"}
         assert (
             await api.client.get(f"/v1/teams/{new_id()}/me", headers=headers)
         ).status_code == 404

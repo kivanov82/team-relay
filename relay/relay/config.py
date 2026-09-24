@@ -87,6 +87,12 @@ def normalise_email(raw: Any) -> str | None:
     return raw.lower()
 
 
+def fold_team_name(name: str) -> str:
+    """What two team names are compared by (M9-SPEC §7.2): case folded, whitespace runs
+    folded to one space, surrounding whitespace dropped."""
+    return " ".join(name.split()).casefold()
+
+
 def normalise_team_name(raw: Any) -> str | None:
     """A team's display name (M9-SPEC §1): surrounding whitespace dropped, then 1 to 60
     characters, none of them a control, format, private-use, unassigned or separator
@@ -144,6 +150,16 @@ class _LimitsFile(_Strict):
     members_per_team: int = Field(default=MAX_MEMBERS_PER_TEAM, ge=1, le=MAX_MEMBERS_PER_TEAM)
     team_creations_per_account_per_day: int = Field(default=10, ge=1, le=1000)
     team_creations_per_ip_per_hour: int = Field(default=30, ge=1, le=10000)
+    # M9-SPEC §7.4: every attempt to create a team (refused ones included) per account (its
+    # email and its Google sub) and hour.
+    team_create_attempts_per_account_per_hour: int = Field(default=30, ge=1, le=10000)
+    # M9-SPEC §7.6: team creations per delegate (the console) and hour.
+    team_creations_per_delegate_per_hour: int = Field(default=60, ge=1, le=10000)
+    # M9-SPEC §7.8: admin deletions through a delegate, per delegate and hour.
+    admin_deletes_per_delegate_per_hour: int = Field(default=5, ge=1, le=1000)
+    # M9-SPEC §7.9: requests per principal and minute that are not (yet) known to come from
+    # a member of the team they name, counted before the membership check.
+    non_member_requests_per_minute: int = Field(default=60, ge=1, le=10000)
 
 
 class _DelegateFile(_Strict):
@@ -181,6 +197,10 @@ class Limits:
     members_per_team: int = MAX_MEMBERS_PER_TEAM
     team_creations_per_account_per_day: int = 10
     team_creations_per_ip_per_hour: int = 30
+    team_create_attempts_per_account_per_hour: int = 30
+    team_creations_per_delegate_per_hour: int = 60
+    admin_deletes_per_delegate_per_hour: int = 5
+    non_member_requests_per_minute: int = 60
 
 
 @dataclass(frozen=True)
@@ -255,6 +275,12 @@ class TeamConfig:
 
     def team_ids(self) -> tuple[str, ...]:
         return tuple(self.teams)
+
+    def is_file_team_name(self, name: str) -> bool:
+        """Whether ``name`` equals a file team's display name (its id when it has none),
+        compared by :func:`fold_team_name` (M9-SPEC §7.2)."""
+        folded = fold_team_name(name)
+        return any(fold_team_name(t.display_name) == folded for t in self.teams.values())
 
     def is_admin(self, email: str) -> bool:
         return email in self.admins

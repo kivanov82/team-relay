@@ -33,6 +33,15 @@
   ``sub``), adds the team to the login's choices and shows the chooser with it preselected.
   A refused creation shows the form again with the reason and the member's own input
   (escaped). Back shows the chooser; Cancel ends the login as the chooser's Cancel does.
+  Every create attempt counts against the account's hourly quota (M9-SPEC §7.4).
+- Invitations (M9-SPEC §7.2): an invited entry is not a team to choose. The chooser lists the
+  account's invitations; an account with invitations and no team sees the chooser (no radios,
+  no Continue) instead of the create page. ``POST /v1/login/invitation`` (``csrf``,
+  optionally ``team`` (the checked radio, ignored), and exactly one of ``accept`` or
+  ``decline`` naming the team) takes the chooser's cookie, Origin, CSRF and step rules.
+  Accepting makes the entry active, binds this Google account's ``sub`` and adds the team to
+  the login's choices (preselected); declining removes the entry. Either way the chooser is
+  shown again; an invitation no longer open shows it with a notice (``409``).
 """
 
 from __future__ import annotations
@@ -68,6 +77,7 @@ from .oauth import OAuthError, OAuthProvider, pkce_challenge
 from .pages import (
     SECURITY_HEADERS,
     CreateForm,
+    InvitationView,
     chooser_page,
     create_page,
     html_response,
@@ -115,6 +125,7 @@ AGAIN = "Run /team-relay:login in Claude Code to start again."
 CREATE_ACTION = "/v1/login/create"
 CHOOSE_FIELDS = frozenset({"csrf", "team", "action"})
 CREATE_FIELDS = frozenset({"csrf", "name", "team", "member", "action"})
+INVITATION_FIELDS = frozenset({"csrf", "team", "accept", "decline"})
 REBOUND_TITLE = "This email now belongs to a different Google account"
 REBOUND_LINE = "Ask the owner."
 
@@ -394,11 +405,33 @@ class LoginService:
             log_event("login_no_team", login=key[:12])
         return await self._chooser(chosen, csrf)
 
-    async def _chooser(self, login: LoginDoc, csrf: str, preselect: str | None = None) -> Response:
-        """The chooser; for an account on no team, the create page (M9-SPEC §3)."""
+    async def _chooser(
+        self,
+        login: LoginDoc,
+        csrf: str,
+        preselect: str | None = None,
+        notice: str | None = None,
+        status: int = 200,
+    ) -> Response:
+        """The chooser, with the account's open invitations (M9-SPEC §7.2); for an account
+        on no team and invited nowhere, the create page (M9-SPEC §3)."""
         assert login.email is not None
-        if not login.choices:
-            return self._create_page(login, csrf, CreateForm(CREATE_ACTION))
+        chosen = {c.team for c in login.choices}
+        invitations = [
+            InvitationView(
+                team=row["team"],
+                name=row["name"],
+                member=row["member"],
+                invited_by=row["invited_by_member"],
+            )
+            for row in await self._teams.invitations(login.email, login.sub)
+            if row["team"] not in chosen
+        ]
+        if not login.choices and not invitations:
+            # With a notice the page cannot prefill itself (it keeps what a refusal shows).
+            member = suggest_member_id(login.email) if notice else ""
+            form = CreateForm(CREATE_ACTION, member=member, error=notice)
+            return self._create_page(login, csrf, form, status)
         names = {c.team: await self._teams.name(c.team) for c in login.choices}
         page = chooser_page(
             email=login.email,
@@ -408,8 +441,10 @@ class LoginService:
             action="/v1/login/choose",
             names=names,
             preselect=preselect,
+            invitations=invitations,
+            notice=notice,
         )
-        return html_response(page)
+        return html_response(page, status)
 
     def _create_page(
         self, login: LoginDoc, csrf: str, form: CreateForm, status: int = 200
@@ -615,6 +650,7 @@ class LoginService:
         team = form.fields.get("team", "").strip()
         member = form.fields.get("member", "").strip()
         try:
+            await self._teams.count_attempt(current.email, current.sub)  # M9-SPEC §7.4
             body: NewTeam = parse_new_team(
                 {"name": name, "owner_member_id": member, **({"id": team} if team else {})}
             )
@@ -659,6 +695,89 @@ class LoginService:
                 clear=True,
             )
         log_event("login_team_created", login=key[:12], team=choice.team, member=choice.member)
+        return await self._chooser(offered, csrf, preselect=choice.team)
+
+    # POST /v1/login/invitation (M9-SPEC §7.2) -----------------------------------------------
+    async def invitation(self, request: Request) -> Response:
+        if not await self._allow(request, "page", self._limits.login_pages_per_minute):
+            return self._busy()
+        origin = request.headers.get("origin")
+        if origin is not None and origin != self.public_url:
+            self._refused("cross_origin_invitation")
+            return self._page(403, "This request did not come from the sign-in page", AGAIN)
+        cookie = self._cookie_login(request)
+        if cookie is None:
+            self._refused("no_login_cookie")
+            return self._page(400, "This sign-in did not start in this browser", AGAIN)
+        form = await self._read_form(request, INVITATION_FIELDS)
+        answers = ([(True, form.fields["accept"])] if form and "accept" in form.fields else []) + (
+            [(False, form.fields["decline"])] if form and "decline" in form.fields else []
+        )
+        if form is None or len(answers) != 1:
+            self._refused("bad_form")
+            return self._page(400, "This form could not be read", AGAIN)
+        accept, team = answers[0]
+        key = _key(cookie)
+        csrf = form.fields.get("csrf", "")
+        now = self._now()
+        current = await self._store.mutate_login(key, lambda doc: LoginChange(result=doc))
+        if current is None or current.step != STEP_CHOOSE or now >= current.expire_at:
+            self._refused("login_not_choosing", login=key[:12])
+            return self._page(
+                400, "This sign-in has expired or was already used", AGAIN, clear=True
+            )
+        if (
+            current.csrf_sha256 is None
+            or TOKEN_RE.fullmatch(csrf) is None
+            or not _same(_key(csrf), current.csrf_sha256)
+        ):
+            self._refused("bad_csrf", login=key[:12])
+            return self._page(403, "This form has expired", AGAIN)
+        if current.email is None or current.sub is None:  # a login from before M6 §7.2
+            await self._close(key)
+            self._refused("login_without_sub", login=key[:12])
+            return self._page(400, "This sign-in has expired", AGAIN, clear=True)
+        try:
+            answered = await self._teams.answer_invitation(
+                team, email=current.email, sub=current.sub, accept=accept, via=None
+            )
+        except ApiError as err:
+            self._refused(f"invitation_{err.code}", login=key[:12])
+            if err.status == 403:  # the email is bound to another Google account
+                await self._close(key)
+                return self._page(403, REBOUND_TITLE, REBOUND_LINE, clear=True)
+            if err.status == 429:
+                notice, status = "Too many answers to invitations; try again later.", 429
+            else:
+                notice, status = "That invitation is no longer open.", 409
+            return await self._chooser(current, csrf, notice=notice, status=status)
+        if not accept:
+            log_event("login_invitation_declined", login=key[:12], team=team)
+            return await self._chooser(current, csrf)
+        choice = LoginChoice(team=answered["team"], member=answered["member"])
+        now = self._now()
+
+        def offer(doc: LoginDoc | None) -> LoginChange[LoginDoc | None]:
+            if (
+                doc is None
+                or doc.step != STEP_CHOOSE
+                or now >= doc.expire_at
+                or doc.csrf_sha256 != current.csrf_sha256
+            ):
+                return LoginChange(result=None)
+            doc.choices = [c for c in doc.choices if c.team != choice.team] + [choice]
+            return LoginChange(result=doc, login=doc)
+
+        offered = await self._store.mutate_login(key, offer)
+        if offered is None:
+            self._refused("login_not_choosing", login=key[:12])
+            return self._page(
+                400,
+                "This sign-in has expired",
+                "You joined the team. " + AGAIN,
+                clear=True,
+            )
+        log_event("login_invitation_accepted", login=key[:12], team=choice.team)
         return await self._chooser(offered, csrf, preselect=choice.team)
 
     def _loopback(self, login: LoginDoc, params: Mapping[str, str]) -> Response:

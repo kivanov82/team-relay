@@ -35,6 +35,7 @@ from .conftest import (
     TOKENS,
     Api,
     FakeClock,
+    accept_invitation,
     auth,
     open_api,
     principal,
@@ -55,10 +56,17 @@ async def _roster(api: Api, member: str = "alice", headers: dict[str, str] | Non
     return {m["member"]: m for m in r.json()["members"]}
 
 
-async def _add(api: Api, member: str, email: str, *, by: str = "alice", **extra: Any):
-    return await api.client.post(
+async def _add(
+    api: Api, member: str, email: str, *, by: str = "alice", accept: bool = True, **extra: Any
+):
+    """Add ``member`` (an invitation, M9-SPEC §7.2) and, with ``accept``, have them accept it
+    at once with their own Google account; the add's response either way."""
+    r = await api.client.post(
         api.url("/roster"), headers=auth(by), json={"member": member, "email": email, **extra}
     )
+    if accept and r.status_code == 201:
+        await accept_invitation(api.client, api.team, email)
+    return r
 
 
 async def _patch(api: Api, member: str, body: dict[str, Any], by: str = "alice"):
@@ -218,8 +226,10 @@ async def test_an_owner_adds_a_member_who_then_works(api: Api):
         "role": "member",
         "added_by": "alice",
         "added_at": "2026-09-23T12:00:00.000Z",
+        "status": "invited",
     }
-    # At once on this instance: in the directory, a valid recipient, and able to sign in.
+    # Accepted (by _add), at once on this instance: in the directory, a valid recipient, and
+    # able to sign in.
     directory = await api.directory("alice")
     assert "erin" in directory and directory["erin"]["stats"]["asked"] == 0
     rid = await api.ask("alice", to=["erin"])
@@ -527,7 +537,9 @@ def test_the_default_is_thirty():
 
 async def test_changes_are_audited_with_email_hashes_only(api: Api):
     # One second apart: the audit is ordered by time, and entries of one instant are not.
-    await _add(api, "erin", "erin@example.com")
+    await _add(api, "erin", "erin@example.com", accept=False)
+    api.clock.advance(1)
+    await accept_invitation(api.client, api.team, "erin@example.com")
     api.clock.advance(1)
     await _patch(api, "erin", {"role": "owner"})
     api.clock.advance(1)
@@ -543,16 +555,18 @@ async def test_changes_are_audited_with_email_hashes_only(api: Api):
     await _delete(api, "erin")
     entries = [e for e in await api.store.list_audit(api.team) if e.action.startswith("roster.")]
     assert [(e.action, e.actor, e.member, e.outcome) for e in entries] == [
-        ("roster.add", "alice", "erin", "added"),
+        ("roster.add", "alice", "erin", "invited"),
+        # M9-SPEC §7.2: she accepts with her Google account, which binds it (M6-SPEC §7.2),
+        # so her first sign-in has nothing left to bind.
+        ("roster.accept", "erin", "erin", "accepted"),
         ("roster.role", "alice", "erin", "changed"),
-        ("roster.bind", "erin", "erin", "bound"),  # her first sign-in (M6-SPEC §7.2)
         ("roster.email_add", "erin", "erin", "changed"),
         ("roster.email_remove", "alice", "erin", "changed"),
         ("roster.remove", "alice", "erin", "removed"),
     ]
     by_action = {e.action: e for e in entries}
     assert by_action["roster.add"].email_sha256 == [_sha("erin@example.com")]
-    assert by_action["roster.bind"].email_sha256 == [_sha("erin@example.com")]
+    assert by_action["roster.accept"].email_sha256 == [_sha("erin@example.com")]
     assert by_action["roster.email_add"].email_sha256 == [_sha("erin.two@example.com")]
     assert by_action["roster.email_remove"].email_sha256 == [_sha("erin@example.com")]
     assert by_action["roster.role"].email_sha256 == []
@@ -663,17 +677,23 @@ async def test_one_principal_two_teams(kind: str, clock: FakeClock):
         assert r.status_code == 404
         r = await api.client.get(api.url("/me"), headers={"Authorization": "Bearer stranger-1"})
         assert r.status_code == 401
-        # Adding bob to the second team's roster makes him a member there (same email).
+        # Adding bob to the second team's roster invites him there (same email); once he
+        # accepts (M9-SPEC §7.2) he is a member there.
         r = await api.client.post(
             f"/v1/teams/{other}/roster",
             headers=auth("dave"),
             json={"member": "bobby", "email": EMAILS["bob"]},
         )
         assert r.status_code == 201
+        # (bob is every test's bob on the shared emulator: this test's teams only.)
+        ours = {api.team, other}
+        chooser = await to_chooser(api.client, api.fake, EMAILS["bob"])
+        assert [t for t in chooser.teams if t in ours] == [api.team]
+        await accept_invitation(api.client, other, EMAILS["bob"])
         # bob's static token is bob in the first team only; his Google identity signs in to
         # either (the chooser offers both).
         chooser = await to_chooser(api.client, api.fake, EMAILS["bob"])
-        assert chooser.teams == [api.team, other]
+        assert [t for t in chooser.teams if t in ours] == [api.team, other]
         body = await login(api, "bob", team=other)
         assert (body["team"], body["member"]) == (other, "bobby")
 

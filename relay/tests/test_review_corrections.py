@@ -27,7 +27,16 @@ from relay.store import (
     RosterState,
 )
 
-from .conftest import EMAILS, Api, FakeClock, auth, delegate_auth, id_token, open_api
+from .conftest import (
+    EMAILS,
+    Api,
+    FakeClock,
+    accept_invitation,
+    auth,
+    delegate_auth,
+    id_token,
+    open_api,
+)
 from .login_helpers import (
     bearer,
     choose,
@@ -372,6 +381,7 @@ async def test_no_team_is_401_and_another_team_is_404(kind: str, clock: FakeCloc
             json={"member": f"e{erin}", "email": f"{erin}@example.com"},
         )
         assert r.status_code == 201
+        await accept_invitation(api.client, api.team, f"{erin}@example.com")
         cred = (await login(api, email=f"{erin}@example.com"))["credential"]
         r = await api.client.delete(api.url(f"/roster/e{erin}"), headers=auth("alice"))
         assert r.status_code == 200

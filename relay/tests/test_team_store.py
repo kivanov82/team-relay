@@ -104,7 +104,9 @@ def creating(team: str, email: str, member: str = "owner1", limit: int = 3):
     record = team_record(team, email, member)
     entry = owner_entry(member, email)
 
-    def fn(current: TeamRecord | None, account: AccountRecord | None) -> TeamCreation[str]:
+    def fn(
+        current: TeamRecord | None, account: AccountRecord | None, by_sub: AccountRecord | None
+    ) -> TeamCreation[str]:
         if current is not None:
             raise ApiError(409, "team_exists")
         if account is not None and len(account.created) >= limit:
@@ -246,7 +248,7 @@ async def test_create_writes_the_team_its_owner_the_index_and_the_audit(store: S
 async def test_a_creation_that_raises_writes_nothing(store: Store):
     team, email = new_id(), new_email()
 
-    def fn(current, account):
+    def fn(current, account, by_sub):
         raise ApiError(409, "nope")
 
     with pytest.raises(ApiError):
@@ -536,7 +538,7 @@ async def test_a_deleted_id_is_created_again_only_after_its_removal(store: Store
     assert await store.purge_team(team, 1000)
     later = NOW + timedelta(days=32)
 
-    def again(current, account):
+    def again(current, account, by_sub):
         assert current is not None and current.status == TEAM_DELETED and current.purge_complete
         record = replace(
             team_record(team, email, "newowner"),

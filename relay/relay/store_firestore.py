@@ -54,6 +54,8 @@ from .jsonutil import canonical_json
 from .store import (
     DELIVERY_SCAN_LIMIT,
     MAX_LIVE_CREDENTIALS,
+    MEMBER_ACTIVE,
+    MEMBER_INVITED,
     PURGE_BATCH,
     STREAM_SCAN_LIMIT,
     TEAM_ACTIVE,
@@ -379,6 +381,7 @@ def _roster_to_doc(entry: RosterEntry) -> dict[str, Any]:
         "updated_at": entry.updated_at,
         # A list, not a map: an email is not a safe Firestore field name.
         "subs": [{"email": e, "sub": entry.subs[e]} for e in sorted(entry.subs)],
+        "status": entry.status,
     }
 
 
@@ -391,6 +394,9 @@ def _roster_from_doc(doc: dict[str, Any]) -> RosterEntry:
         added_at=_dt(doc["added_at"]),  # type: ignore[arg-type]
         updated_at=_dt(doc["updated_at"]),  # type: ignore[arg-type]
         subs={b["email"]: b["sub"] for b in doc.get("subs") or []},
+        # M9-SPEC §7.2: no status is an entry from before invitations: active. Anything but
+        # "active" grants nothing.
+        status=MEMBER_ACTIVE if doc.get("status") in (None, MEMBER_ACTIVE) else MEMBER_INVITED,
     )
 
 
@@ -518,6 +524,7 @@ def _team_to_doc(record: TeamRecord) -> dict[str, Any]:
         "created_at": record.created_at,
         "created_by_member": record.created_by_member,
         "created_by_email_sha256": record.created_by_email_sha256,
+        "created_by_sub_sha256": record.created_by_sub_sha256,
         "roster_version": record.roster_version,
         "members": record.members,
         "owners": record.owners,
@@ -538,6 +545,7 @@ def _team_from_doc(team: str, doc: dict[str, Any]) -> TeamRecord:
         created_at=_dt(doc.get("created_at")),
         created_by_member=doc.get("created_by_member"),
         created_by_email_sha256=doc.get("created_by_email_sha256"),
+        created_by_sub_sha256=doc.get("created_by_sub_sha256"),
         roster_version=int(doc.get("roster_version") or 0),
         members=doc.get("members"),
         owners=doc.get("owners"),
@@ -575,6 +583,7 @@ def _admin_audit_to_doc(entry: AdminAuditEntry) -> dict[str, Any]:
         "team": entry.team,
         "outcome": entry.outcome,
         "detail": entry.detail,
+        "via": entry.via,
         "expire_at": entry.expire_at,
     }
 
@@ -588,6 +597,7 @@ def _admin_audit_from_doc(doc: dict[str, Any]) -> AdminAuditEntry:
         outcome=doc["outcome"],
         detail=doc.get("detail"),
         expire_at=_dt(doc["expire_at"]),  # type: ignore[arg-type]
+        via=doc.get("via") or "direct",
     )
 
 
@@ -1209,7 +1219,8 @@ class FirestoreStore:
             snap = await self._team(team).get(transaction=txn)
             doc = (snap.to_dict() or {}) if snap.exists else {}
             record = _team_from_doc(team, doc)
-            if record.status == TEAM_DELETED:
+            # M9-SPEC §7.1: a record the API created is never adopted, active or deleted.
+            if snap.exists and (record.status == TEAM_DELETED or not record.seed):
                 return record
             update: dict[str, Any] = {}
             if doc.get("id") != team:
@@ -1233,21 +1244,33 @@ class FirestoreStore:
 
         return await self._run(body)
 
+    async def team_has_documents(self, team: str) -> bool:
+        snap = await self._team(team).get(field_paths=["roster_version"])
+        return snap.exists or bool(await self._descendants(team, 1))
+
     async def create_team[T](
-        self, team: str, email_sha256: str, fn: TeamCreateFn[T], quotas: Sequence[Quota] = ()
+        self,
+        team: str,
+        email_sha256: str,
+        fn: TeamCreateFn[T],
+        quotas: Sequence[Quota] = (),
+        sub_key: str | None = None,
     ) -> T:
         async def body(txn: AsyncTransaction) -> T:
             snap = await self._team(team).get(transaction=txn)
             current = _team_from_doc(team, snap.to_dict() or {}) if snap.exists else None
-            creator = (await self._read_accounts(txn, [email_sha256]))[email_sha256]
-            creation = fn(current, creator)
+            keys = [email_sha256, *([sub_key] if sub_key else [])]
+            creators = await self._read_accounts(txn, keys)
+            creator = creators[email_sha256]
+            by_sub = creators.get(sub_key) if sub_key else None
+            creation = fn(current, creator, by_sub)
             if creation.team is None:
                 return creation.result
             if creation.team.id != team:
                 raise RuntimeError("a creation may only write its own team")
             owner = creation.owner
             owner_keys = [account_key(e) for e in owner.emails] if owner is not None else []
-            others = await self._read_accounts(txn, [k for k in owner_keys if k != email_sha256])
+            others = await self._read_accounts(txn, [k for k in owner_keys if k not in keys])
             counts = []
             for quota in quotas:  # relay-wide counters; raising writes nothing
                 qsnap = await self._login_counter(quota.key).get(transaction=txn)
@@ -1264,11 +1287,12 @@ class FirestoreStore:
             txn.set(self._team(team), _team_to_doc(creation.team))
             if owner is not None:
                 txn.set(self._roster_col(team).document(owner.member), _roster_to_doc(owner))
-            accounts = {email_sha256: creator or AccountRecord(key=email_sha256)}
+            accounts = {key: creators[key] or AccountRecord(key=key) for key in keys}
             for key, record in others.items():
                 accounts[key] = record or AccountRecord(key=key)
-            if team not in accounts[email_sha256].created:
-                accounts[email_sha256].created.append(team)
+            for key in keys:
+                if team not in accounts[key].created:
+                    accounts[key].created.append(team)
             if owner is not None:
                 for key in owner_keys:
                     accounts[key].memberships[team] = owner.member
@@ -1285,10 +1309,12 @@ class FirestoreStore:
         async def body(txn: AsyncTransaction) -> T:
             snap = await self._team(team).get(transaction=txn)
             current = _team_from_doc(team, snap.to_dict() or {}) if snap.exists else None
-            creator_key = current.created_by_email_sha256 if current is not None else None
-            creator = None
-            if creator_key:
-                creator = (await self._read_accounts(txn, [creator_key]))[creator_key]
+            keys = (
+                [k for k in (current.created_by_email_sha256, current.created_by_sub_sha256) if k]
+                if current is not None
+                else []
+            )
+            creators = await self._read_accounts(txn, keys)
             deletion = fn(current)
             # All reads are done; writes from here on.
             if deletion.team is not None:
@@ -1296,10 +1322,11 @@ class FirestoreStore:
                     raise RuntimeError("a deletion may only write its own team")
                 was_deleted = current is not None and current.status == TEAM_DELETED
                 txn.set(self._team(team), _team_to_doc(deletion.team))
-                if deletion.team.status == TEAM_DELETED and not was_deleted and creator:
-                    if team in creator.created:
-                        creator.created.remove(team)
-                        self._write_account(txn, creator)
+                if deletion.team.status == TEAM_DELETED and not was_deleted:
+                    for creator in creators.values():
+                        if creator is not None and team in creator.created:
+                            creator.created.remove(team)
+                            self._write_account(txn, creator)
             for entry in deletion.admin_audit:
                 txn.set(self._admin_audit_col().document(), _admin_audit_to_doc(entry))
             return deletion.result

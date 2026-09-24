@@ -132,12 +132,15 @@ class Caller:
     """The member every rule is applied to. ``delegate`` is the principal of the delegate
     acting on the member's behalf (M3-SPEC §2, M6-SPEC §3), for the logs and the audit
     detail only; it changes no rule. ``credential`` is the key of the device credential the
-    call authenticated with (M5-SPEC §3), if it did."""
+    call authenticated with (M5-SPEC §3), if it did. ``email`` is the Google email the call
+    came as (an ID token's, or the one a delegate names), None for a device credential or a
+    static token: deleting a team needs one (M9-SPEC §7.7)."""
 
     team: str
     member: str
     delegate: str | None = None
     credential: str | None = None
+    email: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1317,15 +1320,20 @@ class RelayService:
 
     # M6 §2: the roster -----------------------------------------------------------------
     async def roster_list(self, caller: Caller) -> dict[str, Any]:
-        """Every entry; an owner sees every email, anyone else only their own (others'
-        ``emails`` are null). Validated against ``roster_version`` on every call, so a
-        console never shows a roster older than the last change it made."""
+        """Every member; an owner sees every email, anyone else only their own (others'
+        ``emails`` are null). An owner also sees the open invitations (``status:
+        "invited"``, M9-SPEC §7.2), by member id among the members. Validated against
+        ``roster_version`` on every call, so a console never shows a roster older than the
+        last change it made."""
         roster = await self.roster.snapshot(caller.team, fresh=True)
         is_owner = roster.role(caller.member) == OWNER
+        entries = dict(roster.entries)
+        if is_owner:
+            entries.update(roster.invited)
         return {
             "members": [
-                entry_json(roster.entries[m], show_emails=is_owner or m == caller.member)
-                for m in roster.members()
+                entry_json(entries[m], show_emails=is_owner or m == caller.member)
+                for m in sorted(entries)
             ],
             "roster_version": roster.version,
         }

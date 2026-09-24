@@ -56,6 +56,9 @@ LOGIN_LIMITS = {
     "login_tokens_per_minute": 10000,
     # M9-SPEC §2: team creations per client IP are counted relay-wide too.
     "team_creations_per_ip_per_hour": 10000,
+    # M9-SPEC §7.9: a principal's first request to a team, per instance, counts relay-wide
+    # (the static tokens are the same in every test).
+    "non_member_requests_per_minute": 10000,
 }
 
 # Each member also has a Google principal: the email a delegate names in
@@ -267,6 +270,24 @@ async def client(
 
 def auth(member: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {TOKENS[member]}"}
+
+
+def google_sub(email: str) -> str:
+    """The ``sub`` the fake Google gives ``email`` in the login flow (tests.fake_google), so
+    an ID token made with it and a sign-in are the same Google account."""
+    return hashlib.sha256(email.encode()).hexdigest()[:21]
+
+
+async def accept_invitation(
+    client: httpx.AsyncClient, team: str, email: str, *, sub: str | None = None
+) -> dict[str, Any]:
+    """Accept the invitation ``email`` holds in ``team`` (M9-SPEC §7.2) with that account's
+    own Google ID token."""
+    token = id_token(email, sub or google_sub(email.lower()))
+    headers = {"Authorization": f"Bearer {token}"}
+    r = await client.post(f"/v1/me/invitations/{team}", json={"accept": True}, headers=headers)
+    assert r.status_code == 200, r.text
+    return r.json()
 
 
 def delegate_auth(on_behalf: str | None, team: str = "demo") -> dict[str, str]:

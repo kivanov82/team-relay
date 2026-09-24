@@ -23,17 +23,29 @@ Who the caller is (M5-SPEC §3, §4; M6-SPEC §1):
 
 A delegate may reach only the GET routes in DELEGATE_ROUTES, and with ``manage-roster`` the
 roster mutations in ROSTER_MUTATIONS (the service then requires the member it names to be an
-owner, as for anyone). A delegate with ``team: "*"`` (M9-SPEC §5) acts in the team the URL
-names, for the member of that team its header's email is.
+owner, as for anyone), and with ``manage-teams`` an owner's deletion of the team
+(TEAM_MUTATIONS, M9-SPEC §7.7). A delegate with ``team: "*"`` (M9-SPEC §5) acts in the team
+the URL names, for the member of that team its header's email is; a team that is not one and
+a team the email is not a member of are the same ``404`` (M9-SPEC §7.3).
+
+A roster entry that is only invited (M9-SPEC §7.2) is not a member anywhere here: it never
+resolves a principal, a delegate's email or a credential.
+
+Before the membership check (M9-SPEC §7.9), a principal not seen by this process as a member
+of the URL's team in the last KNOWN_MEMBER_TTL counts one against a per-principal, per-minute
+budget in the store (``non_member_requests_per_minute``); over it: ``429 rate_limited``.
 
 Teams (M9-SPEC §1): a team the API created is a team while its record says so, read on every
 request that names it, so a deleted team is refused (``404``) and its credentials stop
 working (``401``) at once, on every instance.
 
-The account routes (M9-SPEC §2, §4) name no team: ``GET /v1/me/teams``, ``POST /v1/teams``
-and ``/v1/admin/teams``. They take a Google identity only: a Google ID token, or a delegate on
-behalf of an email (``manage-teams`` to create or to act for an admin); never a device
-credential (it is bound to its team) or a static token.
+The account routes (M9-SPEC §2, §4) name no team: ``GET /v1/me/teams``, ``POST /v1/teams``,
+``POST /v1/me/invitations/{team}`` and ``/v1/admin/teams``. They take a Google identity only:
+a Google ID token, or a delegate on behalf of an email (``manage-teams`` to create or to act
+for an admin, ``manage-roster`` to answer an invitation); never a device credential (it is
+bound to its team) or a static token. A delegate's creation carries
+``X-Relay-Client-IP-Hash`` (M9-SPEC §7.6). Every admin audit entry says ``via`` and refused
+admin actions are recorded (M9-SPEC §7.5).
 
 The login pages (M5-SPEC §2) are unauthenticated and live under ``/v1/login``.
 """
@@ -41,6 +53,8 @@ The login pages (M5-SPEC §2) are unauthenticated and live under ``/v1/login``.
 from __future__ import annotations
 
 import os
+import re
+from collections import OrderedDict
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -63,10 +77,18 @@ from .login import LoginService, client_ip
 from .manifest import ManifestValidator
 from .oauth import GoogleOAuthProvider, OAuthProvider
 from .pages import stylesheet_response
-from .roster import email_hash
+from .roster import OWNER, SeedConflict, email_hash
 from .service import Caller, RelayService
 from .store import Quota, Store, TeamGone
-from .teams import ADMIN_LIST_DEFAULT, ADMIN_LIST_MAX, parse_new_team, valid_team_id
+from .teams import (
+    ADMIN_LIST_DEFAULT,
+    ADMIN_LIST_MAX,
+    ALL_TEAMS,
+    VIA_DELEGATE,
+    VIA_DIRECT,
+    parse_new_team,
+    valid_team_id,
+)
 
 MAX_BODY_BYTES = 256 * 1024
 
@@ -95,6 +117,16 @@ ROSTER_MUTATIONS = frozenset(
         ("DELETE", "/v1/teams/{team}/roster/{member}"),
     }
 )
+# M9-SPEC §7.7: with scope manage-teams, a delegate may delete a team for its owner.
+TEAM_MUTATIONS = frozenset({("DELETE", "/v1/teams/{team}")})
+# M9-SPEC §7.6: the console's report of the viewer's address: a salted SHA-256, hex.
+CLIENT_IP_HASH_HEADER = "x-relay-client-ip-hash"
+CLIENT_IP_HASH_RE = re.compile(r"^[0-9a-f]{64}$")
+# M9-SPEC §7.9: a (principal, team) that resolved to a member skips the non-member budget
+# for this long, in this process; at most this many are remembered.
+KNOWN_MEMBER_TTL = timedelta(seconds=60)
+KNOWN_MEMBER_CACHE = 4096
+PRINCIPAL_WINDOW_SECONDS = 60
 
 _STATUS_CODES = {
     400: "bad_request",
@@ -167,6 +199,8 @@ def _audited_action(request: Request) -> str | None:
         return {"POST": "roster.add", "PATCH": "roster.update"}.get(request.method, "roster.remove")
     if "/credentials/" in path:
         return "credential.revoke"
+    if request.method == "DELETE" and path.count("/") == 3:
+        return "team.delete"  # /v1/teams/{team}
     return "unknown"
 
 
@@ -217,10 +251,14 @@ def create_app(
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         # M6-SPEC §1: upsert the seed at startup. Not fatal here: each team is seeded again,
-        # lazily, before its roster is first read.
+        # lazily, before its roster is first read. Except a file team that is a team the API
+        # created (M9-SPEC §7.1): the relay refuses to start, naming the id.
         try:
             await roster.seed_all()
             await teams.ensure_seed_records()  # M9-SPEC §1
+        except SeedConflict:
+            await store.aclose()
+            raise
         except Exception as exc:
             log_event("roster_seed_failed", severity="ERROR", error=type(exc).__name__)
         yield
@@ -282,17 +320,18 @@ def create_app(
             raise Unauthenticated("unknown_on_behalf")
         return email
 
-    async def on_behalf_of(request: Request, delegate: Delegate, team: str) -> Identity:
-        """The member a delegate acts for (M3-SPEC §2): exactly one header naming, by email,
-        a member of the delegate's team on its roster, else 401. For a ``team: "*"``
-        delegate (M9-SPEC §5) the delegate's team is the URL's, when it is a team."""
-        email = on_behalf_email(request)
+    async def on_behalf_of(delegate: Delegate, email: str, team: str) -> Identity:
+        """The member a delegate acts for (M3-SPEC §2): the header's email is a member of the
+        delegate's team on its roster, else 403 ``not_a_member``. For a ``team: "*"``
+        delegate (M9-SPEC §5) the delegate's team is the URL's; a team that is not one and a
+        team the email is not a member of are both ``404`` (M9-SPEC §7.3), so the answer says
+        nothing about which teams exist."""
         if delegate.any_team:
             if await teams.active(team) is None:
                 raise NoSuchTeam("no_such_team")
             member = (await roster.snapshot(team)).member_for_email(email)
             if member is None:
-                raise NotAMember("not_a_member")
+                raise NoSuchTeam("not_a_member")
             return Identity(team=team, member=member)
         member = await roster.member_for_email(delegate.team, email)
         if member is None:
@@ -302,6 +341,35 @@ def create_app(
         return Identity(team=delegate.team, member=member)
 
     retention = timedelta(days=config.audit_retention_days)
+    known_members: OrderedDict[tuple[str, str], datetime] = OrderedDict()
+
+    async def count_unknown_principal(principal: str, team: str, request: Request) -> None:
+        """M9-SPEC §7.9: before the membership check, a principal this process has not seen
+        as a member of ``team`` lately counts one against its per-minute budget."""
+        now = service.now()
+        seen = known_members.get((principal, team))
+        if seen is not None and timedelta(0) <= now - seen < KNOWN_MEMBER_TTL:
+            return
+        start = int(now.timestamp()) // PRINCIPAL_WINDOW_SECONDS * PRINCIPAL_WINDOW_SECONDS
+        quota = Quota(
+            key=f"principal.{sha256_hex(principal)[:32]}.{start}",
+            limit=config.limits.non_member_requests_per_minute,
+            expire_at=datetime.fromtimestamp(start + 2 * PRINCIPAL_WINDOW_SECONDS, UTC),
+        )
+        if not await store.count_login_quota(quota):
+            log_event(
+                "principal_rate_limited",
+                severity="WARNING",
+                method=request.method,
+                path=request.url.path,
+            )
+            raise ApiError(429, "rate_limited", "Too many requests; wait a minute.")
+
+    def remember_member(principal: str, team: str) -> None:
+        known_members[(principal, team)] = service.now()
+        known_members.move_to_end((principal, team))
+        while len(known_members) > KNOWN_MEMBER_CACHE:
+            known_members.popitem(last=False)
 
     async def member_in(verified: Verified, team: str) -> tuple[str | None, bool]:
         """The principal's member in ``team`` and whether its email still needs binding;
@@ -390,6 +458,8 @@ def create_app(
         token = bearer_token(request.headers.get("authorization"))
         delegate: Delegate | None = None
         credential: str | None = None
+        email: str | None = None
+        principal: str | None = None
         try:
             if token is None:
                 raise Unauthenticated("missing_bearer")
@@ -400,9 +470,16 @@ def create_app(
                 # A delegate is never a member (M3-SPEC §2): checked first.
                 delegate = config.delegate(verified.principal)
                 if delegate is not None:
-                    identity = await on_behalf_of(request, delegate, team)
+                    email = on_behalf_email(request)
+                    principal = "google:" + email
+                    await count_unknown_principal(principal, team, request)  # §7.9
+                    identity = await on_behalf_of(delegate, email, team)
                 else:
+                    principal = verified.principal
+                    await count_unknown_principal(principal, team, request)  # §7.9
                     identity = await resolve(verified, team)
+                    if principal.startswith("google:"):
+                        email = principal.removeprefix("google:")
         except Unauthenticated as exc:
             # Structured, and never the token (§2) or the on-behalf value.
             log_event(
@@ -436,19 +513,29 @@ def create_app(
                 raise ApiError(
                     400, "bad_request", "X-Relay-On-Behalf-Of is only accepted from a delegate."
                 )
-            caller = Caller(team=identity.team, member=identity.member, credential=credential)
+            caller = Caller(
+                team=identity.team, member=identity.member, credential=credential, email=email
+            )
             if team != identity.team:
                 err = not_found()
                 action = _audited_action(request)
                 if action is not None:
                     await service.audit_refusal(caller, action, err)
                 raise err
+            if principal is not None:
+                remember_member(principal, team)
             return caller
 
-        caller = Caller(team=identity.team, member=identity.member, delegate=delegate.principal)
+        caller = Caller(
+            team=identity.team, member=identity.member, delegate=delegate.principal, email=email
+        )
+        if principal is not None and team == identity.team:
+            remember_member(principal, team)
         route_path = getattr(request.scope.get("route"), "path", None)
         reads = request.method == "GET" and route_path in DELEGATE_ROUTES
-        manages = delegate.manages_roster and (request.method, route_path) in ROSTER_MUTATIONS
+        manages = (
+            delegate.manages_roster and (request.method, route_path) in ROSTER_MUTATIONS
+        ) or (delegate.manages_teams and (request.method, route_path) in TEAM_MUTATIONS)
         if team != identity.team or not (reads or manages):
             # A delegate's refusals go to stdout, never to the audit log: the member it names
             # did not attempt them (M3-SPEC §2).
@@ -549,21 +636,35 @@ def create_app(
         )
         raise ApiError(403, "forbidden", detail)
 
-    async def admin_account(request: Request) -> Account:
+    def via_of(account: Account) -> str:
+        return VIA_DELEGATE if account.delegate is not None else VIA_DIRECT
+
+    async def admin_account(request: Request, action: str, team: str) -> Account:
         """An admin (config ``admins``), by a Google ID token or through a ``manage-teams``
-        delegate. Admin is relay-wide and is not a team role (M9-SPEC §4)."""
+        delegate. Admin is relay-wide and is not a team role (M9-SPEC §4). A refusal here is
+        recorded in the admin audit (M9-SPEC §7.5)."""
         account = await authenticate_account(request)
-        if account.delegate is not None and not account.delegate.manages_teams:
-            refuse_delegate(account, request, "This delegate may not act for an admin.")
-        if not config.is_admin(account.email):
-            log_event(
-                "admin_refused",
-                severity="WARNING",
-                method=request.method,
-                path=request.url.path,
-                via_delegate=account.delegate is not None,
+        try:
+            if account.delegate is not None and not account.delegate.manages_teams:
+                refuse_delegate(account, request, "This delegate may not act for an admin.")
+            if not config.is_admin(account.email):
+                log_event(
+                    "admin_refused",
+                    severity="WARNING",
+                    method=request.method,
+                    path=request.url.path,
+                    via_delegate=account.delegate is not None,
+                )
+                raise ApiError(403, "forbidden", "Only a relay admin can do this.")
+        except ApiError as err:
+            await teams.admin_refused(
+                actor_sha256=email_hash(account.email),
+                action=action,
+                team=team,
+                err=err,
+                via=via_of(account),
             )
-            raise ApiError(403, "forbidden", "Only a relay admin can do this.")
+            raise
         return account
 
     @app.get("/v1/me/teams")
@@ -574,13 +675,54 @@ def create_app(
             only = account.delegate.team  # a per-team delegate sees its own team only
         return await teams.my_teams(account.email, account.sub, only=only)
 
+    # M9-SPEC §7.2: accept or decline an invitation.
+    @app.post("/v1/me/invitations/{team}")
+    async def answer_invitation(team: str, request: Request) -> dict[str, Any]:
+        account = await authenticate_account(request)
+        if account.delegate is not None:
+            if not account.delegate.manages_roster:
+                refuse_delegate(account, request, "This delegate may not answer invitations.")
+            if not account.delegate.any_team and team != account.delegate.team:
+                raise not_found()
+        if not valid_team_id(team):
+            raise not_found()
+        raw = await read_json_body(request)
+        if (
+            not isinstance(raw, dict)
+            or set(raw) != {"accept"}
+            or not isinstance(raw["accept"], bool)
+        ):
+            raise ApiError(422, "invalid_body", 'Send {"accept": true} or {"accept": false}.')
+        return await teams.answer_invitation(
+            team,
+            email=account.email,
+            sub=account.sub,
+            accept=raw["accept"],
+            via=account.delegate.principal if account.delegate is not None else None,
+        )
+
     @app.post("/v1/teams")
     async def create_team(request: Request) -> JSONResponse:
         account = await authenticate_account(request)
         if account.delegate is not None and not account.delegate.manages_teams:
             refuse_delegate(account, request, "This delegate may not create teams.")
+        # M9-SPEC §7.6: the console reports its viewer's address, salted and hashed; the
+        # per-address limit counts it. Without it a delegate creates nothing.
+        console_ip: str | None = None
+        if account.delegate is not None:
+            values = request.headers.getlist(CLIENT_IP_HASH_HEADER)
+            if len(values) != 1 or CLIENT_IP_HASH_RE.fullmatch(values[0]) is None:
+                log_event("client_ip_hash_missing", severity="WARNING", path=request.url.path)
+                raise ApiError(
+                    400,
+                    "bad_request",
+                    "A delegate's team creation needs one X-Relay-Client-IP-Hash "
+                    "(64 lower-case hex).",
+                )
+            console_ip = values[0]
+        await teams.count_attempt(account.email, account.sub)  # M9-SPEC §7.4
         body = parse_new_team(await read_json_body(request))
-        # A delegate's address is the console's own: only the account limits count for it.
+        # A delegate's socket address is the console's own: the reported one counts instead.
         ip_hash = None
         if account.delegate is None:
             ip_hash = sha256_hex(client_ip(request, on_cloud_run))[:32]
@@ -590,12 +732,13 @@ def create_app(
             body=body,
             ip_hash=ip_hash,
             via=account.delegate.principal if account.delegate is not None else None,
+            console_ip_hash=console_ip,
         )
         return JSONResponse(created, status_code=201)
 
     @app.get("/v1/admin/teams")
     async def admin_teams(request: Request) -> dict[str, Any]:
-        await admin_account(request)
+        await admin_account(request, "admin.list", ALL_TEAMS)
         q = request.query_params
         after = q.get("after")
         if after is not None and not valid_team_id(after):
@@ -603,15 +746,58 @@ def create_app(
         limit = _query_int(q.get("limit"), "limit", 1, ADMIN_LIST_MAX, ADMIN_LIST_DEFAULT)
         return await teams.admin_list(after, limit)
 
-    @app.delete("/v1/admin/teams/{team}")
-    async def admin_delete_team(team: str, request: Request) -> dict[str, Any]:
-        account = await admin_account(request)
+    async def confirmation(request: Request) -> Any:
         raw = await read_json_body(request)
         if not isinstance(raw, dict) or set(raw) != {"confirm"}:
             raise ApiError(
                 422, "confirm_mismatch", 'Send {"confirm": "<team id>"} to delete the team.'
             )
-        return await teams.delete(team, actor_email=account.email, confirm=raw["confirm"])
+        return raw["confirm"]
+
+    @app.delete("/v1/admin/teams/{team}")
+    async def admin_delete_team(team: str, request: Request) -> dict[str, Any]:
+        account = await admin_account(request, "team.delete", team)
+        actor = email_hash(account.email)
+        try:
+            confirm = await confirmation(request)
+            if account.delegate is not None and confirm == team:  # M9-SPEC §7.8
+                await teams.count_delegate_delete(team, account.delegate.principal)
+            return await teams.delete(
+                team, actor_sha256=actor, confirm=confirm, via=via_of(account)
+            )
+        except ApiError as err:
+            await teams.admin_refused(
+                actor_sha256=actor, action="team.delete", team=team, err=err, via=via_of(account)
+            )
+            raise
+
+    # M9-SPEC §7.7: an owner deletes a team they own (never a file team). A Google identity
+    # only (an ID token, or a manage-teams delegate for the owner), as for the account routes.
+    @app.delete("/v1/teams/{team}")
+    async def owner_delete_team(
+        team: str, request: Request, caller: Caller = CallerDep
+    ) -> dict[str, Any]:
+        async def work() -> dict[str, Any]:
+            if caller.email is None:
+                raise ApiError(
+                    403,
+                    "google_identity_required",
+                    "Deleting a team needs a Google account: sign in with Google, not a device "
+                    "credential.",
+                )
+            snapshot = await roster.snapshot(caller.team, fresh=True)
+            if snapshot.role(caller.member) != OWNER:
+                raise ApiError(403, "forbidden", "Only an owner can delete the team.")
+            confirm = await confirmation(request)
+            return await teams.delete(
+                caller.team,
+                actor_sha256=email_hash(caller.email),
+                confirm=confirm,
+                via=VIA_DELEGATE if caller.delegate else VIA_DIRECT,
+                owner=caller.member,
+            )
+
+        return await service._guarded(caller, "team.delete", None, work)
 
     @app.get("/healthz")
     async def healthz() -> dict[str, bool]:
@@ -682,6 +868,10 @@ def create_app(
     @app.post("/v1/login/create")
     async def login_create(request: Request) -> Response:
         return await login_service().create(request)
+
+    @app.post("/v1/login/invitation")
+    async def login_invitation(request: Request) -> Response:
+        return await login_service().invitation(request)
 
     @app.post("/v1/login/token")
     async def login_token(request: Request) -> Response:

@@ -424,9 +424,9 @@ class MemoryStore:
             record = self._teams.get(team)
             if record is None:
                 record = self._teams[team] = TeamRecord(id=team, name=name)
-            if record.status == TEAM_DELETED:
+            # M9-SPEC §7.1: a record the API created is never adopted, active or deleted.
+            if record.status == TEAM_DELETED or not record.seed:
                 return copy.deepcopy(record)
-            record.seed = True
             if record.created_at is None:
                 record.created_at = now
                 record.name = name
@@ -435,13 +435,28 @@ class MemoryStore:
                 record.members, record.owners = roster_counts(entries, [], [])
             return copy.deepcopy(record)
 
+    async def team_has_documents(self, team: str) -> bool:
+        async with self._lock:
+            return (
+                team in self._teams
+                or bool(self._roster.get(team))
+                or bool(self._retired.get(team))
+                or bool(self._team_documents(team))
+            )
+
     async def create_team[T](
-        self, team: str, email_sha256: str, fn: TeamCreateFn[T], quotas: Sequence[Quota] = ()
+        self,
+        team: str,
+        email_sha256: str,
+        fn: TeamCreateFn[T],
+        quotas: Sequence[Quota] = (),
+        sub_key: str | None = None,
     ) -> T:
         async with self._lock:
             creation = fn(
                 copy.deepcopy(self._teams.get(team)),
                 copy.deepcopy(self._accounts.get(email_sha256)),
+                copy.deepcopy(self._accounts.get(sub_key)) if sub_key else None,
             )
             if creation.team is None:
                 return creation.result
@@ -455,9 +470,10 @@ class MemoryStore:
             self._teams[team] = copy.deepcopy(creation.team)
             owner = creation.owner
             self._roster[team] = {owner.member: copy.deepcopy(owner)} if owner else {}
-            account = self._accounts.setdefault(email_sha256, AccountRecord(key=email_sha256))
-            if team not in account.created:
-                account.created.append(team)
+            for key in [email_sha256, *([sub_key] if sub_key else [])]:
+                account = self._accounts.setdefault(key, AccountRecord(key=key))
+                if team not in account.created:
+                    account.created.append(team)
             if owner is not None:
                 for email in owner.emails:
                     key = account_key(email)
@@ -477,13 +493,18 @@ class MemoryStore:
                     raise RuntimeError("a deletion may only write its own team")
                 was_deleted = current is not None and current.status == TEAM_DELETED
                 self._teams[team] = copy.deepcopy(deletion.team)
-                creator = current.created_by_email_sha256 if current else None
-                if deletion.team.status == TEAM_DELETED and not was_deleted and creator:
-                    account = self._accounts.get(creator)
-                    if account is not None and team in account.created:
-                        account.created.remove(team)
-                        if not account.memberships and not account.created:
-                            del self._accounts[creator]
+                creators = (
+                    [current.created_by_email_sha256, current.created_by_sub_sha256]
+                    if current
+                    else []
+                )
+                if deletion.team.status == TEAM_DELETED and not was_deleted:
+                    for creator in filter(None, creators):
+                        account = self._accounts.get(creator)
+                        if account is not None and team in account.created:
+                            account.created.remove(team)
+                            if not account.memberships and not account.created:
+                                del self._accounts[creator]
             self._admin_audit.extend(copy.deepcopy(deletion.admin_audit))
             return deletion.result
 

@@ -21,6 +21,12 @@
 - Accounts are bound by Google ``sub`` (M6-SPEC §7.2): :func:`plan_bind` records, per roster
   email, the ``sub`` of the first account that signs in with it; a later sign-in with that
   email from another account is refused. Removing the email drops its binding.
+- Invitations, not silent membership (M9-SPEC §7.2): an entry an owner adds is ``invited``
+  until its person accepts it (:func:`plan_answer`); declining removes it. An invited entry
+  grants nothing: :class:`TeamRoster` keeps it apart (``invited``), so every lookup that
+  makes someone a member (by email, by id, the members, the roles) sees active entries only.
+  Only active owners count as owners. Seed members are active from the start, and every
+  entry stored before the status existed reads as active.
 """
 
 from __future__ import annotations
@@ -40,10 +46,19 @@ from .config import (
     TeamConfig,
     normalise_email,
 )
-from .errors import ApiError
+from .errors import ApiError, ConfigError
 from .jsonutil import sha256_hex
 from .log import log_event
-from .store import AuditEntry, RetiredId, RosterChange, RosterEntry, RosterState, Store
+from .store import (
+    MEMBER_ACTIVE,
+    MEMBER_INVITED,
+    AuditEntry,
+    RetiredId,
+    RosterChange,
+    RosterEntry,
+    RosterState,
+    Store,
+)
 
 OWNER = "owner"
 MEMBER = "member"
@@ -56,6 +71,17 @@ ROSTER_CACHE_SIZE = 2048
 RETIRED_ID_LIFETIME = timedelta(days=31)
 
 
+class SeedConflict(ConfigError):
+    """A team of the file has the id of a team the API created (M9-SPEC §7.1)."""
+
+    def __init__(self, team: str) -> None:
+        super().__init__(
+            f"team {team!r} in the team file is a team created through the API "
+            "(active or deleted); give the file's team another id"
+        )
+        self.team = team
+
+
 def email_hash(email: str) -> str:
     """What the audit keeps of an email (M6-SPEC §2): the SHA-256 of its lower-cased form."""
     return sha256_hex(email.lower())
@@ -63,19 +89,41 @@ def email_hash(email: str) -> str:
 
 @dataclass(frozen=True)
 class TeamRoster:
-    """An immutable snapshot of one team's roster."""
+    """An immutable snapshot of one team's roster. ``entries`` (and everything read through
+    them) are the active members only; ``invited`` the invitations (M9-SPEC §7.2)."""
 
     version: int
     entries: Mapping[str, RosterEntry]
     by_email: Mapping[str, str] = field(default_factory=dict)
+    invited: Mapping[str, RosterEntry] = field(default_factory=dict)
+    invited_by_email: Mapping[str, str] = field(default_factory=dict)
 
     @classmethod
     def of(cls, state: RosterState) -> TeamRoster:
+        active: dict[str, RosterEntry] = {}
+        invited: dict[str, RosterEntry] = {}
         by_email: dict[str, str] = {}
+        invited_by_email: dict[str, str] = {}
         for member, entry in state.entries.items():
+            if entry.active:
+                active[member] = entry
+                target = by_email
+            else:
+                invited[member] = entry
+                target = invited_by_email
             for email in entry.emails:
-                by_email.setdefault(email, member)
-        return cls(version=state.version, entries=dict(state.entries), by_email=by_email)
+                target.setdefault(email, member)
+        return cls(
+            version=state.version,
+            entries=active,
+            by_email=by_email,
+            invited=invited,
+            invited_by_email=invited_by_email,
+        )
+
+    def invitation_for_email(self, email: str) -> RosterEntry | None:
+        member = self.invited_by_email.get(email)
+        return self.invited.get(member) if member is not None else None
 
     def members(self) -> tuple[str, ...]:
         return tuple(sorted(self.entries))
@@ -111,7 +159,12 @@ class Roster:
     # Seeding --------------------------------------------------------------------------------
     async def ensure_seeded(self, team: str) -> None:
         """Upsert the team file's seed into ``team``'s roster, once per process. A team the
-        API created (M9-SPEC §1) has no seed."""
+        API created (M9-SPEC §1) has no seed.
+
+        First the team's record is made a seed team's, in one transaction that refuses to
+        adopt a record the API created (M9-SPEC §7.1): a file team whose id belongs to a
+        created team, active or deleted, raises :class:`SeedConflict` and nothing of the
+        seed is written (at startup the relay then refuses to start)."""
         if team in self._seeded or team not in self._config.teams:
             return
         lock = self._seed_locks.setdefault(team, asyncio.Lock())
@@ -119,6 +172,11 @@ class Roster:
             if team in self._seeded:
                 return
             now = self._now()
+            name = self._config.teams[team].display_name
+            record = await self._store.ensure_seed_team(team, name, now)
+            if not record.seed:
+                log_event("seed_team_conflict", severity="ERROR", team=team)
+                raise SeedConflict(team)
             outcome = await self._store.mutate_roster(team, plan_seed(self._config, team, now), now)
             created, skipped = outcome.result
             if created or skipped:
@@ -244,6 +302,7 @@ def entry_json(entry: RosterEntry, *, show_emails: bool) -> dict[str, Any]:
         "role": entry.role,
         "added_by": entry.added_by,
         "added_at": format_time(entry.added_at),
+        "status": entry.status,
     }
 
 
@@ -254,7 +313,8 @@ def plan_bind(
 
     def fn(state: RosterState) -> RosterChange[str]:
         current = state.entries.get(member)
-        if current is None or email not in current.emails:
+        # An invitation is not a membership (M9-SPEC §7.2): nothing to bind until accepted.
+        if current is None or not current.active or email not in current.emails:
             return RosterChange(result="gone")
         bound = current.subs.get(email)
         if bound is not None:
@@ -278,7 +338,7 @@ def plan_bind(
 
 def _require_owner(state: RosterState, actor: str) -> None:
     entry = state.entries.get(actor)
-    if entry is None or entry.role != OWNER:
+    if entry is None or not entry.active or entry.role != OWNER:
         raise ApiError(403, "forbidden", "Only an owner can change the team's members.")
 
 
@@ -290,7 +350,12 @@ def _email_holder(state: RosterState, email: str) -> str | None:
 
 
 def _owners(entries: Mapping[str, RosterEntry]) -> int:
-    return sum(1 for entry in entries.values() if entry.role == OWNER)
+    """The active owners: an invitation to be an owner is not one yet."""
+    return sum(1 for entry in entries.values() if entry.active and entry.role == OWNER)
+
+
+def _last_owner(entries: Mapping[str, RosterEntry], current: RosterEntry) -> bool:
+    return current.active and current.role == OWNER and _owners(entries) <= 1
 
 
 def _retired_for_others(
@@ -390,6 +455,7 @@ def plan_add(
                 "member_id_retired",
                 "That id belonged to someone else recently; choose another.",
             )
+        # M9-SPEC §7.2: invited until they accept; it grants nothing before.
         entry = RosterEntry(
             member=body.member,
             emails=[body.email],
@@ -397,12 +463,13 @@ def plan_add(
             added_by=actor,
             added_at=now,
             updated_at=now,
+            status=MEMBER_INVITED,
         )
         audit = _audit(
             team,
             actor,
             "roster.add",
-            "added",
+            "invited",
             now,
             retention,
             member=body.member,
@@ -478,21 +545,13 @@ def plan_update(
             note("roster.email_add", "email added", [email_hash(body.add_email)])
         role = current.role
         if body.role is not None and body.role != current.role:
-            if current.role == OWNER and _owners(state.entries) <= 1:
+            if _last_owner(state.entries, current):
                 raise ApiError(409, "last_owner", "A team keeps at least one owner.")
             role = body.role
             note("roster.role", f"role {current.role} -> {role}")
         if not audit:  # nothing to change: the entry as it is, nothing written
             return RosterChange(result=current)
-        entry = RosterEntry(
-            member=member,
-            emails=emails,
-            role=role,
-            added_by=current.added_by,
-            added_at=current.added_at,
-            updated_at=now,
-            subs=subs,
-        )
+        entry = replace(current, emails=emails, role=role, updated_at=now, subs=subs)
         return RosterChange(result=entry, put=[entry], audit=audit, revoke_email=revoke)
 
     return fn
@@ -512,7 +571,7 @@ def plan_remove(
         current = state.entries.get(member)
         if current is None:
             raise ApiError(404, "not_found")
-        if current.role == OWNER and _owners(state.entries) <= 1:
+        if _last_owner(state.entries, current):
             raise ApiError(409, "last_owner", "A team keeps at least one owner.")
         if member in seed_ids:
             # The seed is upserted when absent, so a removed seed member would be back at the
@@ -531,8 +590,12 @@ def plan_remove(
             retention,
             member=member,
             email_sha256=[email_hash(e) for e in current.emails],
-            detail=_detail(f"role {current.role}", via),
+            detail=_detail(f"role {current.role}{'' if current.active else '; invitation'}", via),
         )
+        if not current.active:
+            # An invitation withdrawn: the id never had a member, so it is not retired (a
+            # tombstone it already had stays as it was).
+            return RosterChange(result=current, remove=[member], audit=[audit])
         # Keep every email the id ever had while it stays retired, so the same person can
         # come back under it.
         previous = state.retired.get(member)
@@ -551,3 +614,54 @@ def plan_remove(
 
 def _detail(text: str, via: str | None) -> str:
     return f"{text}; via delegate" if via else text
+
+
+def plan_answer(
+    team: str,
+    email: str,
+    sub: str | None,
+    accept: bool,
+    now: datetime,
+    retention: timedelta,
+    via: str | None,
+) -> Callable[[RosterState], RosterChange[RosterEntry]]:
+    """Accept (the entry becomes active, and ``email`` is bound to ``sub`` when there is one)
+    or decline (the entry is removed) the invitation ``email`` holds in ``team`` (M9-SPEC
+    §7.2). No invitation for it: ``404``. An email bound to another Google account: ``403``."""
+
+    def fn(state: RosterState) -> RosterChange[RosterEntry]:
+        current = next(
+            (e for e in state.entries.values() if not e.active and email in e.emails), None
+        )
+        if current is None:
+            raise ApiError(404, "not_found")
+        bound = current.subs.get(email)
+        if sub is not None and bound is not None and bound != sub:
+            raise ApiError(
+                403,
+                "forbidden",
+                "This email now belongs to a different Google account; ask the owner.",
+            )
+        action, outcome = (
+            ("roster.accept", "accepted") if accept else ("roster.decline", "declined")
+        )
+        audit = _audit(
+            team,
+            current.member,
+            action,
+            outcome,
+            now,
+            retention,
+            member=current.member,
+            email_sha256=[email_hash(email)],
+            detail=_detail(f"role {current.role}; invited by {current.added_by}", via),
+        )
+        if not accept:
+            return RosterChange(result=current, remove=[current.member], audit=[audit])
+        subs = dict(current.subs)
+        if sub is not None and bound is None:
+            subs[email] = sub  # M6-SPEC §7.2: accepting is this account's first use
+        entry = replace(current, status=MEMBER_ACTIVE, subs=subs, updated_at=now)
+        return RosterChange(result=entry, put=[entry], audit=[audit])
+
+    return fn

@@ -31,6 +31,7 @@ from .conftest import (
     TOKENS,
     Api,
     FakeClock,
+    accept_invitation,
     auth,
     open_api,
     principal,
@@ -439,6 +440,7 @@ async def test_a_member_removed_while_choosing_gets_no_code(api: Api):
         json={"member": "erin", "email": "erin@example.com"},
     )
     assert r.status_code == 201, r.text
+    await accept_invitation(api.client, api.team, "erin@example.com")
     chooser = await to_chooser(api.client, api.fake, "erin@example.com")
     r = await api.client.delete(api.url("/roster/erin"), headers=auth("alice"))
     assert r.status_code == 200, r.text

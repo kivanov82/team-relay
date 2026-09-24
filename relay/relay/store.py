@@ -43,9 +43,16 @@ that need a transaction live in exactly one primitive each:
 
 Teams (M9-SPEC §1) are ``teams/{team}`` records. A team the API created is ``seed=False``; the
 team file's teams are seed teams, and a record written before M9 (``roster_version`` only)
-reads as an active seed team. For the teams the API created (and only those), each Google
-email's memberships are indexed in ``accounts/{sha256(email)}``, kept exact by the roster
-transactions, so "which teams is this email on" is one read.
+reads as an active seed team. A created record is never turned into a seed one (M9-SPEC
+§7.1). For the teams the API created (and only those), each Google email's roster entries
+(active or invited) are indexed in ``accounts/{sha256(email)}``, kept exact by the roster
+transactions, so "which teams is this email on or invited to" is one read. The teams an
+account created are counted on its email's document and, when the creation had a Google
+``sub``, on ``accounts/{sha256("sub:" + sub)}`` too (M9-SPEC §7.6).
+
+Roster entries (M6-SPEC §1) carry a ``status`` (M9-SPEC §7.2): ``invited`` when an owner
+added them, ``active`` once accepted, for a seed member, and for every entry stored before
+the field existed.
 
 Every write of an existing request keeps its ``updated_at`` monotonic (M2-SPEC §7.1): the
 store stamps it, inside the transaction that writes the request, as the later of the value
@@ -205,10 +212,17 @@ class AuditEntry:
 # Roster (M6-SPEC §1) ---------------------------------------------------------------------
 
 
+# M9-SPEC §7.2: a roster entry an owner added is ``invited`` until its person accepts; only
+# an ``active`` entry is a member. An entry stored without a status (every entry written
+# before invitations existed) is active: that is the whole migration, no step to run.
+MEMBER_ACTIVE = "active"
+MEMBER_INVITED = "invited"
+
+
 @dataclass
 class RosterEntry:
-    """``teams/{team}/roster/{member}``: who the member is (their lower-cased Google emails)
-    and their role. Never expires."""
+    """``teams/{team}/roster/{member}``: who the member is (their lower-cased Google emails),
+    their role and whether they are a member yet (``status``). Never expires."""
 
     member: str
     emails: list[str]
@@ -219,6 +233,12 @@ class RosterEntry:
     # M6-SPEC §7.2: email -> the Google ``sub`` of the account that first signed in with it.
     # An email without an entry here is not bound yet. Removing an email drops its binding.
     subs: dict[str, str] = field(default_factory=dict)
+    # M9-SPEC §7.2: "active" (a member) or "invited" (grants nothing until accepted).
+    status: str = MEMBER_ACTIVE
+
+    @property
+    def active(self) -> bool:
+        return self.status == MEMBER_ACTIVE
 
 
 @dataclass
@@ -297,6 +317,9 @@ class TeamRecord:
     roster_version: int = 0
     members: int | None = None
     owners: int | None = None
+    # M9-SPEC §7.6: the creator's Google ``sub`` (its SHA-256), when the creation had one: the
+    # per-account limit counts it as well as the email.
+    created_by_sub_sha256: str | None = None
     deleted_at: datetime | None = None
     deleted_by_email_sha256: str | None = None
     reserved_until: datetime | None = None
@@ -323,6 +346,12 @@ def account_key(email: str) -> str:
     return sha256_hex(email.lower())
 
 
+def sub_account_key(sub: str) -> str:
+    """The account document of a Google account by its ``sub`` (M9-SPEC §7.6): it holds only
+    the teams that account created. Never equal to an email's key (the input differs)."""
+    return sha256_hex("sub:" + sub)
+
+
 @dataclass
 class AdminAuditEntry:
     """``admin_audit/{auto}`` (M9-SPEC §4): relay-wide, outside any team, so it outlives a
@@ -335,6 +364,8 @@ class AdminAuditEntry:
     outcome: str
     expire_at: datetime
     detail: str | None = None
+    # M9-SPEC §7.5: "direct" (the person's own Google identity) or "delegate" (the console).
+    via: str = "direct"
 
 
 @dataclass
@@ -364,7 +395,8 @@ class TeamGone(Exception):
 
 
 def roster_memberships(entries: Mapping[str, RosterEntry]) -> dict[str, str]:
-    """email -> member over a roster's entries."""
+    """email -> member over a roster's entries, invited ones included: the account index
+    says where to look (for a membership or an invitation), the roster decides which."""
     found: dict[str, str] = {}
     for member, entry in entries.items():
         for email in entry.emails:
@@ -389,13 +421,15 @@ def membership_changes(
 def roster_counts(
     before: Mapping[str, RosterEntry], put: Sequence[RosterEntry], remove: Sequence[str]
 ) -> tuple[int, int]:
-    """``(members, owners)`` after a roster change."""
+    """``(members, owners)`` after a roster change, counting active entries only (an
+    invitation is not a member yet, M9-SPEC §7.2)."""
     after = dict(before)
     for member in remove:
         after.pop(member, None)
     for entry in put:
         after[entry.member] = entry
-    return len(after), sum(1 for e in after.values() if e.role == "owner")
+    active = [e for e in after.values() if e.active]
+    return len(active), sum(1 for e in active if e.role == "owner")
 
 
 # A purge batch removes at most this many documents, in one transaction (Firestore allows
@@ -646,7 +680,10 @@ type MutateFn[T] = Callable[[RequestDoc | None], Mutation[T]]
 type RosterFn[T] = Callable[[RosterState], RosterChange[T]]
 type LoginFn[T] = Callable[[LoginDoc | None], LoginChange[T]]
 type RedeemFn[T] = Callable[[LoginCode | None], Redemption[T]]
-type TeamCreateFn[T] = Callable[[TeamRecord | None, AccountRecord | None], TeamCreation[T]]
+# The team, the creator's account by email, and by ``sub`` (None without one, M9-SPEC §7.6).
+type TeamCreateFn[T] = Callable[
+    [TeamRecord | None, AccountRecord | None, AccountRecord | None], TeamCreation[T]
+]
 type TeamDeleteFn[T] = Callable[[TeamRecord | None], TeamDeletion[T]]
 
 
@@ -816,29 +853,41 @@ class Store(Protocol):
         ...
 
     async def ensure_seed_team(self, team: str, name: str, now: datetime) -> TeamRecord:
-        """Make ``teams/{team}`` a seed team's record: fill what a record written before M9
-        lacks (id, name, status, ``seed``, ``created_at``, the roster counts), and mark a
-        team the API created that the file now lists as ``seed``. A deleted record is left
-        as it is. One transaction; returns the record."""
+        """Make ``teams/{team}`` a seed team's record: create it, or fill what a record
+        written before M9 lacks (id, name, status, ``seed``, ``created_at``, the roster
+        counts). A record the API created (``seed`` False, active or deleted) is never
+        adopted: it is returned as it is, and the caller refuses to start (M9-SPEC §7.1).
+        One transaction; returns the record."""
+        ...
+
+    async def team_has_documents(self, team: str) -> bool:
+        """Whether anything at all is stored under ``teams/{team}``: its record or any
+        document below it (M9-SPEC §7.1: a team is created only over an empty id)."""
         ...
 
     async def create_team[T](
-        self, team: str, email_sha256: str, fn: TeamCreateFn[T], quotas: Sequence[Quota] = ()
+        self,
+        team: str,
+        email_sha256: str,
+        fn: TeamCreateFn[T],
+        quotas: Sequence[Quota] = (),
+        sub_key: str | None = None,
     ) -> T:
-        """Read the team (None when absent) and the account ``email_sha256``; run ``fn``
-        (pure; raising writes nothing). When it returns a team: every quota (relay-wide
-        counters) must be under its limit (else :class:`QuotaExceeded`, nothing written)
-        and is counted; the team is written whole (a deleted record is replaced), its owner
-        entry written as its only roster entry, the account gets the team in ``created`` and
-        the owner's membership for each of the owner's emails, and the audit and admin
-        audit are written; one transaction."""
+        """Read the team (None when absent), the account ``email_sha256`` and, with
+        ``sub_key``, the account ``sub_key``; run ``fn`` (pure; raising writes nothing). When
+        it returns a team: every quota (relay-wide counters) must be under its limit (else
+        :class:`QuotaExceeded`, nothing written) and is counted; the team is written whole (a
+        deleted record is replaced), its owner entry written as its only roster entry, both
+        accounts get the team in ``created``, the email's account the owner's membership for
+        each of the owner's emails, and the audit and admin audit are written; one
+        transaction."""
         ...
 
     async def delete_team[T](self, team: str, fn: TeamDeleteFn[T]) -> T:
-        """Read the team (None when absent) and its creator's account; run ``fn`` (pure).
-        When it returns a new version: write it; when that version is deleted and the stored
-        one was not, take the team off its creator's ``created``; write the admin audit; one
-        transaction."""
+        """Read the team (None when absent) and its creator's accounts (by email and by
+        ``sub``); run ``fn`` (pure). When it returns a new version: write it; when that
+        version is deleted and the stored one was not, take the team off both accounts'
+        ``created``; write the admin audit; one transaction."""
         ...
 
     async def purge_team(self, team: str, budget: int) -> bool:

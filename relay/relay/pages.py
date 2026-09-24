@@ -13,6 +13,12 @@ one. The chooser stays one form with the fields it always had (``csrf``, ``team`
 create page, whose own form posts to ``/v1/login/create``. So a page never holds two forms,
 and a client that submits the chooser as it always did is unaffected. Team names are shown
 escaped like everything else.
+
+M9-SPEC §7.2: the chooser lists the account's invitations ("<name> — invited by <member>:
+Accept / Decline"). Each answer is a button of the same form, placed after Continue, that
+posts to ``/v1/login/invitation`` (``formaction``, ``formnovalidate``) and is named
+``accept`` or ``decline`` with the team id as its value; a button sends only its own name, so
+Continue still sends exactly ``csrf``, ``team`` and ``action``, and the page adds no input.
 """
 
 from __future__ import annotations
@@ -25,6 +31,19 @@ from html import escape
 from fastapi.responses import HTMLResponse, Response
 
 from .store import LoginChoice
+
+INVITATION_ACTION = "/v1/login/invitation"
+
+
+@dataclass(frozen=True)
+class InvitationView:
+    """One open invitation on the chooser: the team, its name, who invited, and as whom."""
+
+    team: str
+    name: str
+    member: str
+    invited_by: str
+
 
 STYLESHEET_PATH = "/v1/login/style.css"
 
@@ -220,6 +239,23 @@ button.link {
 }
 button.link:hover { text-decoration: underline; }
 .choice .name { font-weight: 600; }
+.invitations { margin: 20px 0 0; padding: 0; list-style: none; }
+.invitation {
+  padding: 12px 14px;
+  margin: 0 0 8px;
+  border: 1px dashed var(--border);
+  border-radius: 8px;
+}
+.invitation .name { font-weight: 600; }
+.invitation .actions { margin-top: 10px; }
+.notice {
+  margin: 0 0 12px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: var(--warn-soft);
+  color: var(--warn-text);
+  font-size: 14px;
+}
 footer { margin-top: 20px; padding-top: 12px; border-top: 1px solid var(--hairline);
   font-size: 12px; color: var(--subtle); }
 @media (max-width: 480px) {
@@ -322,6 +358,34 @@ def _create_fields(form: CreateForm, csrf: str, *, back: bool) -> str:
     )
 
 
+def _invitations(invitations: Sequence[InvitationView]) -> str:
+    """The invitations, each with its Accept and Decline buttons (see the module doc)."""
+    if not invitations:
+        return ""
+    items = []
+    for inv in invitations:
+        team = escape(inv.team)
+        items.append(
+            '<li class="invitation">'
+            f'<span class="name">{escape(inv.name)}</span> '
+            f'<span class="member mono">{team}</span> — invited by '
+            f'<span class="mono">{escape(inv.invited_by)}</span><br>'
+            f'<span class="member">as <span class="mono">{escape(inv.member)}</span></span>'
+            '<div class="actions">'
+            f'<button class="primary" type="submit" formaction="{INVITATION_ACTION}" '
+            f'formnovalidate name="accept" value="{team}">Accept</button>'
+            f'<button type="submit" formaction="{INVITATION_ACTION}" formnovalidate '
+            f'name="decline" value="{team}">Decline</button>'
+            "</div></li>"
+        )
+    legend = "Your invitation" if len(invitations) == 1 else "Your invitations"
+    return (
+        f'<fieldset><legend>{legend}</legend>\n<ul class="invitations">\n'
+        + "\n".join(items)
+        + "\n</ul></fieldset>\n"
+    )
+
+
 def chooser_page(
     *,
     email: str,
@@ -331,6 +395,8 @@ def chooser_page(
     action: str,
     names: dict[str, str] | None = None,
     preselect: str | None = None,
+    invitations: Sequence[InvitationView] = (),
+    notice: str | None = None,
 ) -> str:
     single = len(choices) == 1
     # M6-SPEC §7.5: preselected only when there is exactly one; with several, the member
@@ -355,19 +421,33 @@ def chooser_page(
             "</span></label>"
         )
     legend = "Your team" if single else "Choose a team"
+    teams = ""
+    buttons = '<button type="submit" name="action" value="cancel" formnovalidate>Cancel</button>'
+    if choices:
+        teams = f"<fieldset><legend>{legend}</legend>\n" + "\n".join(options) + "\n</fieldset>\n"
+        buttons = (
+            '<button class="primary" type="submit" name="action" value="continue">Continue'
+            "</button>" + buttons
+        )
+    lead = (
+        '<p class="subtle">A Claude Code session asked to sign in with this account.</p>\n'
+        if choices
+        else "<p>You're not on a team yet. Accept an invitation, or create a team.</p>\n"
+    )
+    shown = f'<p class="notice" role="status">{escape(notice)}</p>\n' if notice else ""
     body = (
         "<h1>Connect Claude Code to your team</h1>\n"
-        '<p class="subtle">A Claude Code session asked to sign in with this account.</p>\n'
+        + lead
+        + shown
         + _identity(email, device)
         + f'<form method="post" action="{escape(action)}">\n'
         f'<input type="hidden" name="csrf" value="{escape(csrf)}">\n'
-        f"<fieldset><legend>{legend}</legend>\n" + "\n".join(options) + "\n</fieldset>\n"
-        '<div class="actions">'
-        '<button class="primary" type="submit" name="action" value="continue">Continue</button>'
-        '<button type="submit" name="action" value="cancel" formnovalidate>Cancel</button>'
-        "</div>\n"
+        + teams
+        + f'<div class="actions">{buttons}</div>\n'
+        # M9-SPEC §7.2: after Continue, buttons of the same form (see the module doc).
+        + _invitations(invitations)
         # M9-SPEC §3: a button of the same form, so the page keeps one form and its fields.
-        '<div class="secondary-actions">'
+        + '<div class="secondary-actions">'
         '<button class="link" type="submit" name="action" value="new" formnovalidate>'
         "Create a new team</button></div>\n</form>"
     )
