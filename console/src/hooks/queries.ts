@@ -1,7 +1,7 @@
-import { QueryClient, useQuery, useQueryClient, type Query } from '@tanstack/react-query'
+import { QueryClient, useMutation, useQuery, useQueryClient, type Query } from '@tanstack/react-query'
 
-import { ApiError, api } from '@/api/client'
-import type { Directory, Join, Me, RequestDetail } from '@/api/types'
+import { ApiError, ChangeError, api } from '@/api/client'
+import type { Directory, Join, Me, RequestDetail, Roster, RosterRole } from '@/api/types'
 import { emptyActivity, pollActivity, PollError, type ActivityState } from '@/lib/activity'
 
 // Polling cadence (M2 §5): the feed every 3 s, incrementally from `next_since` (less the
@@ -61,8 +61,8 @@ function hidden(): boolean {
 function whileVisible<T>(name: string, ms: number) {
   return (query: Query<T, ApiError, T, readonly unknown[]>): number | false => {
     if (hidden()) return false
-    // Signed out: nothing more will succeed until the page is reloaded.
-    if (query.state.error instanceof ApiError && query.state.error.kind === 'session_expired') return false
+    // Signed out, or not on the team: nothing more will succeed until the page is reloaded.
+    if (query.state.error instanceof ApiError && (query.state.error.kind === 'session_expired' || query.state.error.kind === 'not_on_team')) return false
     const streak = slowStreak.get(name) ?? 0
     if (streak === 0) return ms
     const err = query.state.error
@@ -77,7 +77,7 @@ export function useMe() {
     queryKey: ['me'],
     queryFn: async () => (await api.me()).data,
     staleTime: Infinity,
-    retry: (count, err) => err.kind !== 'unauthorized' && err.kind !== 'session_expired' && count < 100,
+    retry: (count, err) => err.kind !== 'unauthorized' && err.kind !== 'session_expired' && err.kind !== 'not_on_team' && count < 100,
     retryDelay: (count, err) => (err.kind === 'rate_limited' ? slowDelay(count + 1, err.retryAfterMs) : 3_000),
   })
 }
@@ -99,6 +99,38 @@ export function useDirectory() {
     queryKey: ['directory'],
     queryFn: () => tracked('directory', async () => (await api.directory()).data),
     refetchInterval: whileVisible('directory', DIRECTORY_INTERVAL_MS),
+  })
+}
+
+export const ROSTER_INTERVAL_MS = 30_000
+export const rosterKey = ['roster'] as const
+
+/** M6 §2: the team's roster, for the Members panel (owners see emails; members names and roles). */
+export function useRoster() {
+  return useQuery<Roster, ApiError>({
+    queryKey: rosterKey,
+    queryFn: () => tracked('roster', async () => (await api.roster()).data),
+    refetchInterval: whileVisible('roster', ROSTER_INTERVAL_MS),
+  })
+}
+
+export type RosterChange =
+  | { kind: 'add'; member: string; email: string }
+  | { kind: 'role'; member: string; role: RosterRole }
+  | { kind: 'remove'; member: string }
+
+/** M6 §3: an owner's change, sent once; the roster and the directory are read again after it. */
+export function useRosterChange() {
+  const qc = useQueryClient()
+  return useMutation<unknown, ChangeError, RosterChange>({
+    mutationFn: (c) =>
+      c.kind === 'add' ? api.addMember(c.member, c.email) : c.kind === 'role' ? api.setRole(c.member, c.role) : api.removeMember(c.member),
+    retry: false,
+    onSettled: () => {
+      void qc.invalidateQueries({ queryKey: rosterKey })
+      void qc.invalidateQueries({ queryKey: ['directory'] })
+      void qc.invalidateQueries({ queryKey: ['me'] })
+    },
   })
 }
 
@@ -153,10 +185,19 @@ export type Connection =
   | { state: 'live'; rttMs: number | null; updatedAt: number }
   /** Over the relay's read budget: polling less often, what is on screen is kept. */
   | { state: 'slowed'; updatedAt: number | null }
-  | { state: 'unreachable'; reason: 'relay' | 'server'; since: number; updatedAt: number | null }
+  | {
+      state: 'unreachable'
+      reason: 'relay' | 'server'
+      since: number
+      updatedAt: number | null
+      /** The relay refused the console's sign-in (401): /team-relay:login again (M5 §6). */
+      signInRefused?: boolean
+    }
   | { state: 'unauthorized' }
   /** Hosted: the IAP sign-in lapsed; a reload signs in again. */
   | { state: 'session_expired' }
+  /** Hosted (M6 §4): the signed-in account is not on the team. */
+  | { state: 'not_on_team'; email: string | null }
 
 /** The relay connection as the header and the banner describe it, from the feed's poll. */
 export function useConnection(): Connection {
@@ -164,6 +205,7 @@ export function useConnection(): Connection {
   const err = q.error
   if (err?.kind === 'unauthorized') return { state: 'unauthorized' }
   if (err?.kind === 'session_expired') return { state: 'session_expired' }
+  if (err?.kind === 'not_on_team') return { state: 'not_on_team', email: err.email }
   const failing = q.isError && err !== null
   if (failing && err.kind === 'rate_limited') {
     return { state: 'slowed', updatedAt: q.data?.receivedAt ?? null }
@@ -174,6 +216,7 @@ export function useConnection(): Connection {
       reason: err.kind === 'relay_unreachable' ? 'relay' : 'server',
       since: failingSince ?? q.errorUpdatedAt,
       updatedAt: q.data?.receivedAt ?? null,
+      signInRefused: err.kind === 'relay_unreachable' && err.relayStatus === 401,
     }
   }
   if (!q.data) return { state: 'connecting' }

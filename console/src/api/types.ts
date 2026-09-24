@@ -21,10 +21,35 @@ export interface Me {
 export interface Join {
   relay_url: string
   team: string
-  /** The team-relay repository to clone, or null: ask the team owner for access. */
+  /** The team-relay repository, or null. */
   repo_url: string | null
+  /**
+   * What `/plugin marketplace add` takes (M5 §1): a GitHub owner/repo or a git URL, or null
+   * (ask the team owner). Absent from older console servers.
+   */
+  marketplace_source?: string | null
   marketplace: string
   plugin: string
+  /** True when the team's relay is the plugin's default, so a bare /team-relay:login reaches it. */
+  default_relay?: boolean
+}
+
+export type RosterRole = 'owner' | 'member'
+
+/**
+ * One entry of GET /api/roster (M6 §2). Owners see every email; a member sees their own and
+ * null for everyone else's.
+ */
+export interface RosterMember {
+  member: string
+  emails: Array<string | null> | null
+  role: RosterRole
+  added_by?: string | null
+  added_at?: Iso | null
+}
+
+export interface Roster {
+  members: RosterMember[]
 }
 
 export type Environment = 'staging' | 'production'

@@ -1,4 +1,4 @@
-import { KeyRound, LogIn, PlugZap, ServerOff } from 'lucide-react'
+import { KeyRound, LogIn, PlugZap, ServerOff, UserX } from 'lucide-react'
 import type { ReactNode } from 'react'
 
 import { isHosted } from '@/api/key'
@@ -63,6 +63,23 @@ export function SessionExpired() {
   )
 }
 
+/**
+ * Hosted (M6 §4): the Google account IAP signed in is not on this team. Nothing else is
+ * shown: the relay gave the console no data for it.
+ */
+export function NotOnTeam({ email }: { email: string | null }) {
+  return (
+    <FullPage icon={<UserX className="size-4" />} title="You're not on this team yet">
+      <p data-not-on-team>
+        Ask the team owner to add{' '}
+        {email ? <span className="font-medium text-foreground">{email}</span> : 'the Google account you signed in with'}. Once
+        they have, reload this page.
+      </p>
+      <p className="mt-2">Signed in with the wrong account? Sign out of Google in this browser, then reload.</p>
+    </FullPage>
+  )
+}
+
 /** The relay (or the console server itself) stopped answering; what is on screen is kept. */
 export function UnreachableBanner({ conn }: { conn: Extract<Connection, { state: 'unreachable' }> }) {
   const relay = conn.reason === 'relay'
@@ -72,13 +89,19 @@ export function UnreachableBanner({ conn }: { conn: Extract<Connection, { state:
       <Icon aria-hidden className="mt-0.5 size-4 shrink-0 text-bad" />
       <div className="flex min-w-0 flex-col gap-0.5">
         <span className="font-semibold text-foreground">
-          {relay ? 'The relay is not answering' : 'The console server is not answering'}
+          {conn.signInRefused
+            ? 'The relay refused your sign-in'
+            : relay
+              ? 'The relay is not answering'
+              : 'The console server is not answering'}
         </span>
         <span className="text-subtle">
-          {relay
+          {conn.signInRefused
+            ? 'You were signed out, your sign-in expired, or you are no longer on the team. Run /team-relay:login in Claude Code, then start the console again.'
+            : relay
             ? isHosted()
               ? 'The console is running, but its calls to the relay fail.'
-              : 'The console server is running, but its calls to the relay fail. Check your network and your gcloud login.'
+              : 'The console server is running, but its calls to the relay fail. Check your network and your sign-in (/team-relay:login).'
             : isHosted()
               ? 'The console service did not answer.'
               : 'It may have been stopped. Start it again with bin/console and open the new link.'}{' '}

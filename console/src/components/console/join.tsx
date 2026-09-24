@@ -1,14 +1,15 @@
-import { Check, ChevronRight, Copy } from 'lucide-react'
+import { Check, ChevronRight, Copy, UserPlus } from 'lucide-react'
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
 
 import { Skeleton } from '@/components/ui/skeleton'
 import { useJoin, useMe } from '@/hooks/queries'
-import { CLONE_PATH, EMAIL_PLACEHOLDER, MIN_CLAUDE_CODE, MIN_NODE, joinCommands, viewerEmail } from '@/lib/join'
+import { EMAIL_PLACEHOLDER, MIN_CLAUDE_CODE, MIN_NODE, joinCommands, viewerEmail } from '@/lib/join'
 import { cn } from '@/lib/utils'
 
-// "Join the team": a reference panel of the steps a new member follows (plugin/README.md),
-// with every value from GET /api/join and the viewer's email from /api/me. A disclosure:
-// open on a viewer's first visit, closed on later ones, and after that as the viewer left it.
+// "Join the team": the three steps of M5 §1 (install the plugin, sign in, start answering),
+// with every value from GET /api/join and the viewer's email from /api/me, and, for an owner,
+// how to invite someone (M6 §4). A disclosure: open on a viewer's first visit, closed on later
+// ones, and after that as the viewer left it.
 
 export const JOIN_STORAGE_KEY = 'team-relay-console.join'
 
@@ -129,7 +130,7 @@ function Note({ children }: { children: ReactNode }) {
   return <p className="text-[12.5px] leading-relaxed text-subtle">{children}</p>
 }
 
-function Steps() {
+function Steps({ owner }: { owner: boolean }) {
   const join = useJoin()
   const me = useMe()
 
@@ -151,99 +152,85 @@ function Steps() {
   }
 
   const email = viewerEmail(me.data?.email)
-  const placeholder = email === EMAIL_PLACEHOLDER
-  const c = joinCommands(join.data, email)
+  const c = joinCommands(join.data)
 
   return (
-    <ol className="gap-x-10 lg:columns-2" aria-label="Steps to join the team">
-      <Step n={0} title="What you need">
-        <ul className="flex list-disc flex-col gap-0.5 pl-4 text-[12.5px] leading-relaxed marker:text-faint">
-          <li>Claude Code {MIN_CLAUDE_CODE} or newer</li>
-          <li>Node.js {MIN_NODE} or newer</li>
-          <li>The Google Cloud CLI</li>
-          <li>Your team email on the relay's allowlist (ask the owner to add you)</li>
-        </ul>
-      </Step>
-
-      <Step n={1} title="Sign in to Google Cloud as yourself">
-        <Command text={c.signIn} label="sign-in command" />
-        {placeholder ? <Note>Use your team email, the one on the allowlist.</Note> : null}
-      </Step>
-
-      <Step n={2} title="Get the plugin">
-        {c.clone ? (
-          <Command text={c.clone} label="clone command" />
-        ) : (
+    <div className="flex flex-col gap-4">
+      {owner ? (
+        <p
+          data-invite-hint
+          className="flex items-start gap-2 rounded-md border bg-muted/60 px-3 py-2 text-[12.5px] leading-relaxed"
+        >
+          <UserPlus aria-hidden className="mt-0.5 size-3.5 shrink-0 text-subtle" />
+          <span>
+            <span className="font-medium">Inviting someone?</span> Add their Google email{' '}
+            <button
+              type="button"
+              className="rounded font-medium text-signal underline decoration-signal/40 underline-offset-2 hover:decoration-signal"
+              onClick={() => document.getElementById('members-title')?.scrollIntoView({ behavior: 'smooth', block: 'start' })}
+            >
+              here
+            </button>
+            , then send them the install steps.
+          </span>
+        </p>
+      ) : null}
+      <ol className="gap-x-10 lg:columns-3" aria-label="Steps to join the team">
+        <Step n={1} title="Install the plugin">
+          {c.marketplaceAdd ? (
+            <Command text={c.marketplaceAdd} label="marketplace command" />
+          ) : (
+            <Note>
+              <span className="text-foreground">Ask the team owner where to add the plugin from.</span> Then add that
+              marketplace.
+            </Note>
+          )}
+          <Command text={c.install} label="install command" />
+          <Note>No questions to answer. Then start Claude Code with the team channel:</Note>
+          <Command text={c.working} label="working session command" />
           <Note>
-            <span className="text-foreground">Ask the team owner for access to the team-relay repository.</span> Then
-            clone it.
+            Claude Code {MIN_CLAUDE_CODE} or newer and Node.js {MIN_NODE} or newer. It asks once for consent to load the
+            channel.
           </Note>
-        )}
-        <Note>
-          The steps below use the clone's full path, shown as <Code>{CLONE_PATH}</Code>.
-        </Note>
-      </Step>
+        </Step>
 
-      <Step n={3} title="Install it in Claude Code">
-        <Command text={c.marketplaceAdd} label="marketplace command" />
-        <Command text={c.install} label="install command" />
-        <Note>Answer the install questions with:</Note>
-        <dl className="grid grid-cols-[auto_minmax(0,1fr)] items-center gap-x-4 rounded-md border py-1 pr-1 pl-3 font-mono text-[12px]">
-          {c.answers.map((a) => (
-            <div key={a.key} className="contents" data-answer={a.key}>
-              <dt className="text-subtle">{a.key}</dt>
-              <dd className="flex min-w-0 items-center gap-1">
-                <span className="min-w-0 flex-1 truncate text-foreground" title={a.value}>
-                  {a.value}
-                </span>
-                <CopyButton text={a.value} label={`${a.key} value`} />
-              </dd>
-            </div>
-          ))}
-        </dl>
-      </Step>
-
-      <Step n={4} title="Start your working session">
-        <Command text={c.working} label="working session command" />
-        <Note>Claude Code asks once for consent to load the development channel.</Note>
-      </Step>
-
-      <Step n={5} title="Start your answering session">
-        <Note>In a second terminal:</Note>
-        <Command text={c.answering} label="answering session commands" />
-        <Note>
-          The first run asks you to log in once, in the session's own config (Vertex settings in your environment work
-          too). To offer a capability, also export <Code>CAP_&lt;NAME&gt;_ENABLED=true</Code> and{' '}
-          <Code>CAP_&lt;NAME&gt;_RUNNER</Code>; plugin/README.md has the details.
-        </Note>
-        <div data-reads className="flex flex-col gap-1.5">
+        <Step n={2} title="Sign in">
+          <Command text={c.login} label="sign-in command" />
           <Note>
-            <span className="text-foreground">It reads none of your files by default.</span> To let it read a folder
-            without asking, share it deliberately before you start: <Code>export ANSWERER_READ_DIRS=~/src/app:~/notes</Code>{' '}
-            (teammates see the folder names).
+            Your browser opens on the relay. Sign in with Google
+            {email !== EMAIL_PLACEHOLDER ? (
+              <>
+                {' '}
+                as <span className="text-foreground">{email}</span>
+              </>
+            ) : (
+              ' with the account the owner added'
+            )}
+            , pick the team, and you are connected.
           </Note>
-          <Note>
-            For anything else it asks you in that terminal, naming the file or folder: allow it once, for the session, or
-            deny it. A desktop notification tells you when it is waiting.
-          </Note>
-          <Note>
-            Credentials and keys are never readable, whatever you allow. These are Claude Code permission rules, not an
-            OS sandbox.
-          </Note>
-        </div>
-      </Step>
+        </Step>
 
-      <Step n={6} title="Check that it worked">
-        <Note>
-          Your two presence rings on the team map turn green within a minute. Then ask a teammate something from your
-          working session.
-        </Note>
-      </Step>
-    </ol>
+        <Step n={3} title="Start answering">
+          <Command text={c.answering} label="answering command" />
+          <Note>It prints the one command that starts your answering session. Run that in a second terminal.</Note>
+          <div data-reads className="flex flex-col gap-1.5">
+            <Note>
+              <span className="text-foreground">It reads none of your files by default.</span> To share folders, start it
+              with <Code>ANSWERER_READ_DIRS=~/src/app:~/notes</Code> in front (teammates see the folder names). For anything
+              else it asks you in that terminal. Credentials are never readable; these are Claude Code permission rules, not
+              an OS sandbox.
+            </Note>
+            <Note>
+              <Code>{c.console}</Code> opens this console on your own machine.
+            </Note>
+          </div>
+        </Step>
+      </ol>
+    </div>
   )
 }
 
-export function JoinPanel() {
+export function JoinPanel({ owner = false }: { owner?: boolean }) {
   const [open, toggle] = useRemembered()
   return (
     <section
@@ -268,12 +255,12 @@ export function JoinPanel() {
           />
           Join the team
           <span className="ml-auto hidden text-[12px] font-normal text-subtle sm:inline">
-            Install the plugin and start your two sessions
+            Install, sign in, start answering
           </span>
         </button>
       </h2>
       <div id="join-steps" hidden={!open} className="border-t border-hairline px-4 pt-4">
-        {open ? <Steps /> : null}
+        {open ? <Steps owner={owner} /> : null}
       </div>
     </section>
   )

@@ -1,6 +1,7 @@
 // The "Join the team" panel: a disclosure that is open on a viewer's first visit and closed
-// afterwards (remembered in localStorage, and fine without it), whose commands are built from
-// GET /api/join and the viewer's email, with a copy button on every command.
+// afterwards (remembered in localStorage, and fine without it), with M5 §1's three steps
+// (install the plugin, sign in, start answering) built from GET /api/join, a copy button on
+// every command, and, for an owner, how to invite someone (M6 §4).
 
 import { act, fireEvent, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
@@ -21,8 +22,10 @@ const JOIN: Join = {
   relay_url: 'https://relay-zeta.team.example',
   team: 'zeta',
   repo_url: 'https://git.team.example/zeta/multiagent.git',
+  marketplace_source: 'zeta-org/zeta-relay',
   marketplace: 'zeta-market',
   plugin: 'zeta-relay',
+  default_relay: true,
 }
 const ME: Me = { team: 'zeta', member: 'dana', teammates: ['eli'], email: 'dana@team.example' }
 
@@ -69,14 +72,14 @@ describe('join panel: open and closed', () => {
     expect(toggle()).toHaveAttribute('aria-expanded', 'true')
     expect(toggle()).toHaveAttribute('aria-controls', 'join-steps')
     expect(steps()).toBeVisible()
-    await screen.findByText('Sign in to Google Cloud as yourself')
+    await screen.findByText('Install the plugin')
     expect(window.localStorage.getItem(JOIN_STORAGE_KEY)).toBe('closed')
     first.unmount()
 
     renderWithClient(<JoinPanel />)
     expect(toggle()).toHaveAttribute('aria-expanded', 'false')
     expect(steps()).not.toBeVisible()
-    expect(screen.queryByText('Sign in to Google Cloud as yourself')).toBeNull()
+    expect(screen.queryByText('Install the plugin')).toBeNull()
     expect(s.joinCalls()).toHaveLength(1)
   })
 
@@ -89,7 +92,7 @@ describe('join panel: open and closed', () => {
     await user.click(toggle())
     expect(toggle()).toHaveAttribute('aria-expanded', 'true')
     expect(window.localStorage.getItem(JOIN_STORAGE_KEY)).toBe('open')
-    await screen.findByText('Start your answering session')
+    await screen.findByText('Start answering')
     a.unmount()
 
     const b = renderWithClient(<JoinPanel />)
@@ -127,7 +130,7 @@ describe('join panel: open and closed', () => {
     const user = userEvent.setup()
     renderWithClient(<JoinPanel />)
     expect(toggle()).toHaveAttribute('aria-expanded', 'true')
-    expect(await screen.findByText('Get the plugin')).toBeInTheDocument()
+    expect(await screen.findByText('Sign in')).toBeInTheDocument()
     expect(commandText('install command')).toBe('/plugin install zeta-relay@zeta-market')
     await user.click(toggle())
     expect(toggle()).toHaveAttribute('aria-expanded', 'false')
@@ -138,92 +141,90 @@ describe('join panel: open and closed', () => {
   })
 })
 
-describe('join panel: the steps', () => {
-  it('builds every command from /api/join and the viewer email', async () => {
+describe('join panel: the steps (M5 §1)', () => {
+  it('builds every command from /api/join: install, sign in, start answering', async () => {
     server()
     renderWithClient(<JoinPanel />)
-    await screen.findByText('Sign in to Google Cloud as yourself')
-    await waitFor(() => expect(commandText('sign-in command')).toBe('gcloud auth login dana@team.example'))
+    await screen.findByText('Install the plugin')
+    expect([...document.querySelectorAll('[data-step]')].map((el) => el.getAttribute('data-step'))).toEqual(['1', '2', '3'])
+    expect(screen.getByText('Sign in')).toBeInTheDocument()
+    expect(screen.getByText('Start answering')).toBeInTheDocument()
 
-    expect(commandText('clone command')).toBe('git clone https://git.team.example/zeta/multiagent.git team-relay')
-    expect(commandText('marketplace command')).toBe('/plugin marketplace add /path/to/team-relay')
+    expect(commandText('marketplace command')).toBe('/plugin marketplace add zeta-org/zeta-relay')
     expect(commandText('install command')).toBe('/plugin install zeta-relay@zeta-market')
     expect(commandText('working session command')).toBe('claude --dangerously-load-development-channels plugin:zeta-relay@zeta-market')
-    expect(commandText('answering session commands')).toBe(
-      [
-        'export RELAY_URL=https://relay-zeta.team.example',
-        'export RELAY_TEAM=zeta',
-        'export RELAY_GCLOUD_ACCOUNT=dana@team.example',
-        '/path/to/team-relay/plugin/bin/answerer',
-      ].join('\n'),
-    )
-    const answers = Object.fromEntries(
-      [...document.querySelectorAll('[data-answer]')].map((el) => [
-        el.getAttribute('data-answer'),
-        el.querySelector('dd')?.textContent,
-      ]),
-    )
-    expect(answers).toEqual({
-      relay_url: 'https://relay-zeta.team.example',
-      relay_team: 'zeta',
-      relay_auth: 'google',
-      gcloud_account: 'dana@team.example',
-    })
-    expect(screen.queryByText(/Ask the team owner for access/)).toBeNull()
-    expect(screen.queryByText(/Use your team email/)).toBeNull()
-
-    // Step 0 to step 6, in order, and the prerequisites.
-    expect([...document.querySelectorAll('[data-step]')].map((el) => el.getAttribute('data-step'))).toEqual(['0', '1', '2', '3', '4', '5', '6'])
-    expect(steps()).toHaveTextContent('Claude Code 2.1.280 or newer')
-    expect(steps()).toHaveTextContent('Node.js 22 or newer')
-    expect(steps()).toHaveTextContent('The Google Cloud CLI')
-    expect(steps()).toHaveTextContent(/allowlist \(ask the owner to add you\)/)
-    expect(steps()).toHaveTextContent(/presence rings on the team map turn green within a minute/)
-    expect(steps()).toHaveTextContent(/CAP_<NAME>_ENABLED=true/)
+    // The team's relay is the plugin's default: a bare login reaches it.
+    expect(commandText('sign-in command')).toBe('/zeta-relay:login')
+    expect(commandText('answering command')).toBe('/zeta-relay:answering')
+    expect(steps()).toHaveTextContent('/zeta-relay:console')
+    expect(steps()).toHaveTextContent('No questions to answer.')
+    expect(steps()).toHaveTextContent('Claude Code 2.1.280 or newer and Node.js 22 or newer')
+    await waitFor(() => expect(steps()).toHaveTextContent(/Sign in with Google as dana@team\.example, pick the team, and you are connected/))
+    // No gcloud, no clone, no install questions, no environment to export.
+    expect(steps()).not.toHaveTextContent(/gcloud|git clone|RELAY_URL|RELAY_TEAM|relay_auth|export /)
     // Nothing from the demo leaks in.
     expect(steps()).not.toHaveTextContent(/relay\.example\.com|team-relay-dev|demo/)
     // Every command block has its own copy button.
     for (const block of document.querySelectorAll('[data-command]')) {
       expect(within(block as HTMLElement).getByRole('button', { name: /^Copy / })).toBeInTheDocument()
     }
+    // Not an owner: no invite hint.
+    expect(document.querySelector('[data-invite-hint]')).toBeNull()
   })
 
-  it('says in step 5 what the answering session may read (M4 §4)', async () => {
+  it('names the relay in the sign-in command when it is not the plugin default', async () => {
+    server({ join: { ...JOIN, default_relay: false } })
+    renderWithClient(<JoinPanel />)
+    await screen.findByText('Install the plugin')
+    expect(commandText('sign-in command')).toBe('/zeta-relay:login https://relay-zeta.team.example')
+  })
+
+  it('says in step 3 what the answering session may read (M4 §4)', async () => {
     server()
     renderWithClient(<JoinPanel />)
-    await screen.findByText('Start your answering session')
-    await waitFor(() => expect(document.querySelector('[data-reads]')).not.toBeNull())
-    const step5 = document.querySelector('[data-step="5"]') as HTMLElement
-    const reads = step5.querySelector('[data-reads]') as HTMLElement
-    // Nothing by default; share folders deliberately; grant when asked; never credentials; not a sandbox.
+    await screen.findByText('Start answering')
+    const step3 = document.querySelector('[data-step="3"]') as HTMLElement
+    const reads = step3.querySelector('[data-reads]') as HTMLElement
     expect(reads).toHaveTextContent('It reads none of your files by default.')
-    expect(reads).toHaveTextContent(/share it deliberately before you start: export ANSWERER_READ_DIRS=~\/src\/app:~\/notes/)
+    expect(reads).toHaveTextContent(/ANSWERER_READ_DIRS=~\/src\/app:~\/notes/)
     expect(reads).toHaveTextContent(/teammates see the folder names/)
-    expect(reads).toHaveTextContent(/it asks you in that terminal, naming the file or folder: allow it once, for the session, or deny it/)
-    expect(reads).toHaveTextContent(/desktop notification tells you when it is waiting/)
-    expect(reads).toHaveTextContent(/Credentials and keys are never readable, whatever you allow/)
+    expect(reads).toHaveTextContent(/For anything else it asks you in that terminal/)
+    expect(reads).toHaveTextContent(/Credentials are never readable/)
     expect(reads).toHaveTextContent(/permission rules, not an OS sandbox/)
-    // The read setting is optional: the command block itself does not set it.
-    expect(commandText('answering session commands')).not.toContain('ANSWERER_READ_DIRS')
+    expect(commandText('answering command')).not.toContain('ANSWERER_READ_DIRS')
   })
 
-  it('uses a placeholder, and says which email, when /api/me gives none', async () => {
+  it('says which account to use when /api/me gives no email', async () => {
     const { email: _email, ...noEmail } = ME
     server({ me: noEmail })
     renderWithClient(<JoinPanel />)
-    await screen.findByText('Sign in to Google Cloud as yourself')
-    await waitFor(() => expect(commandText('sign-in command')).toBe('gcloud auth login <you>@<domain>'))
-    expect(commandText('answering session commands')).toContain('export RELAY_GCLOUD_ACCOUNT=<you>@<domain>')
-    expect(screen.getByText(/Use your team email/)).toBeInTheDocument()
+    await screen.findByText('Install the plugin')
+    await waitFor(() => expect(steps()).toHaveTextContent(/Sign in with Google with the account the owner added/))
   })
 
-  it('asks the owner for the repository when repo_url is null', async () => {
-    server({ join: { ...JOIN, repo_url: null } })
+  it('asks the owner where to add the plugin from when there is no marketplace source', async () => {
+    server({ join: { ...JOIN, marketplace_source: null } })
     renderWithClient(<JoinPanel />)
-    expect(await screen.findByText('Ask the team owner for access to the team-relay repository.')).toBeInTheDocument()
-    expect(command('clone command')).toBeNull()
-    expect(steps()).not.toHaveTextContent('git clone')
+    expect(await screen.findByText('Ask the team owner where to add the plugin from.')).toBeInTheDocument()
+    expect(command('marketplace command')).toBeNull()
     expect(commandText('install command')).toBe('/plugin install zeta-relay@zeta-market')
+  })
+
+  it('never puts an odd marketplace source or relay URL into a command', async () => {
+    server({ join: { ...JOIN, marketplace_source: 'x; rm -rf ~', relay_url: 'https://relay.example.com/$(id)', default_relay: false } })
+    renderWithClient(<JoinPanel />)
+    await screen.findByText('Install the plugin')
+    expect(command('marketplace command')).toBeNull()
+    expect(commandText('sign-in command')).toBe('/zeta-relay:login')
+  })
+
+  it('tells an owner how to invite someone (M6 §4)', async () => {
+    server()
+    renderWithClient(<JoinPanel owner />)
+    await screen.findByText('Install the plugin')
+    const hint = document.querySelector('[data-invite-hint]') as HTMLElement
+    expect(hint).toHaveTextContent('Add their Google email here, then send them the install steps.')
+    expect(within(hint).getByRole('button', { name: 'here' })).toBeInTheDocument()
   })
 
   it('says so when the join details do not load', async () => {
@@ -238,16 +239,15 @@ describe('join panel: copy', () => {
   it('writes the command to the clipboard and shows Copied for a moment', async () => {
     server()
     renderWithClient(<JoinPanel />)
-    await screen.findByText('Sign in to Google Cloud as yourself')
-    await waitFor(() => expect(commandText('answering session commands')).toContain('dana@team.example'))
+    await screen.findByText('Install the plugin')
 
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
-    const button = within(command('answering session commands')!).getByRole('button', { name: 'Copy answering session commands' })
+    const button = within(command('sign-in command')!).getByRole('button', { name: 'Copy sign-in command' })
     await act(async () => {
       fireEvent.click(button)
     })
     expect(clipboard.writeText).toHaveBeenCalledTimes(1)
-    expect(clipboard.writeText).toHaveBeenCalledWith(commandText('answering session commands'))
+    expect(clipboard.writeText).toHaveBeenCalledWith('/zeta-relay:login')
     expect(button).toHaveTextContent('Copied')
     expect(button).toHaveAttribute('data-copy', 'copied')
     await act(async () => {
@@ -256,18 +256,18 @@ describe('join panel: copy', () => {
     expect(button).not.toHaveTextContent('Copied')
     expect(button).toHaveAttribute('data-copy', 'idle')
 
-    const relayValue = within(document.querySelector('[data-answer="relay_url"]') as HTMLElement).getByRole('button')
+    const answering = within(command('answering command')!).getByRole('button')
     await act(async () => {
-      fireEvent.click(relayValue)
+      fireEvent.click(answering)
     })
-    expect(clipboard.writeText).toHaveBeenLastCalledWith('https://relay-zeta.team.example')
+    expect(clipboard.writeText).toHaveBeenLastCalledWith('/zeta-relay:answering')
   })
 
   it('says the copy failed when the clipboard refuses, or there is none', async () => {
     clipboard.writeText.mockRejectedValue(new DOMException('no', 'NotAllowedError'))
     server()
     renderWithClient(<JoinPanel />)
-    await screen.findByText('Sign in to Google Cloud as yourself')
+    await screen.findByText('Install the plugin')
     const button = within(command('install command')!).getByRole('button')
     await act(async () => {
       fireEvent.click(button)
@@ -287,7 +287,7 @@ describe('join panel in the console', () => {
   it('sits below the header and above the team map, and does not depend on the relay', async () => {
     const s = server({ me: { ...fixtureMe } })
     renderWithClient(<App />)
-    await screen.findByText('Sign in to Google Cloud as yourself')
+    await screen.findByText('Install the plugin')
     const panel = document.querySelector('[data-join]') as HTMLElement
     const header = screen.getAllByRole('banner')[0]!
     const map = document.getElementById('team-map-title')!.closest('section')!

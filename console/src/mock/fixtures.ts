@@ -15,7 +15,7 @@
 //                       (M4 §2: the tool event is `waiting`)
 // bob shares two folders with his answering session; carol shares none (M4 §3).
 
-import type { ActivityPage, ActivityRequest, Directory, Join, Manifest, Me, RequestDetail } from '@/api/types'
+import type { ActivityPage, ActivityRequest, Directory, Join, Manifest, Me, RequestDetail, Roster } from '@/api/types'
 
 export const FIXTURE_NOW = '2026-09-23T10:15:00.000Z'
 
@@ -26,8 +26,19 @@ export const fixtureJoin: Join = {
   relay_url: 'https://relay.example.com',
   team: 'demo',
   repo_url: null,
+  marketplace_source: 'example/team-relay',
   marketplace: 'team-relay-dev',
   plugin: 'team-relay',
+  default_relay: false,
+}
+
+/** GET /api/roster as alice, an owner, reads it (M6 §2): every email visible. */
+export const fixtureRoster: Roster = {
+  members: [
+    { member: 'alice', emails: ['alice@example.com'], role: 'owner', added_by: 'alice', added_at: '2026-09-17T09:00:00Z' },
+    { member: 'bob', emails: ['bob@example.com'], role: 'member', added_by: 'alice', added_at: '2026-09-17T09:02:00Z' },
+    { member: 'carol', emails: ['carol@example.com', 'carol.w@example.org'], role: 'member', added_by: 'alice', added_at: '2026-09-18T14:30:00Z' },
+  ],
 }
 
 const stagingDbQuery: Manifest['capabilities'][number] = {

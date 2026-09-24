@@ -1,9 +1,10 @@
 import { consoleKey, isHosted } from './key'
-import type { ActivityPage, Directory, Join, Me, RequestDetail } from './types'
+import type { ActivityPage, Directory, Join, Me, RequestDetail, Roster, RosterRole } from './types'
 
-// Every call goes to the console server's read-only proxy: locally (M2 §4.4) with the key
-// in X-Console-Key; hosted behind IAP (M3 §4) without a key, with the IAP session cookie.
-// There is no write path in this client, by construction.
+// Every call goes to the console server's proxy: locally (M2 §4.4) with the key in
+// X-Console-Key; hosted behind IAP (M3 §4) without a key, with the IAP session cookie. The only
+// writes are an owner's roster changes (M6 §3): a same-origin JSON POST, PATCH or DELETE,
+// which the browser marks Sec-Fetch-Site: same-origin. Nothing can be sent, acked or replied.
 
 export type Transport = (path: string, init: RequestInit) => Promise<Response>
 
@@ -22,6 +23,11 @@ export type ApiErrorKind =
   | 'not_found'
   /** The relay's per-member read budget is spent (429 rate_limited, M2 §7.3). */
   | 'rate_limited'
+  /**
+   * Hosted (M6 §4): the Google account IAP signed in is not on the team; the console server
+   * answers 403 {"error": "not_on_team", "email"} and no data.
+   */
+  | 'not_on_team'
   | 'failed'
 
 export class ApiError extends Error {
@@ -29,13 +35,42 @@ export class ApiError extends Error {
   readonly status: number | null
   /** For `rate_limited`: how long the server asked us to wait, when it said. */
   readonly retryAfterMs: number | null
+  /** For `not_on_team`: the signed-in account, as the console server named it. */
+  readonly email: string | null
+  /** For a relay refusal: the relay's status (401: the stored sign-in was refused). */
+  readonly relayStatus: number | null
 
-  constructor(kind: ApiErrorKind, status: number | null, message: string, retryAfterMs: number | null = null) {
+  constructor(
+    kind: ApiErrorKind,
+    status: number | null,
+    message: string,
+    retryAfterMs: number | null = null,
+    extra: { email?: string | null; relayStatus?: number | null } = {},
+  ) {
     super(message)
     this.name = 'ApiError'
     this.kind = kind
     this.status = status
     this.retryAfterMs = retryAfterMs
+    this.email = extra.email ?? null
+    this.relayStatus = extra.relayStatus ?? null
+  }
+}
+
+const NOT_ON_TEAM_EMAIL = /^[^\s@<>"'`]{1,64}@[^\s@<>"'`]{1,253}$/
+
+/** The console server's 403 for a signed-in account that is not on the team (M6 §4). */
+async function notOnTeam(res: Response): Promise<ApiError | null> {
+  if (res.status !== 403 || !isJson(res)) return null
+  try {
+    const body: unknown = await res.clone().json()
+    if (typeof body !== 'object' || body === null || (body as { error?: unknown }).error !== 'not_on_team') return null
+    const email = (body as { email?: unknown }).email
+    return new ApiError('not_on_team', 403, 'Not on this team', null, {
+      email: typeof email === 'string' && NOT_ON_TEAM_EMAIL.test(email) ? email : null,
+    })
+  } catch {
+    return null
   }
 }
 
@@ -95,6 +130,8 @@ export async function getJson<T>(path: string): Promise<Timed<T>> {
   if (res.type === 'opaqueredirect' || res.status === 0 || (res.status >= 300 && res.status < 400)) {
     throw expired(res.status || null)
   }
+  const stranger = await notOnTeam(res)
+  if (stranger) throw stranger
   if (res.status === 401 || res.status === 403) {
     // Keyless (hosted) there is no key to refuse, and a refusal that is not the console
     // server's JSON came from IAP: either way, signing in again is the answer.
@@ -114,7 +151,7 @@ export async function getJson<T>(path: string): Promise<Timed<T>> {
     if (res.status === 502 && (await relayRateLimited(res))) {
       throw new ApiError('rate_limited', res.status, 'Slowed down by the relay', retryAfter(res))
     }
-    throw new ApiError('relay_unreachable', res.status, 'The relay did not answer')
+    throw new ApiError('relay_unreachable', res.status, 'The relay did not answer', null, { relayStatus: await relayStatusOf(res) })
   }
   if (!res.ok) {
     throw new ApiError('failed', res.status, `Request failed with ${res.status}`)
@@ -137,9 +174,19 @@ function retryAfter(res: Response): number | null {
   return Math.min(300, Number(v.trim())) * 1000
 }
 
+async function relayStatusOf(res: Response): Promise<number | null> {
+  try {
+    const body: unknown = await res.clone().json()
+    const st = typeof body === 'object' && body !== null ? (body as { relay_status?: unknown }).relay_status : null
+    return typeof st === 'number' ? st : null
+  } catch {
+    return null
+  }
+}
+
 async function relayRateLimited(res: Response): Promise<boolean> {
   try {
-    const body: unknown = await res.json()
+    const body: unknown = await res.clone().json()
     if (typeof body !== 'object' || body === null) return false
     const b = body as Record<string, unknown>
     return b.relay_status === 429 || b.relay_error === 'rate_limited' || b.error === 'rate_limited'
@@ -148,10 +195,116 @@ async function relayRateLimited(res: Response): Promise<boolean> {
   }
 }
 
+// ---------------------------------------------------------------------------------------
+// Roster changes (M6 §3, §4): the owner's only writes.
+
+/** Why a roster change did not happen, in words for the Members panel. */
+export class ChangeError extends Error {
+  readonly status: number | null
+  readonly relayStatus: number | null
+  /** The session is gone (local key refused, or the IAP sign-in lapsed): reload. */
+  readonly signedOut: boolean
+  constructor(message: string, opts: { status?: number | null; relayStatus?: number | null; signedOut?: boolean } = {}) {
+    super(message)
+    this.name = 'ChangeError'
+    this.status = opts.status ?? null
+    this.relayStatus = opts.relayStatus ?? null
+    this.signedOut = opts.signedOut ?? false
+  }
+}
+
+/** The relay's own detail, when it is plain short text; never markup or a wall of text. */
+function plainDetail(v: unknown): string | null {
+  if (typeof v !== 'string') return null
+  const t = v.trim()
+  if (!t || t.length > 200 || /[<>]/.test(t)) return null
+  return t
+}
+
+async function changeError(res: Response): Promise<ChangeError> {
+  let body: Record<string, unknown> = {}
+  if (isJson(res)) {
+    try {
+      const b: unknown = await res.json()
+      if (typeof b === 'object' && b !== null) body = b as Record<string, unknown>
+    } catch {
+      body = {}
+    }
+  }
+  if (res.status === 403 && body.error === 'not_on_team') {
+    return new ChangeError('This Google account is not on the team.', { status: 403 })
+  }
+  // A refused key (local), or IAP's refusal, which is not the console server's JSON (hosted).
+  if (res.status === 401 || (res.status === 403 && (!isJson(res) || body.detail === 'wrong console key'))) {
+    return new ChangeError(isHosted() ? 'Your session has expired. Reload to sign in again.' : 'This console link is no longer valid.', {
+      status: res.status,
+      signedOut: true,
+    })
+  }
+  if (res.status === 400 || res.status === 403 || res.status === 413 || res.status === 415) {
+    return new ChangeError(plainDetail(body.detail) ?? 'The console refused that change.', { status: res.status })
+  }
+  if (res.status === 502 && body.error === 'relay_refused') {
+    const rs = typeof body.relay_status === 'number' ? body.relay_status : null
+    const detail = plainDetail(body.detail)
+    const message =
+      rs === 409
+        ? (detail ?? 'That member id or email is already on the team.')
+        : rs === 403
+          ? 'Only team owners can change members.'
+          : rs === 429
+            ? 'Too many member changes for now. Try again in a while.'
+            : rs === 404
+              ? (detail ?? 'That member is no longer on the team.')
+              : rs === 401
+                ? 'The relay refused your sign-in. Run /team-relay:login again.'
+                : (detail ?? `The relay refused that change (${rs ?? 'error'}).`)
+    return new ChangeError(message, { status: 502, relayStatus: rs })
+  }
+  if (res.status >= 500) return new ChangeError('The relay did not answer. Try again.', { status: res.status })
+  return new ChangeError(`The change failed (${res.status}).`, { status: res.status })
+}
+
+/** A roster change: JSON, same origin, no redirects followed. Resolves with the relay's answer. */
+export async function sendChange<T>(method: 'POST' | 'PATCH' | 'DELETE', path: string, body?: unknown): Promise<T> {
+  const key = consoleKey()
+  if (key === null && !isHosted()) throw new ChangeError('No console key.', { signedOut: true })
+  const headers: Record<string, string> = { Accept: 'application/json', 'Content-Type': 'application/json' }
+  if (key !== null) headers['X-Console-Key'] = key
+  let res: Response
+  try {
+    res = await transport(path, {
+      method,
+      headers,
+      body: body === undefined ? undefined : JSON.stringify(body),
+      credentials: key === null ? 'same-origin' : 'omit',
+      cache: 'no-store',
+      referrerPolicy: 'no-referrer',
+      redirect: 'manual',
+      signal: typeof AbortSignal.timeout === 'function' ? AbortSignal.timeout(TIMEOUT_MS) : null,
+    })
+  } catch {
+    throw new ChangeError('The console server did not answer.')
+  }
+  if (res.type === 'opaqueredirect' || res.status === 0 || (res.status >= 300 && res.status < 400)) {
+    throw new ChangeError('Your session has expired. Reload to sign in again.', { signedOut: true })
+  }
+  if (!res.ok) throw await changeError(res)
+  try {
+    return (await res.json()) as T
+  } catch {
+    return {} as T
+  }
+}
+
 export const api = {
   me: () => getJson<Me>('api/me'),
   directory: () => getJson<Directory>('api/directory'),
   join: () => getJson<Join>('api/join'),
+  roster: () => getJson<Roster>('api/roster'),
+  addMember: (member: string, email: string) => sendChange<unknown>('POST', 'api/roster', { member, email }),
+  setRole: (member: string, role: RosterRole) => sendChange<unknown>('PATCH', `api/roster/${encodeURIComponent(member)}`, { role }),
+  removeMember: (member: string) => sendChange<unknown>('DELETE', `api/roster/${encodeURIComponent(member)}`),
   activity: (since: string | null, limit = 200) => {
     const q = new URLSearchParams({ limit: String(limit) })
     if (since !== null) q.set('since', since)

@@ -15,8 +15,19 @@ import type {
   DirectoryMember,
   ProgressEntry,
   RequestDetail,
+  Roster,
+  RosterMember,
 } from '@/api/types'
-import { FIXTURE_NOW, RQ, fixtureCapabilityDetail, fixtureDirectory, fixtureJoin, fixtureMe, fixtureRequests } from './fixtures'
+import {
+  FIXTURE_NOW,
+  RQ,
+  fixtureCapabilityDetail,
+  fixtureDirectory,
+  fixtureJoin,
+  fixtureMe,
+  fixtureRequests,
+  fixtureRoster,
+} from './fixtures'
 
 export const CYCLE_MS = 100_000
 /** The relay keeps an equal-updated_at group whole on a page, up to this many (M2 §7.10). */
@@ -494,6 +505,12 @@ export class MockRelay {
   reachable = true
   /** Answers every /api/* call with 429 rate_limited while set (M2 §7.3), for the dev view. */
   rateLimited = false
+  /** M6 §4: answers as the console server does for a signed-in account not on the team. */
+  stranger = false
+  /** The viewer's role on the roster (M6 §4): an owner manages members; a member only reads. */
+  role: 'owner' | 'member' = 'owner'
+  /** M6 §1, in memory: changes an owner makes, under the relay's invariants. */
+  private rosterEntries: RosterMember[] = structuredClone(fixtureRoster.members)
   private readonly shift: number
   private readonly now: () => number
 
@@ -630,15 +647,84 @@ export class MockRelay {
     }
   }
 
+  /**
+   * GET /api/roster as the relay masks it (M6 §2): an owner sees every email; a member sees
+   * their own and null for everyone else's.
+   */
+  roster(): Roster {
+    const owner = this.viewerRole() === 'owner'
+    // As a member (?role=member), bob owns the team and alice is a member.
+    const view = this.role === 'owner' ? this.rosterEntries : this.rosterEntries.map((m) => ({ ...m, role: m.member === 'bob' ? ('owner' as const) : ('member' as const) }))
+    return {
+      members: view.map((m) => ({
+        ...m,
+        emails: owner || m.member === this.viewer ? [...(m.emails ?? [])] : (m.emails ?? []).map(() => null),
+      })),
+    }
+  }
+
+  private viewerRole(): 'owner' | 'member' {
+    return this.rosterEntries.find((m) => m.member === this.viewer)?.role === 'owner' && this.role === 'owner' ? 'owner' : 'member'
+  }
+
+  /** M6 §2 changes, refused as the relay refuses them (403 for a member, 409 for a conflict). */
+  change(method: string, p: string, body: unknown): Response {
+    const refuse = (status: number, code: string, detail: string) =>
+      json({ error: 'relay_refused', relay_status: status, relay_error: code, detail }, 502)
+    if (this.viewerRole() !== 'owner') return refuse(403, 'forbidden', 'Only owners can change the roster.')
+    const b = (typeof body === 'object' && body !== null ? body : {}) as Record<string, unknown>
+    const owners = () => this.rosterEntries.filter((m) => m.role === 'owner').length
+    const emailsOf = (m: RosterMember) => (m.emails ?? []).filter((e): e is string => typeof e === 'string')
+    if (method === 'POST' && p === '/api/roster') {
+      const member = String(b.member ?? '')
+      const email = String(b.email ?? '').toLowerCase()
+      if (!/^[a-z][a-z0-9_]{1,31}$/.test(member) || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+        return json({ error: 'bad_request', detail: 'member and email are required' }, 400)
+      }
+      if (this.rosterEntries.some((m) => m.member === member)) return refuse(409, 'conflict', 'That member id is already on the team.')
+      if (this.rosterEntries.some((m) => emailsOf(m).includes(email))) {
+        return refuse(409, 'conflict', 'That email already belongs to a member of the team.')
+      }
+      const entry: RosterMember = { member, emails: [email], role: 'member', added_by: this.viewer, added_at: new Date(this.now()).toISOString() }
+      this.rosterEntries.push(entry)
+      return json(entry, 201)
+    }
+    const m = /^\/api\/roster\/([a-z][a-z0-9_]{1,31})$/.exec(p)
+    const target = m ? this.rosterEntries.find((x) => x.member === m[1]) : undefined
+    if (!target) return json({ error: 'not_found' }, 404)
+    if (method === 'PATCH') {
+      if (b.role === 'member' && target.role === 'owner' && owners() === 1) {
+        return refuse(409, 'last_owner', 'A team always has at least one owner.')
+      }
+      if (b.role === 'owner' || b.role === 'member') target.role = b.role
+      return json(target)
+    }
+    if (method === 'DELETE') {
+      if (target.role === 'owner' && owners() === 1) return refuse(409, 'last_owner', 'A team always has at least one owner.')
+      this.rosterEntries = this.rosterEntries.filter((x) => x !== target)
+      return json({ member: target.member, removed: true })
+    }
+    return json({ error: 'method_not_allowed' }, 405)
+  }
+
   /** A Transport for the API client (src/api/client.ts). */
-  handle = async (path: string): Promise<Response> => {
+  handle = async (path: string, init?: RequestInit): Promise<Response> => {
     await new Promise((resolve) => setTimeout(resolve, 35 + Math.random() * 70))
     const url = new URL(path, 'http://console.invalid/')
     const p = url.pathname.replace(/^\/+/, '/')
+    const method = (init?.method ?? 'GET').toUpperCase()
     // Answered by the console server itself, so it does not depend on the relay.
     if (p === '/api/join') return json(fixtureJoin)
+    if (this.stranger) return json({ error: 'not_on_team', email: 'dana@example.com' }, 403)
     if (!this.reachable) return json({ error: 'relay_unreachable' }, 502)
     if (this.rateLimited) return json({ error: 'relay_refused', relay_status: 429, relay_error: 'rate_limited' }, 502)
+    if (method !== 'GET') {
+      if (p !== '/api/roster' && !p.startsWith('/api/roster/')) return json({ error: 'method_not_allowed' }, 405)
+      let body: unknown = undefined
+      if (typeof init?.body === 'string' && init.body !== '') body = JSON.parse(init.body)
+      return this.change(method, p, body)
+    }
+    if (p === '/api/roster') return json(this.roster())
     if (p === '/api/me') return json(fixtureMe)
     if (p === '/api/directory') return json(this.directory())
     if (p === '/api/activity') {

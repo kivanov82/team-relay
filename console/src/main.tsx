@@ -22,7 +22,11 @@ async function start() {
     const relay = new MockRelay()
     relay.reachable = params.get('mock') !== 'down'
     relay.rateLimited = params.get('mock') === 'slow'
-    setTransport((path) => relay.handle(path))
+    // M6 §4: ?mock=stranger is a signed-in account that is not on the team; ?role=member the
+    // Members panel as a member (not an owner) sees it.
+    relay.stranger = params.get('mock') === 'stranger'
+    if (params.get('role') === 'member') relay.role = 'member'
+    setTransport((path, init) => relay.handle(path, init))
     setConsoleKey('mock-console-key-0000000000000000')
     Object.assign(window, { __mockRelay: relay })
   } else {

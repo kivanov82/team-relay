@@ -163,3 +163,36 @@ describe('MockRelay access grants (M4 §2) and shares (M4 §3)', () => {
     expect(dir.members.find((m) => m.member === 'carol')?.manifest?.shares).toEqual([])
   })
 })
+
+describe('mock roster (M6 §2, §4)', () => {
+  it('masks others’ emails for a member and refuses a member’s changes, as the relay does', async () => {
+    const owner = relayAt('alice', 0)
+    expect(owner.roster().members.map((m) => [m.member, m.role, m.emails?.every((e) => typeof e === 'string')])).toEqual([
+      ['alice', 'owner', true],
+      ['bob', 'member', true],
+      ['carol', 'member', true],
+    ])
+    const added = owner.change('POST', '/api/roster', { member: 'dana', email: 'Dana@Example.com' })
+    expect(added.status).toBe(201)
+    expect(owner.roster().members.at(-1)).toMatchObject({ member: 'dana', emails: ['dana@example.com'] })
+    expect((await owner.change('POST', '/api/roster', { member: 'dana', email: 'x@example.com' }).json()).relay_status).toBe(409)
+    expect((await owner.change('DELETE', '/api/roster/alice', undefined).json()).relay_error).toBe('last_owner')
+    expect(owner.change('DELETE', '/api/roster/dana', undefined).status).toBe(200)
+
+    const member = relayAt('alice', 0)
+    member.role = 'member'
+    const view = member.roster().members
+    expect(view.find((m) => m.member === 'alice')).toMatchObject({ role: 'member', emails: ['alice@example.com'] })
+    expect(view.find((m) => m.member === 'carol')!.emails).toEqual([null, null])
+    expect((await member.change('POST', '/api/roster', { member: 'dana', email: 'dana@example.com' }).json()).relay_status).toBe(403)
+  })
+
+  it('answers not_on_team for a stranger, and still the join details', async () => {
+    const relay = relayAt('alice', 0)
+    relay.stranger = true
+    expect((await relay.handle('api/join')).status).toBe(200)
+    const r = await relay.handle('api/me')
+    expect(r.status).toBe(403)
+    expect(await r.json()).toEqual({ error: 'not_on_team', email: 'dana@example.com' })
+  })
+})
