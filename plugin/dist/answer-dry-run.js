@@ -15272,7 +15272,18 @@ var ANY_DEPTH = [
   "**/*.jks",
   "**/credentials.json",
   "**/*.tfvars",
-  "**/keystore/**"
+  "**/keystore/**",
+  "**/.npmrc",
+  "**/.netrc",
+  "**/.pypirc",
+  "**/.git-credentials",
+  "**/id_ecdsa*",
+  "**/id_dsa*",
+  "**/*.ppk",
+  "**/*.tfstate",
+  "**/*.tfstate.*",
+  "**/.aws/**",
+  "**/.kube/**"
 ];
 function escapeGlob(p) {
   return p.replace(/[\\*?[\]!#]/g, (c) => `\\${c}`);
@@ -22112,6 +22123,7 @@ function childArgs(files, rubricText, model) {
   args.push("--append-system-prompt", rubricText, "--disallowedTools", ...CHILD_DISALLOWED_LIST);
   return args;
 }
+var READ_TRAIL_TIMEOUT_S = 10;
 function childSettings(input) {
   const allow = [REPLY_TOOL, REQUEST_APPROVAL_TOOL];
   if (input.scope.qualifies) allow.push(`Read(${anchored(input.scope.path)}/**)`);
@@ -22125,6 +22137,17 @@ function childSettings(input) {
       deny
     }
   };
+  const trail = {
+    type: "command",
+    command: input.readTrailHook.node,
+    args: [input.readTrailHook.script, "--config", input.readTrailHook.config],
+    timeout: READ_TRAIL_TIMEOUT_S
+  };
+  const hooks = {
+    PreToolUse: [{ matcher: "Read|Grep", hooks: [trail] }],
+    PostToolUse: [{ matcher: "Grep", hooks: [trail] }],
+    PostToolUseFailure: [{ matcher: "Grep", hooks: [trail] }]
+  };
   if (input.toolEventHook) {
     const hook = {
       type: "command",
@@ -22133,11 +22156,10 @@ function childSettings(input) {
       async: true,
       timeout: 5
     };
-    settings.hooks = {
-      PostToolUse: [{ matcher: "*", hooks: [hook] }],
-      PostToolUseFailure: [{ matcher: "*", hooks: [hook] }]
-    };
+    hooks.PostToolUse.push({ matcher: "*", hooks: [hook] });
+    hooks.PostToolUseFailure.push({ matcher: "*", hooks: [hook] });
   }
+  settings.hooks = hooks;
   return settings;
 }
 function childMcpConfig(input) {
@@ -22398,7 +22420,8 @@ var NOTICE_TEXT = "Team relay: your answering session is waiting for your permis
 var CAP_MS = 3e3;
 var STDIN_LIMIT = 1024 * 1024;
 var APPROVAL_TEXT = "Team relay: an answer is waiting for your approval";
-var TEXTS = [NOTICE_TEXT, APPROVAL_TEXT];
+var TAKEOVER_TEXT = "Team relay: this session now answers teammates automatically";
+var TEXTS = [NOTICE_TEXT, APPROVAL_TEXT, TAKEOVER_TEXT];
 function notifyCommand(platform, text = NOTICE_TEXT) {
   if (!TEXTS.includes(text)) return null;
   if (platform === "darwin") {
@@ -22452,7 +22475,7 @@ if (process.argv[1] && /notify-desktop\.(js|ts)$/.test(process.argv[1])) {
 }
 
 // src/scope.ts
-import { statSync as statSync2 } from "node:fs";
+import { existsSync, readdirSync, statSync as statSync2 } from "node:fs";
 import { homedir as homedir3 } from "node:os";
 import { basename as basename2, dirname as dirname2, isAbsolute as isAbsolute4, join as join4, normalize as normalize2 } from "node:path";
 function relayCredentialDirs(env) {
@@ -22493,13 +22516,41 @@ function scopeFolder(cwd, env) {
     credentialDirs: relayCredentialDirs(env)
   });
   if (hit) return refuse(`it is inside a credential location on the deny list (${hit})`);
+  if (dirname2(path) === homeReal || dirname2(normalize2(cwd)) === normalize2(home)) return refuse("it is a folder directly in your home directory");
+  const hidden = homeEntries(homeReal);
+  for (const e of hidden) {
+    if (within(path, e.path) || within(path, e.real)) return refuse(`it is inside ~/${e.name}`);
+    if (within(e.real, path)) return refuse(`it contains ~/${e.name}`);
+  }
+  if (!inGitWorkTree(path, homeReal)) return refuse("it is not inside a git work tree (no .git in it or in a folder above it, below your home directory)");
   return { path, qualifies: true, reason: null, share: shareName(path) };
+}
+function homeEntries(homeReal) {
+  let names;
+  try {
+    names = readdirSync(homeReal);
+  } catch {
+    names = [];
+  }
+  const wanted = /* @__PURE__ */ new Set(["Library", ...names.filter((n) => n.startsWith(".") && n !== "." && n !== "..")]);
+  return [...wanted].map((name) => {
+    const path = join4(homeReal, name);
+    return { name, path, real: realOr(path) };
+  });
+}
+function inGitWorkTree(path, homeReal) {
+  for (let d = path; ; d = dirname2(d)) {
+    if (d === "/" || within(homeReal, d)) return false;
+    if (existsSync(join4(d, ".git"))) return true;
+    if (dirname2(d) === d) return false;
+  }
 }
 
 // src/secret-screen.ts
 var PREFIXED = [
   { kind: "a private key", re: /-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY(?: BLOCK)?-----/ },
   { kind: "a PGP private key", re: /-----BEGIN PGP PRIVATE KEY BLOCK-----/ },
+  { kind: "a key or certificate body", re: /\bMI[IGH][A-Za-z0-9+/]{40,}/ },
   { kind: "an AWS access key id", re: /\b(?:AKIA|ASIA|AGPA|AIDA|AROA|ANPA|ANVA|AIPA)[0-9A-Z]{16}\b/ },
   { kind: "a GitHub token", re: /\b(?:gh[pousr]_[A-Za-z0-9]{36,255}|github_pat_[A-Za-z0-9_]{22,255})\b/ },
   { kind: "a GitLab token", re: /\bglpat-[A-Za-z0-9_-]{20,}\b/ },
@@ -22525,17 +22576,157 @@ var PREFIXED = [
   { kind: "a JSON web token", re: /\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/ },
   { kind: "a basic-auth header", re: /\bAuthorization:\s*(?:Basic|Bearer)\s+[A-Za-z0-9+/=._-]{12,}/i }
 ];
-var ASSIGNMENT = /(?:^|[\s"'{,;])["']?([A-Za-z0-9_.-]*(?:PASSWORD|PASSWD|SECRET|TOKEN|API[_-]?KEY|APIKEY|ACCESS[_-]?KEY|PRIVATE[_-]?KEY|CREDENTIAL|CLIENT[_-]?SECRET|AUTH[_-]?KEY|SIGNING[_-]?KEY|ENCRYPTION[_-]?KEY|SESSION[_-]?KEY|DSN|CONN(?:ECTION)?[_-]?STRING)[A-Za-z0-9_.-]*)["']?\s*[:=]\s*["']?([^\s"',;}]+)/gim;
-function placeholder(value) {
-  const v = value.trim().replace(/^["']|["']$/g, "");
-  if (v.length < 6) return true;
-  if (/^(?:x+|\*+|\.+|-+|_+|<[^>]*>|\{\{.*\}\}|\$\{[^}]*\}?|\$[A-Z_][A-Z0-9_]*|%[A-Z_]+%|null|none|nil|true|false|undefined|changeme|change_me|your[_-]?\w*|example\w*|placeholder|redacted|\[redacted\]|todo|tbd|secret|password|token)$/i.test(v)) {
+var INVISIBLE = /[\u00AD\u034F\u061C\u115F\u1160\u17B4\u17B5\u180B-\u180F\u200B-\u200F\u202A-\u202E\u2060-\u206F\u3164\uFE00-\uFE0F\uFEFF\uFFA0]/g;
+var CONFUSABLES = {
+  "\u0410": "A",
+  "\u0412": "B",
+  "\u0415": "E",
+  "\u041A": "K",
+  "\u041C": "M",
+  "\u041D": "H",
+  "\u041E": "O",
+  "\u0420": "P",
+  "\u0421": "C",
+  "\u0422": "T",
+  "\u0425": "X",
+  "\u0423": "Y",
+  "\u0405": "S",
+  "\u0406": "I",
+  "\u0408": "J",
+  "\u0500": "d",
+  "\u0430": "a",
+  "\u0432": "b",
+  "\u0435": "e",
+  "\u043A": "k",
+  "\u043C": "m",
+  "\u043D": "h",
+  "\u043E": "o",
+  "\u0440": "p",
+  "\u0441": "c",
+  "\u0442": "t",
+  "\u0445": "x",
+  "\u0443": "y",
+  "\u0455": "s",
+  "\u0456": "i",
+  "\u0458": "j",
+  "\u04BB": "h",
+  "\u0501": "d",
+  "\u051B": "q",
+  "\u051D": "w",
+  "\u04CF": "l",
+  "\u0391": "A",
+  "\u0392": "B",
+  "\u0395": "E",
+  "\u0396": "Z",
+  "\u0397": "H",
+  "\u0399": "I",
+  "\u039A": "K",
+  "\u039C": "M",
+  "\u039D": "N",
+  "\u039F": "O",
+  "\u03A1": "P",
+  "\u03A4": "T",
+  "\u03A5": "Y",
+  "\u03A7": "X",
+  "\u03BF": "o",
+  "\u03BD": "v",
+  "\u03B1": "a",
+  "\u03B9": "i",
+  "\u03BA": "k",
+  "\u03C1": "p",
+  "\u03C4": "t",
+  "\u03C5": "u",
+  "\u03C7": "x"
+};
+function normalise(text) {
+  let out = "";
+  for (const c of text.normalize("NFKC").replace(INVISIBLE, "")) out += CONFUSABLES[c] ?? c;
+  return out;
+}
+function joinLines(text) {
+  return text.replace(/(?<=[A-Za-z0-9+/_=.-]{4})[ \t]*\r?\n[ \t>*-]*(?=[A-Za-z0-9+/_=-]{4})/g, "");
+}
+function closeUp(text) {
+  return text.replace(/(?:\S[ \t\u00A0]){7,}\S/g, (run2) => run2.replace(/[ \t\u00A0]/g, ""));
+}
+var SECRET_KEY_SUBSTRING = /PASSWORD|PASSWD|PASSPHRASE|SECRET|TOKEN|API[_-]?KEY|APIKEY|ACCESS[_-]?KEY|PRIVATE[_-]?KEY|CREDENTIAL|CLIENT[_-]?SECRET|AUTH[_-]?KEY|SIGNING[_-]?KEY|ENCRYPTION[_-]?KEY|SESSION[_-]?KEY|DSN|CONN(?:ECTION)?[_-]?STRING/;
+var SECRET_KEY_WORDS = /* @__PURE__ */ new Set(["pass", "pwd", "pw", "passwd", "passcode", "passphrase", "creds", "pat"]);
+function isSecretKey(key) {
+  const k = normalise(key);
+  if (SECRET_KEY_SUBSTRING.test(k.toUpperCase())) return true;
+  const words = k.replace(/([a-z0-9])([A-Z])/g, "$1 $2").split(/[\s_.:-]+/).map((w) => w.toLowerCase()).filter(Boolean);
+  return words.some((w) => SECRET_KEY_WORDS.has(w));
+}
+var ASSIGNMENT = /(?:^|[\s"'`{,;(])["'`]?([A-Za-z_][A-Za-z0-9_.-]{0,79})["'`]?\s*(?::=|=>|=|:)\s*["'`]?([^\s"'`,;}]+)/gm;
+function placeholder(value, minLength = 6) {
+  const v = value.trim().replace(/^["'`]|["'`]$/g, "");
+  if (v.length < minLength) return true;
+  if (/^(?:x+|\*+|•+|\.+|-+|_+|<[^>]*>|\{\{.*\}\}|\$\{[^}]*\}?|\$[A-Z_][A-Z0-9_]*|%[A-Z_]+%|null|none|nil|true|false|undefined|changeme|change_me|your[_-]?\w*|example\w*|placeholder|redacted|\[redacted\]|todo|tbd|secret|password|token)$/i.test(v)) {
     return true;
   }
   if (/^(?:process\.env|os\.environ|env\.|secrets\.|vault:|projects\/[^/]+\/secrets\/)/i.test(v)) return true;
   return false;
 }
-var CONNECTION = /\b[a-z][a-z0-9+.-]{1,20}:\/\/[^\s:/@]{1,128}:([^\s@/]{1,256})@[^\s/]{1,255}/gi;
+var PROSE = /\b(passwords?|passphrase|passcode|passwd|pwd|pass|pin|secret|token|(?:api|access|secret|private|signing)[ _-]?key|key)\b(?:\s+(?:for|of|to|on|in|at)(?:\s+[^\s.,;:!?]{1,40}){1,3}?)?\s+(?:is|was|=|would be|will be|should be|reads|equals|is set to|was set to)\s*:?\s*(["'`“”‘’]?)([^\s"'`“”‘’]{1,256})/gi;
+var PROSE_WORDS = new Set(
+  "a an the not no now also still only just then this that these those it its your our my his her their what whatever which stored kept saved held set reset changed rotated managed required needed used missing wrong invalid expired correct same different located encrypted hashed salted sent provided generated defined configured found empty blank shown visible hidden secure private public available unavailable being from at on in under via inside outside there here too very rotated important optional mandatory case-sensitive sensitive unknown unset known given shared read loaded fetched pulled injected passed checked verified validated refreshed renewed revoked issued signed short long weak strong random different".split(" ")
+);
+function proseSecret(word, quoted, rawValue) {
+  const value = rawValue.replace(/[.,;:!?)\]]+$/, "");
+  if (value === "" || PROSE_WORDS.has(value.toLowerCase())) return false;
+  if (placeholder(value, 4)) return false;
+  const w = word.toLowerCase();
+  const passwordLike = /^(?:passwords?|passphrase|passcode|passwd|pwd|pass|pin|secret)$/.test(w);
+  if (quoted || passwordLike) return true;
+  return value.length >= 8 && (/[0-9]/.test(value) || /[a-z]/.test(value) && /[A-Z]/.test(value) || /[_+/=!@#$%^&*-]/.test(value));
+}
+var URL_USERINFO = /(?:\b[a-z][a-z0-9+.-]{0,20}:)?\/\/([^\s/?#@"'<>]{1,256})@[^\s/?#@"'<>]{1,255}/gi;
+var URL_PARAM = /[?&;#]([A-Za-z0-9_.-]{1,64})=([^&#\s"'<>]{1,512})/g;
+var SECRET_PARAMS = /* @__PURE__ */ new Set([
+  "key",
+  "sig",
+  "signature",
+  "auth",
+  "access_token",
+  "id_token",
+  "refresh_token",
+  "client_secret",
+  "apikey",
+  "api_key",
+  "x-amz-signature",
+  "x-amz-credential",
+  "x-amz-security-token",
+  "x-goog-signature",
+  "x-goog-credential",
+  "sas",
+  "sv",
+  "code"
+]);
+function decode(s) {
+  try {
+    return decodeURIComponent(s);
+  } catch {
+    return s;
+  }
+}
+function urlCredentials(text) {
+  for (const m of text.matchAll(URL_USERINFO)) {
+    const info = m[1] ?? "";
+    const colon = info.indexOf(":");
+    if (colon >= 0) {
+      const password = decode(info.slice(colon + 1));
+      if (password !== "" && !placeholder(password, 1)) return true;
+    } else {
+      const user = decode(info);
+      if (!placeholder(user, 12) && (user.length >= 20 || /[0-9]/.test(user) && /[A-Za-z]/.test(user))) return true;
+    }
+  }
+  for (const m of text.matchAll(URL_PARAM)) {
+    const name = (m[1] ?? "").toLowerCase();
+    if ((SECRET_PARAMS.has(name) || isSecretKey(name)) && !placeholder(decode(m[2] ?? ""))) return true;
+  }
+  return false;
+}
 function entropy(s) {
   const counts = /* @__PURE__ */ new Map();
   for (const c of s) counts.set(c, (counts.get(c) ?? 0) + 1);
@@ -22558,19 +22749,50 @@ function highEntropy(text) {
   }
   return false;
 }
+var HEX = /(?<![0-9A-Za-z])[0-9a-fA-F]{32,}(?![0-9A-Za-z])/g;
+var HEX_GROUPS = /(?<![0-9A-Za-z])(?:[0-9a-fA-F]{2,8}[ :-]){3,}[0-9a-fA-F]{2,8}(?![0-9A-Za-z])/g;
+function hexSecret(text) {
+  const mixed = (s) => /[0-9]/.test(s) && /[a-f]/i.test(s);
+  for (const m of text.matchAll(HEX)) if (mixed(m[0])) return true;
+  for (const m of text.matchAll(HEX_GROUPS)) {
+    const digits = m[0].replace(/[ :-]/g, "");
+    if (digits.length >= 32 && mixed(digits)) return true;
+  }
+  return false;
+}
+var BASE64_PADDED = /(?<![A-Za-z0-9+/=])[A-Za-z0-9+/]{14,}={1,2}(?![A-Za-z0-9+/=])/g;
+function paddedBase64(text) {
+  for (const m of text.matchAll(BASE64_PADDED)) {
+    const s = m[0];
+    if (s.length % 4 !== 0) continue;
+    const body = s.replace(/=+$/, "");
+    if (/[0-9]/.test(body) && /[A-Za-z]/.test(body) || /[a-z]/.test(body) && /[A-Z]/.test(body)) return true;
+  }
+  return false;
+}
+function screenForm(text, add) {
+  for (const { kind, re } of PREFIXED) if (re.test(text)) add(kind);
+  for (const m of text.matchAll(ASSIGNMENT)) {
+    if (isSecretKey(m[1] ?? "") && !placeholder(m[2] ?? "")) add("a secret-looking KEY=value pair");
+  }
+  for (const m of text.matchAll(PROSE)) {
+    if (proseSecret(m[1] ?? "", (m[2] ?? "") !== "", m[3] ?? "")) add("a secret stated in words");
+  }
+  if (urlCredentials(text)) add("a URL with credentials");
+  if (hexSecret(text)) add("a long hex string");
+  if (paddedBase64(text)) add("a base64-encoded value");
+  if (highEntropy(text)) add("a long random-looking token");
+}
 function screenSecrets(text) {
   const found = [];
   const add = (kind) => {
     if (!found.some((f) => f.kind === kind)) found.push({ kind });
   };
-  for (const { kind, re } of PREFIXED) if (re.test(text)) add(kind);
-  for (const m of text.matchAll(ASSIGNMENT)) {
-    if (!placeholder(m[2] ?? "")) add("a secret-looking KEY=value pair");
-  }
-  for (const m of text.matchAll(CONNECTION)) {
-    if (!placeholder(m[1] ?? "")) add("a connection string with a password");
-  }
-  if (highEntropy(text)) add("a long random-looking token");
+  const norm = normalise(text);
+  const forms = /* @__PURE__ */ new Set([norm, joinLines(norm), closeUp(norm), closeUp(joinLines(norm))]);
+  for (const form of forms) screenForm(form, add);
+  const stripped = norm.replace(/\s+/g, "");
+  for (const { kind, re } of PREFIXED) if (re.test(stripped)) add(kind);
   return found;
 }
 function screenDraft(text, data) {
@@ -22594,6 +22816,7 @@ function isPlainObject(v) {
 
 // src/answer-host.ts
 var REPLY_DATA_LIMIT = 64 * 1024;
+var NOTICE_GAP_MS = 5 * 6e4;
 function singleLine(text, limit) {
   const flat = neutraliseChannelTags(text).replace(/\s+/g, " ").trim();
   return flat.length <= limit ? flat : `${flat.slice(0, limit)}\u2026`;
@@ -22666,16 +22889,19 @@ function planRun(p) {
   const mcpConfig = join5(runDir, "mcp.json");
   const settings = join5(runDir, "settings.json");
   const toolEventFile = relay.toolEvent ? join5(runDir, "tool-event.json") : null;
+  const readTrailFile = join5(runDir, "read-trail.json");
   const write = (path, value) => writeFileSync(path, `${JSON.stringify(value, null, 2)}
 `, { mode: 384, flag: "wx" });
   write(mcpConfig, childMcpConfig({ node: p.node, answerTools: join5(p.dist, "answer-tools.js"), socket: p.socket.path, token, capabilities }));
   if (toolEventFile) write(toolEventFile, relay.toolEvent);
+  write(readTrailFile, { socket: p.socket.path, token });
   write(
     settings,
     childSettings({
       scope,
       denyFiles: relay.denyFiles,
       denyDirs,
+      readTrailHook: { node: p.node, script: join5(p.dist, "read-trail.js"), config: readTrailFile },
       ...toolEventFile ? { toolEventHook: { node: p.node, script: join5(p.dist, "tool-event.js"), config: toolEventFile } } : {}
     })
   );
@@ -22690,15 +22916,23 @@ function planRun(p) {
     args: childArgs({ mcpConfig, settings }, rubric(p.member, scope), model),
     env: childEnv(env),
     stdin: buildPrompt(p.item),
-    files: { mcpConfig, settings, toolEvent: toolEventFile }
+    files: { mcpConfig, settings, toolEvent: toolEventFile, readTrail: readTrailFile }
   };
 }
 function draftReasons(d) {
   const reasons = [];
-  if (d.needsApproval) reasons.push(`the answerer flagged it${d.reason ? ` ("${singleLine(d.reason, 200)}")` : ""}`);
-  if (d.requested !== null) reasons.push(`the answerer asked for your approval ("${singleLine(d.requested, 200)}")`);
+  const words = (r) => ` (in the answerer's own words: "${singleLine(r, 200)}")`;
+  if (d.needsApproval) reasons.push(`the answerer flagged it${d.reason ? words(d.reason) : ""}`);
+  if (d.requested !== null) reasons.push(`the answerer asked for your approval${words(d.requested)}`);
   const secrets = screenDraft(d.text, d.data);
   if (secrets.length) reasons.push(`the secret screen found ${secrets.map((s) => s.kind).join(", ")}`);
+  const sensitive = [...new Set(d.sensitiveReads ?? [])];
+  if (sensitive.length) {
+    const names = sensitive.slice(0, 3).map((n) => singleLine(n, 80)).join(", ");
+    const more = sensitive.length > 3 ? ` and ${sensitive.length - 3} more` : "";
+    reasons.push(`it read files whose names suggest secrets (${names}${more})`);
+  }
+  if ((d.openSearches ?? 0) > 0) reasons.push("what one of its searches read could not be recorded");
   if (d.approvalDuringRun) reasons.push("it needed your permission for a step while it worked");
   return reasons;
 }

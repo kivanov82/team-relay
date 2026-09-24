@@ -33402,11 +33402,12 @@ var AnswerDeadlines = class {
 import { randomUUID } from "node:crypto";
 import { execFile as execFile5 } from "node:child_process";
 import { mkdirSync as mkdirSync5, mkdtempSync as mkdtempSync3, rmSync as rmSync7, writeFileSync as writeFileSync4 } from "node:fs";
-import { basename as basename3, dirname as dirname4, isAbsolute as isAbsolute7, join as join8, resolve as resolvePath } from "node:path";
+import { basename as basename4, dirname as dirname4, isAbsolute as isAbsolute7, join as join8, resolve as resolvePath } from "node:path";
 import { fileURLToPath as fileURLToPath4 } from "node:url";
 
 // src/answering-lock.ts
-import { closeSync as closeSync2, mkdirSync as mkdirSync3, openSync as openSync2, readFileSync as readFileSync6, rmSync as rmSync4, statSync as statSync2, unlinkSync as unlinkSync2, writeSync as writeSync2 } from "node:fs";
+import { randomBytes as randomBytes4 } from "node:crypto";
+import { closeSync as closeSync2, linkSync, mkdirSync as mkdirSync3, openSync as openSync2, readFileSync as readFileSync6, renameSync as renameSync3, rmSync as rmSync4, statSync as statSync2, writeSync as writeSync2 } from "node:fs";
 import { homedir as homedir2 } from "node:os";
 import { isAbsolute as isAbsolute5, join as join4 } from "node:path";
 var LOCK_FILE = "answering.lock";
@@ -33471,6 +33472,31 @@ function ageMs(path) {
     return Number.POSITIVE_INFINITY;
   }
 }
+function takeAndRemove(path, expected) {
+  const aside = `${path}.${process.pid}.${randomBytes4(6).toString("hex")}.taken`;
+  try {
+    renameSync3(path, aside);
+  } catch (err) {
+    if (err.code === "ENOENT") return true;
+    throw err;
+  }
+  let content;
+  try {
+    content = readFileSync6(aside, "utf8");
+  } catch {
+    content = null;
+  }
+  if (content !== null && expected(content)) {
+    rmSync4(aside, { force: true });
+    return true;
+  }
+  try {
+    linkSync(aside, path);
+  } catch {
+  }
+  rmSync4(aside, { force: true });
+  return false;
+}
 function breakStale(path, seen) {
   const breaker2 = `${path}.break`;
   if (!createExclusive(breaker2, String(process.pid))) {
@@ -33479,19 +33505,7 @@ function breakStale(path, seen) {
     if (!createExclusive(breaker2, String(process.pid))) return false;
   }
   try {
-    let now;
-    try {
-      now = readFileSync6(path, "utf8");
-    } catch {
-      return true;
-    }
-    if (now !== seen) return false;
-    try {
-      unlinkSync2(path);
-    } catch (err) {
-      if (err.code !== "ENOENT") throw err;
-    }
-    return true;
+    return takeAndRemove(path, (now) => now === seen);
   } finally {
     rmSync4(breaker2, { force: true });
   }
@@ -33509,8 +33523,7 @@ function tryAcquire(path, role, opts = {}) {
         path,
         release: () => {
           try {
-            const info2 = parseInfo(readFileSync6(path, "utf8"));
-            if (info2?.pid === pid) unlinkSync2(path);
+            takeAndRemove(path, (now) => parseInfo(now)?.pid === pid);
           } catch {
           }
         }
@@ -33539,10 +33552,14 @@ function heldBy(holder) {
 }
 
 // src/approvals.ts
-import { randomBytes as randomBytes4 } from "node:crypto";
+import { randomBytes as randomBytes5 } from "node:crypto";
 var MAX_WAIT_MS = 30 * 6e4;
 var PERMISSION_DECISIONS = ["allow", "deny"];
 var DRAFT_DECISIONS = ["send", "dont_send", "decline"];
+var RUN_DECISIONS = ["allow", "deny", "decline"];
+function decisionsFor(ask) {
+  return ask.type === "permission" ? PERMISSION_DECISIONS : ask.type === "run" ? RUN_DECISIONS : DRAFT_DECISIONS;
+}
 var ApprovalQueue = class {
   items = /* @__PURE__ */ new Map();
   now;
@@ -33568,7 +33585,7 @@ var ApprovalQueue = class {
     return Number.isFinite(answerDeadline2) ? Math.min(answerDeadline2, cap) : cap;
   }
   add(ctx, ask, answerDeadline2) {
-    const id = `ap_${randomBytes4(8).toString("hex")}`;
+    const id = `ap_${randomBytes5(8).toString("hex")}`;
     const deadline = this.deadlineFor(answerDeadline2);
     let settle2;
     const outcome = new Promise((resolve) => {
@@ -33612,8 +33629,7 @@ var ApprovalQueue = class {
   decide(id, decision) {
     const e = this.items.get(id);
     if (!e) return false;
-    const allowed = e.ask.type === "permission" ? PERMISSION_DECISIONS : DRAFT_DECISIONS;
-    if (!allowed.includes(decision)) return false;
+    if (!decisionsFor(e.ask).includes(decision)) return false;
     if (this.now() >= e.deadline) {
       this.finish(id, "lapsed");
       return false;
@@ -33635,17 +33651,21 @@ var ApprovalQueue = class {
 };
 
 // src/approvals-page.ts
-import { createHash as createHash2, randomBytes as randomBytes5, timingSafeEqual as timingSafeEqual2 } from "node:crypto";
+import { createHash as createHash2, randomBytes as randomBytes6, timingSafeEqual as timingSafeEqual2 } from "node:crypto";
 import { createServer as createServer2 } from "node:http";
 
 // src/approvals-review.ts
 var DIALOG_DRAFT_LIMIT = 8e3;
+var DRAFT_PREVIEW_LIMIT = 1500;
 var QUESTION_LIMIT = 2e3;
 function clip(text, limit) {
   return text.length <= limit ? text : `${text.slice(0, limit)} \u2026[${text.length - limit} more characters not shown]`;
 }
+function quoteLines(text) {
+  return text.split("\n").map((l) => `> ${l}`).join("\n");
+}
 function quoteTeammate(text, limit = QUESTION_LIMIT) {
-  return clip(neutraliseChannelTags(text), limit).split("\n").map((l) => `> ${l}`).join("\n");
+  return quoteLines(clip(neutraliseChannelTags(text), limit));
 }
 function draftBody(item) {
   if (item.ask.type !== "draft") return "";
@@ -33653,14 +33673,35 @@ function draftBody(item) {
 
 Data: ${JSON.stringify(item.ask.data, null, 2)}` : item.ask.text;
 }
+var UNSHOWABLE = /[\u0000-\u0008\u000B-\u001F\u007F-\u009F\u00AD\u061C\u200B-\u200F\u2028-\u202E\u2060-\u206F\uFEFF\uFFF9-\uFFFB]/u;
+var UNSHOWABLE_ALL = /[\u0000-\u0008\u000B-\u001F\u007F-\u009F\u00AD\u061C\u200B-\u200F\u2028-\u202E\u2060-\u206F\uFEFF\uFFF9-\uFFFB]/gu;
+function showable(text) {
+  return !UNSHOWABLE.test(text) && neutraliseChannelTags(text) === text;
+}
+function visibleEscapes(text) {
+  return neutraliseChannelTags(text).replace(UNSHOWABLE_ALL, (c) => `\\u{${c.codePointAt(0).toString(16)}}`);
+}
+function shownDraft(item) {
+  const body = draftBody(item);
+  const full = quoteLines(body);
+  if (showable(body) && full.length <= DIALOG_DRAFT_LIMIT) return { shown: full, whole: true };
+  return { shown: quoteLines(clip(visibleEscapes(body), DRAFT_PREVIEW_LIMIT)), whole: false };
+}
 function draftFits(item) {
-  return draftBody(item).length <= DIALOG_DRAFT_LIMIT;
+  return shownDraft(item).whole;
 }
 function choicesFor(item) {
   if (item.ask.type === "permission") {
     return [
       { const: "allow", title: "Allow (this once, for this question)" },
       { const: "deny", title: "Deny" }
+    ];
+  }
+  if (item.ask.type === "run") {
+    return [
+      { const: "allow", title: "Answer it automatically (the answer may still wait for you)" },
+      { const: "deny", title: "Don't answer (nothing is sent)" },
+      { const: "decline", title: "Decline politely (say I did not approve it)" }
     ];
   }
   const out = [];
@@ -33677,20 +33718,28 @@ function elicitationFor(item, index, total, member) {
     lines.push(`${ctx.asker} asked (teammate text, as they wrote it):`, quoteTeammate(ctx.question));
   }
   lines.push("");
+  const politely = `"Decline politely" sends: "I couldn't answer this automatically; ${member} hasn't approved it."`;
   if (item.ask.type === "permission") {
     lines.push(`Your automatic answerer wants to ${item.ask.action}.`, "Allow lets it do this once, for this question only.");
+  } else if (item.ask.type === "run") {
+    lines.push(
+      `This question waits for your approval before your automatic answerer works on it: ${item.ask.reason}.`,
+      "Answering it automatically follows the usual rules: what it reads outside the folder, and its answer when needed, still wait for you.",
+      "",
+      politely
+    );
   } else {
     lines.push(`The answer your automatic answerer drafted waits for you because: ${item.ask.reasons.join("; ")}.`, "");
-    if (draftFits(item)) {
-      lines.push("The draft, exactly as it would be sent:", quoteTeammate(draftBody(item), DIALOG_DRAFT_LIMIT));
+    const { shown, whole } = shownDraft(item);
+    if (whole) {
+      lines.push('The draft, exactly as it would be sent (each line marked with "> "; the marks are not sent):', shown);
     } else {
       lines.push(
-        `The draft is too long to show here in full (${draftBody(item).length} characters), so it cannot be sent from this dialog.`,
-        "Its beginning:",
-        quoteTeammate(draftBody(item), 1500)
+        showable(draftBody(item)) ? `The draft is too long to show here in full (${draftBody(item).length} characters), so it cannot be sent from this dialog. Its beginning:` : "The draft holds characters that cannot be shown here as they are (shown below as \\u{\u2026}), so it cannot be sent from this dialog. Its beginning:",
+        shown
       );
     }
-    lines.push("", `"Decline politely" sends: "I couldn't answer this automatically; ${member} hasn't approved it."`);
+    lines.push("", politely);
   }
   lines.push("", "Decline or Esc: decide later (it is denied if you have not decided by its deadline).");
   return {
@@ -33817,21 +33866,29 @@ function pageItems(queue, member) {
     let ask;
     let detail = null;
     let choices = choicesFor(item);
+    const politely = `"Decline politely" sends: "I couldn't answer this automatically; ${member} hasn't approved it."`;
     if (item.ask.type === "permission") {
       ask = `Your automatic answerer wants to ${item.ask.action}. Allow lets it do this once, for this question only.`;
+    } else if (item.ask.type === "run") {
+      ask = `This question waits for your approval before your automatic answerer works on it: ${item.ask.reason}. ${politely}`;
     } else {
-      ask = `The drafted answer waits because: ${item.ask.reasons.join("; ")}. "Decline politely" sends: "I couldn't answer this automatically; ${member} hasn't approved it."`;
-      detail = item.ask.data ? `${item.ask.text}
+      ask = `The drafted answer waits because: ${item.ask.reasons.join("; ")}. ${politely}`;
+      const body = draftBody(item);
+      if (showable(body)) {
+        detail = body;
+        if (!draftFits(item)) choices = [{ const: "send", title: "Send this answer" }, ...choices];
+      } else {
+        detail = `(Characters that cannot be shown as they are appear as \\u{\u2026}; this draft cannot be sent from here.)
 
-Data: ${JSON.stringify(item.ask.data, null, 2)}` : item.ask.text;
-      if (!draftFits(item)) choices = [{ const: "send", title: "Send this answer" }, ...choices];
+${visibleEscapes(body)}`;
+      }
     }
     return { id: item.id, heading, teammate_text: teammate, ask, detail, choices, deadline: new Date(item.deadline).toISOString() };
   });
 }
 var digest = (s) => createHash2("sha256").update(s, "utf8").digest();
 var ApprovalsPage = class {
-  constructor(queue, member, key = randomBytes5(32).toString("base64url")) {
+  constructor(queue, member, key = randomBytes6(32).toString("base64url")) {
     this.queue = queue;
     this.member = member;
     this.key = key;
@@ -33923,8 +33980,8 @@ var ApprovalsPage = class {
 };
 
 // src/approvals-state.ts
-import { randomBytes as randomBytes6 } from "node:crypto";
-import { mkdirSync as mkdirSync4, readFileSync as readFileSync7, renameSync as renameSync3, rmSync as rmSync5, writeFileSync as writeFileSync3 } from "node:fs";
+import { randomBytes as randomBytes7 } from "node:crypto";
+import { mkdirSync as mkdirSync4, readFileSync as readFileSync7, renameSync as renameSync4, rmSync as rmSync5, writeFileSync as writeFileSync3 } from "node:fs";
 import { join as join5 } from "node:path";
 var STATE_FILE = "approvals.json";
 function statePath(env) {
@@ -33932,11 +33989,11 @@ function statePath(env) {
 }
 function writeApprovalsState(path, pending, pid = process.pid) {
   mkdirSync4(join5(path, ".."), { recursive: true, mode: 448 });
-  const tmp = `${path}.${pid}.${randomBytes6(6).toString("hex")}.tmp`;
+  const tmp = `${path}.${pid}.${randomBytes7(6).toString("hex")}.tmp`;
   try {
     writeFileSync3(tmp, `${JSON.stringify({ pending, pid, updated_at: (/* @__PURE__ */ new Date()).toISOString() })}
 `, { mode: 384, flag: "wx" });
-    renameSync3(tmp, path);
+    renameSync4(tmp, path);
   } catch (err) {
     rmSync5(tmp, { force: true });
     throw err;
@@ -34016,7 +34073,18 @@ var ANY_DEPTH = [
   "**/*.jks",
   "**/credentials.json",
   "**/*.tfvars",
-  "**/keystore/**"
+  "**/keystore/**",
+  "**/.npmrc",
+  "**/.netrc",
+  "**/.pypirc",
+  "**/.git-credentials",
+  "**/id_ecdsa*",
+  "**/id_dsa*",
+  "**/*.ppk",
+  "**/*.tfstate",
+  "**/*.tfstate.*",
+  "**/.aws/**",
+  "**/.kube/**"
 ];
 function escapeGlob(p) {
   return p.replace(/[\\*?[\]!#]/g, (c) => `\\${c}`);
@@ -34081,7 +34149,7 @@ function credentialHit(p, ctx) {
 
 // src/headless.ts
 import { spawn } from "node:child_process";
-import { randomBytes as randomBytes7 } from "node:crypto";
+import { randomBytes as randomBytes8 } from "node:crypto";
 var CHILD_TOOLS = ["Read", "Glob", "Grep"];
 var CHILD_DISALLOWED_LIST = ["Bash", "Write", "Edit", "NotebookEdit", "WebFetch", "WebSearch", "Agent", "Task"];
 function readDenyRulesFor(files, dirs) {
@@ -34113,7 +34181,7 @@ function rubric(member, scope) {
     "If you cannot or will not answer, reply saying so."
   ].join(" ");
 }
-function buildPrompt(item, nonce = randomBytes7(12).toString("hex")) {
+function buildPrompt(item, nonce = randomBytes8(12).toString("hex")) {
   const open2 = `<<<teammate-text-${nonce}`;
   const close = `teammate-text-${nonce}>>>`;
   if (item.kind === "capability_call" && item.capability) {
@@ -34162,6 +34230,7 @@ function childArgs(files, rubricText, model) {
   args.push("--append-system-prompt", rubricText, "--disallowedTools", ...CHILD_DISALLOWED_LIST);
   return args;
 }
+var READ_TRAIL_TIMEOUT_S = 10;
 function childSettings(input) {
   const allow = [REPLY_TOOL, REQUEST_APPROVAL_TOOL];
   if (input.scope.qualifies) allow.push(`Read(${anchored(input.scope.path)}/**)`);
@@ -34175,6 +34244,17 @@ function childSettings(input) {
       deny
     }
   };
+  const trail = {
+    type: "command",
+    command: input.readTrailHook.node,
+    args: [input.readTrailHook.script, "--config", input.readTrailHook.config],
+    timeout: READ_TRAIL_TIMEOUT_S
+  };
+  const hooks = {
+    PreToolUse: [{ matcher: "Read|Grep", hooks: [trail] }],
+    PostToolUse: [{ matcher: "Grep", hooks: [trail] }],
+    PostToolUseFailure: [{ matcher: "Grep", hooks: [trail] }]
+  };
   if (input.toolEventHook) {
     const hook = {
       type: "command",
@@ -34183,11 +34263,10 @@ function childSettings(input) {
       async: true,
       timeout: 5
     };
-    settings.hooks = {
-      PostToolUse: [{ matcher: "*", hooks: [hook] }],
-      PostToolUseFailure: [{ matcher: "*", hooks: [hook] }]
-    };
+    hooks.PostToolUse.push({ matcher: "*", hooks: [hook] });
+    hooks.PostToolUseFailure.push({ matcher: "*", hooks: [hook] });
   }
+  settings.hooks = hooks;
   return settings;
 }
 function childMcpConfig(input) {
@@ -34323,7 +34402,7 @@ function runChild(opts) {
 }
 
 // src/host-socket.ts
-import { createHash as createHash3, randomBytes as randomBytes8, timingSafeEqual as timingSafeEqual3 } from "node:crypto";
+import { createHash as createHash3, randomBytes as randomBytes9, timingSafeEqual as timingSafeEqual3 } from "node:crypto";
 import { chmodSync as chmodSync3, mkdtempSync as mkdtempSync2, rmSync as rmSync6 } from "node:fs";
 import { createConnection, createServer as createServer3 } from "node:net";
 import { tmpdir as tmpdir2 } from "node:os";
@@ -34332,7 +34411,7 @@ var MAX_LINE = 1024 * 1024;
 var SOCKET_FILE = "host.sock";
 var digest2 = (s) => createHash3("sha256").update(s, "utf8").digest();
 function newToken() {
-  return randomBytes8(32).toString("base64url");
+  return randomBytes9(32).toString("base64url");
 }
 function lineReader(sock, onLine, onTooLong) {
   let buf = "";
@@ -34448,7 +34527,8 @@ var NOTICE_TEXT = "Team relay: your answering session is waiting for your permis
 var CAP_MS = 3e3;
 var STDIN_LIMIT = 1024 * 1024;
 var APPROVAL_TEXT = "Team relay: an answer is waiting for your approval";
-var TEXTS = [NOTICE_TEXT, APPROVAL_TEXT];
+var TAKEOVER_TEXT = "Team relay: this session now answers teammates automatically";
+var TEXTS = [NOTICE_TEXT, APPROVAL_TEXT, TAKEOVER_TEXT];
 function notifyCommand(platform, text = NOTICE_TEXT) {
   if (!TEXTS.includes(text)) return null;
   if (platform === "darwin") {
@@ -34501,10 +34581,51 @@ if (process.argv[1] && /notify-desktop\.(js|ts)$/.test(process.argv[1])) {
   }).finally(() => process.exit(0));
 }
 
+// src/read-trail-core.ts
+import { basename as basename2 } from "node:path";
+var SENSITIVE_NAMES = [
+  "*.tfstate",
+  "secrets.*",
+  "*.properties",
+  "docker-compose*",
+  "kubeconfig",
+  "*service-account*.json",
+  ".npmrc",
+  ".netrc",
+  ".git-credentials",
+  ".dev.vars",
+  "id_ecdsa*",
+  "id_dsa*",
+  "*.ppk",
+  "*.pem",
+  "*.key",
+  "*.p12"
+];
+function globMatch(glob, name) {
+  const parts = glob.toLowerCase().split("*");
+  const s = name.toLowerCase();
+  if (parts.length === 1) return s === parts[0];
+  const first = parts[0];
+  const last = parts[parts.length - 1];
+  if (!s.startsWith(first) || s.length < first.length + last.length || !s.endsWith(last)) return false;
+  let at = first.length;
+  const end = s.length - last.length;
+  for (const mid of parts.slice(1, -1)) {
+    const i = s.indexOf(mid, at);
+    if (i < 0 || i + mid.length > end) return false;
+    at = i + mid.length;
+  }
+  return true;
+}
+function sensitiveName(path) {
+  const name = basename2(path.replace(/[/\\]+$/, ""));
+  return name !== "" && SENSITIVE_NAMES.some((glob) => globMatch(glob, name));
+}
+
 // src/scope.ts
-import { statSync as statSync3 } from "node:fs";
+import { existsSync, readdirSync, statSync as statSync3 } from "node:fs";
 import { homedir as homedir3 } from "node:os";
-import { basename as basename2, dirname as dirname3, isAbsolute as isAbsolute6, join as join7, normalize as normalize2 } from "node:path";
+import { basename as basename3, dirname as dirname3, isAbsolute as isAbsolute6, join as join7, normalize as normalize2 } from "node:path";
 function relayCredentialDirs(env) {
   const dirs = [configDir(env)];
   try {
@@ -34514,7 +34635,7 @@ function relayCredentialDirs(env) {
   return [...new Set(dirs)];
 }
 function shareName(path) {
-  return basename2(path).replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 64) || "folder";
+  return basename3(path).replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 64) || "folder";
 }
 function scopeFolder(cwd, env) {
   const path = realOr(cwd);
@@ -34543,13 +34664,41 @@ function scopeFolder(cwd, env) {
     credentialDirs: relayCredentialDirs(env)
   });
   if (hit) return refuse(`it is inside a credential location on the deny list (${hit})`);
+  if (dirname3(path) === homeReal || dirname3(normalize2(cwd)) === normalize2(home)) return refuse("it is a folder directly in your home directory");
+  const hidden = homeEntries(homeReal);
+  for (const e of hidden) {
+    if (within(path, e.path) || within(path, e.real)) return refuse(`it is inside ~/${e.name}`);
+    if (within(e.real, path)) return refuse(`it contains ~/${e.name}`);
+  }
+  if (!inGitWorkTree(path, homeReal)) return refuse("it is not inside a git work tree (no .git in it or in a folder above it, below your home directory)");
   return { path, qualifies: true, reason: null, share: shareName(path) };
+}
+function homeEntries(homeReal) {
+  let names;
+  try {
+    names = readdirSync(homeReal);
+  } catch {
+    names = [];
+  }
+  const wanted = /* @__PURE__ */ new Set(["Library", ...names.filter((n) => n.startsWith(".") && n !== "." && n !== "..")]);
+  return [...wanted].map((name) => {
+    const path = join7(homeReal, name);
+    return { name, path, real: realOr(path) };
+  });
+}
+function inGitWorkTree(path, homeReal) {
+  for (let d = path; ; d = dirname3(d)) {
+    if (d === "/" || within(homeReal, d)) return false;
+    if (existsSync(join7(d, ".git"))) return true;
+    if (dirname3(d) === d) return false;
+  }
 }
 
 // src/secret-screen.ts
 var PREFIXED = [
   { kind: "a private key", re: /-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY(?: BLOCK)?-----/ },
   { kind: "a PGP private key", re: /-----BEGIN PGP PRIVATE KEY BLOCK-----/ },
+  { kind: "a key or certificate body", re: /\bMI[IGH][A-Za-z0-9+/]{40,}/ },
   { kind: "an AWS access key id", re: /\b(?:AKIA|ASIA|AGPA|AIDA|AROA|ANPA|ANVA|AIPA)[0-9A-Z]{16}\b/ },
   { kind: "a GitHub token", re: /\b(?:gh[pousr]_[A-Za-z0-9]{36,255}|github_pat_[A-Za-z0-9_]{22,255})\b/ },
   { kind: "a GitLab token", re: /\bglpat-[A-Za-z0-9_-]{20,}\b/ },
@@ -34575,17 +34724,157 @@ var PREFIXED = [
   { kind: "a JSON web token", re: /\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/ },
   { kind: "a basic-auth header", re: /\bAuthorization:\s*(?:Basic|Bearer)\s+[A-Za-z0-9+/=._-]{12,}/i }
 ];
-var ASSIGNMENT = /(?:^|[\s"'{,;])["']?([A-Za-z0-9_.-]*(?:PASSWORD|PASSWD|SECRET|TOKEN|API[_-]?KEY|APIKEY|ACCESS[_-]?KEY|PRIVATE[_-]?KEY|CREDENTIAL|CLIENT[_-]?SECRET|AUTH[_-]?KEY|SIGNING[_-]?KEY|ENCRYPTION[_-]?KEY|SESSION[_-]?KEY|DSN|CONN(?:ECTION)?[_-]?STRING)[A-Za-z0-9_.-]*)["']?\s*[:=]\s*["']?([^\s"',;}]+)/gim;
-function placeholder(value) {
-  const v = value.trim().replace(/^["']|["']$/g, "");
-  if (v.length < 6) return true;
-  if (/^(?:x+|\*+|\.+|-+|_+|<[^>]*>|\{\{.*\}\}|\$\{[^}]*\}?|\$[A-Z_][A-Z0-9_]*|%[A-Z_]+%|null|none|nil|true|false|undefined|changeme|change_me|your[_-]?\w*|example\w*|placeholder|redacted|\[redacted\]|todo|tbd|secret|password|token)$/i.test(v)) {
+var INVISIBLE = /[\u00AD\u034F\u061C\u115F\u1160\u17B4\u17B5\u180B-\u180F\u200B-\u200F\u202A-\u202E\u2060-\u206F\u3164\uFE00-\uFE0F\uFEFF\uFFA0]/g;
+var CONFUSABLES = {
+  "\u0410": "A",
+  "\u0412": "B",
+  "\u0415": "E",
+  "\u041A": "K",
+  "\u041C": "M",
+  "\u041D": "H",
+  "\u041E": "O",
+  "\u0420": "P",
+  "\u0421": "C",
+  "\u0422": "T",
+  "\u0425": "X",
+  "\u0423": "Y",
+  "\u0405": "S",
+  "\u0406": "I",
+  "\u0408": "J",
+  "\u0500": "d",
+  "\u0430": "a",
+  "\u0432": "b",
+  "\u0435": "e",
+  "\u043A": "k",
+  "\u043C": "m",
+  "\u043D": "h",
+  "\u043E": "o",
+  "\u0440": "p",
+  "\u0441": "c",
+  "\u0442": "t",
+  "\u0445": "x",
+  "\u0443": "y",
+  "\u0455": "s",
+  "\u0456": "i",
+  "\u0458": "j",
+  "\u04BB": "h",
+  "\u0501": "d",
+  "\u051B": "q",
+  "\u051D": "w",
+  "\u04CF": "l",
+  "\u0391": "A",
+  "\u0392": "B",
+  "\u0395": "E",
+  "\u0396": "Z",
+  "\u0397": "H",
+  "\u0399": "I",
+  "\u039A": "K",
+  "\u039C": "M",
+  "\u039D": "N",
+  "\u039F": "O",
+  "\u03A1": "P",
+  "\u03A4": "T",
+  "\u03A5": "Y",
+  "\u03A7": "X",
+  "\u03BF": "o",
+  "\u03BD": "v",
+  "\u03B1": "a",
+  "\u03B9": "i",
+  "\u03BA": "k",
+  "\u03C1": "p",
+  "\u03C4": "t",
+  "\u03C5": "u",
+  "\u03C7": "x"
+};
+function normalise(text) {
+  let out = "";
+  for (const c of text.normalize("NFKC").replace(INVISIBLE, "")) out += CONFUSABLES[c] ?? c;
+  return out;
+}
+function joinLines(text) {
+  return text.replace(/(?<=[A-Za-z0-9+/_=.-]{4})[ \t]*\r?\n[ \t>*-]*(?=[A-Za-z0-9+/_=-]{4})/g, "");
+}
+function closeUp(text) {
+  return text.replace(/(?:\S[ \t\u00A0]){7,}\S/g, (run3) => run3.replace(/[ \t\u00A0]/g, ""));
+}
+var SECRET_KEY_SUBSTRING = /PASSWORD|PASSWD|PASSPHRASE|SECRET|TOKEN|API[_-]?KEY|APIKEY|ACCESS[_-]?KEY|PRIVATE[_-]?KEY|CREDENTIAL|CLIENT[_-]?SECRET|AUTH[_-]?KEY|SIGNING[_-]?KEY|ENCRYPTION[_-]?KEY|SESSION[_-]?KEY|DSN|CONN(?:ECTION)?[_-]?STRING/;
+var SECRET_KEY_WORDS = /* @__PURE__ */ new Set(["pass", "pwd", "pw", "passwd", "passcode", "passphrase", "creds", "pat"]);
+function isSecretKey(key) {
+  const k = normalise(key);
+  if (SECRET_KEY_SUBSTRING.test(k.toUpperCase())) return true;
+  const words = k.replace(/([a-z0-9])([A-Z])/g, "$1 $2").split(/[\s_.:-]+/).map((w) => w.toLowerCase()).filter(Boolean);
+  return words.some((w) => SECRET_KEY_WORDS.has(w));
+}
+var ASSIGNMENT = /(?:^|[\s"'`{,;(])["'`]?([A-Za-z_][A-Za-z0-9_.-]{0,79})["'`]?\s*(?::=|=>|=|:)\s*["'`]?([^\s"'`,;}]+)/gm;
+function placeholder(value, minLength = 6) {
+  const v = value.trim().replace(/^["'`]|["'`]$/g, "");
+  if (v.length < minLength) return true;
+  if (/^(?:x+|\*+|•+|\.+|-+|_+|<[^>]*>|\{\{.*\}\}|\$\{[^}]*\}?|\$[A-Z_][A-Z0-9_]*|%[A-Z_]+%|null|none|nil|true|false|undefined|changeme|change_me|your[_-]?\w*|example\w*|placeholder|redacted|\[redacted\]|todo|tbd|secret|password|token)$/i.test(v)) {
     return true;
   }
   if (/^(?:process\.env|os\.environ|env\.|secrets\.|vault:|projects\/[^/]+\/secrets\/)/i.test(v)) return true;
   return false;
 }
-var CONNECTION = /\b[a-z][a-z0-9+.-]{1,20}:\/\/[^\s:/@]{1,128}:([^\s@/]{1,256})@[^\s/]{1,255}/gi;
+var PROSE = /\b(passwords?|passphrase|passcode|passwd|pwd|pass|pin|secret|token|(?:api|access|secret|private|signing)[ _-]?key|key)\b(?:\s+(?:for|of|to|on|in|at)(?:\s+[^\s.,;:!?]{1,40}){1,3}?)?\s+(?:is|was|=|would be|will be|should be|reads|equals|is set to|was set to)\s*:?\s*(["'`“”‘’]?)([^\s"'`“”‘’]{1,256})/gi;
+var PROSE_WORDS = new Set(
+  "a an the not no now also still only just then this that these those it its your our my his her their what whatever which stored kept saved held set reset changed rotated managed required needed used missing wrong invalid expired correct same different located encrypted hashed salted sent provided generated defined configured found empty blank shown visible hidden secure private public available unavailable being from at on in under via inside outside there here too very rotated important optional mandatory case-sensitive sensitive unknown unset known given shared read loaded fetched pulled injected passed checked verified validated refreshed renewed revoked issued signed short long weak strong random different".split(" ")
+);
+function proseSecret(word, quoted, rawValue) {
+  const value = rawValue.replace(/[.,;:!?)\]]+$/, "");
+  if (value === "" || PROSE_WORDS.has(value.toLowerCase())) return false;
+  if (placeholder(value, 4)) return false;
+  const w = word.toLowerCase();
+  const passwordLike = /^(?:passwords?|passphrase|passcode|passwd|pwd|pass|pin|secret)$/.test(w);
+  if (quoted || passwordLike) return true;
+  return value.length >= 8 && (/[0-9]/.test(value) || /[a-z]/.test(value) && /[A-Z]/.test(value) || /[_+/=!@#$%^&*-]/.test(value));
+}
+var URL_USERINFO = /(?:\b[a-z][a-z0-9+.-]{0,20}:)?\/\/([^\s/?#@"'<>]{1,256})@[^\s/?#@"'<>]{1,255}/gi;
+var URL_PARAM = /[?&;#]([A-Za-z0-9_.-]{1,64})=([^&#\s"'<>]{1,512})/g;
+var SECRET_PARAMS = /* @__PURE__ */ new Set([
+  "key",
+  "sig",
+  "signature",
+  "auth",
+  "access_token",
+  "id_token",
+  "refresh_token",
+  "client_secret",
+  "apikey",
+  "api_key",
+  "x-amz-signature",
+  "x-amz-credential",
+  "x-amz-security-token",
+  "x-goog-signature",
+  "x-goog-credential",
+  "sas",
+  "sv",
+  "code"
+]);
+function decode3(s) {
+  try {
+    return decodeURIComponent(s);
+  } catch {
+    return s;
+  }
+}
+function urlCredentials(text) {
+  for (const m of text.matchAll(URL_USERINFO)) {
+    const info = m[1] ?? "";
+    const colon = info.indexOf(":");
+    if (colon >= 0) {
+      const password = decode3(info.slice(colon + 1));
+      if (password !== "" && !placeholder(password, 1)) return true;
+    } else {
+      const user = decode3(info);
+      if (!placeholder(user, 12) && (user.length >= 20 || /[0-9]/.test(user) && /[A-Za-z]/.test(user))) return true;
+    }
+  }
+  for (const m of text.matchAll(URL_PARAM)) {
+    const name = (m[1] ?? "").toLowerCase();
+    if ((SECRET_PARAMS.has(name) || isSecretKey(name)) && !placeholder(decode3(m[2] ?? ""))) return true;
+  }
+  return false;
+}
 function entropy(s) {
   const counts = /* @__PURE__ */ new Map();
   for (const c of s) counts.set(c, (counts.get(c) ?? 0) + 1);
@@ -34608,19 +34897,50 @@ function highEntropy(text) {
   }
   return false;
 }
+var HEX = /(?<![0-9A-Za-z])[0-9a-fA-F]{32,}(?![0-9A-Za-z])/g;
+var HEX_GROUPS = /(?<![0-9A-Za-z])(?:[0-9a-fA-F]{2,8}[ :-]){3,}[0-9a-fA-F]{2,8}(?![0-9A-Za-z])/g;
+function hexSecret(text) {
+  const mixed = (s) => /[0-9]/.test(s) && /[a-f]/i.test(s);
+  for (const m of text.matchAll(HEX)) if (mixed(m[0])) return true;
+  for (const m of text.matchAll(HEX_GROUPS)) {
+    const digits = m[0].replace(/[ :-]/g, "");
+    if (digits.length >= 32 && mixed(digits)) return true;
+  }
+  return false;
+}
+var BASE64_PADDED = /(?<![A-Za-z0-9+/=])[A-Za-z0-9+/]{14,}={1,2}(?![A-Za-z0-9+/=])/g;
+function paddedBase64(text) {
+  for (const m of text.matchAll(BASE64_PADDED)) {
+    const s = m[0];
+    if (s.length % 4 !== 0) continue;
+    const body = s.replace(/=+$/, "");
+    if (/[0-9]/.test(body) && /[A-Za-z]/.test(body) || /[a-z]/.test(body) && /[A-Z]/.test(body)) return true;
+  }
+  return false;
+}
+function screenForm(text, add) {
+  for (const { kind, re } of PREFIXED) if (re.test(text)) add(kind);
+  for (const m of text.matchAll(ASSIGNMENT)) {
+    if (isSecretKey(m[1] ?? "") && !placeholder(m[2] ?? "")) add("a secret-looking KEY=value pair");
+  }
+  for (const m of text.matchAll(PROSE)) {
+    if (proseSecret(m[1] ?? "", (m[2] ?? "") !== "", m[3] ?? "")) add("a secret stated in words");
+  }
+  if (urlCredentials(text)) add("a URL with credentials");
+  if (hexSecret(text)) add("a long hex string");
+  if (paddedBase64(text)) add("a base64-encoded value");
+  if (highEntropy(text)) add("a long random-looking token");
+}
 function screenSecrets(text) {
   const found = [];
   const add = (kind) => {
     if (!found.some((f) => f.kind === kind)) found.push({ kind });
   };
-  for (const { kind, re } of PREFIXED) if (re.test(text)) add(kind);
-  for (const m of text.matchAll(ASSIGNMENT)) {
-    if (!placeholder(m[2] ?? "")) add("a secret-looking KEY=value pair");
-  }
-  for (const m of text.matchAll(CONNECTION)) {
-    if (!placeholder(m[1] ?? "")) add("a connection string with a password");
-  }
-  if (highEntropy(text)) add("a long random-looking token");
+  const norm = normalise(text);
+  const forms = /* @__PURE__ */ new Set([norm, joinLines(norm), closeUp(norm), closeUp(joinLines(norm))]);
+  for (const form of forms) screenForm(form, add);
+  const stripped = norm.replace(/\s+/g, "");
+  for (const { kind, re } of PREFIXED) if (re.test(stripped)) add(kind);
   return found;
 }
 function screenDraft(text, data) {
@@ -34640,9 +34960,14 @@ var POLITE_DECLINE = (member) => `I couldn't answer this automatically; ${member
 var REPLY_DATA_LIMIT = 64 * 1024;
 var LOCK_RETRY_MS = 3e4;
 var QUOTE_LIMIT = 200;
+var MAX_QUEUED_PER_ASKER = 3;
+var MAX_RUNS_PER_HOUR = 20;
+var HOUR_MS = 36e5;
+var NOTICE_GAP_MS = 5 * 6e4;
+var WITHDRAW_MS = 1500;
 function ownDist() {
   const here = dirname4(fileURLToPath4(import.meta.url));
-  return basename3(here) === "src" ? join8(here, "..", "dist") : here;
+  return basename4(here) === "src" ? join8(here, "..", "dist") : here;
 }
 function singleLine(text, limit) {
   const flat = neutraliseChannelTags(text).replace(/\s+/g, " ").trim();
@@ -34652,21 +34977,30 @@ var AnswerHost = class {
   constructor(o) {
     this.o = o;
     this.env = o.env;
+    this.now = o.now ?? Date.now;
+    this.queue = new ApprovalQueue({ now: this.now });
     this.scope = scopeFolder(o.cwd ?? process.cwd(), o.env);
     this.dist = o.distDir ?? ownDist();
     this.node = o.node ?? process.execPath;
     this.lockFile = o.lockFile ?? lockPath(o.env);
     this.stateFile = o.stateFile ?? statePath(o.env);
+    this.perAsker = o.limits?.perAsker ?? MAX_QUEUED_PER_ASKER;
+    this.perHour = o.limits?.perHour ?? MAX_RUNS_PER_HOUR;
+    this.noticeGapMs = o.limits?.noticeGapMs ?? NOTICE_GAP_MS;
     this.queue.onChange((e) => this.onQueueChange(e.type, e.item, e.outcome));
   }
   o;
-  queue = new ApprovalQueue();
+  queue;
   env;
   scope;
   dist;
   node;
   lockFile;
   stateFile;
+  now;
+  perAsker;
+  perHour;
+  noticeGapMs;
   controller = new AbortController();
   lock = null;
   holder = null;
@@ -34679,6 +35013,19 @@ var AnswerHost = class {
   claudeMissing = false;
   recent = new RecentIds(500);
   whyNot = "starting";
+  /** When each automatic run started, for the hourly limit. */
+  runStarts = [];
+  lastDesktop = Number.NEGATIVE_INFINITY;
+  lastQuoted = Number.NEGATIVE_INFINITY;
+  /** Whether a folder was published as shared, so stopping withdraws it. */
+  sharing = false;
+  // The inbox cursor (§7 item 12).
+  readAfter = void 0;
+  open = /* @__PURE__ */ new Set();
+  maxSeen = 0;
+  cursorWanted = 0;
+  cursorPosted = 0;
+  cursorChain = Promise.resolve();
   get stopped() {
     return this.controller.signal.aborted;
   }
@@ -34745,9 +35092,19 @@ var AnswerHost = class {
       return;
     }
     this.writeState();
-    await this.publish(this.scope.qualifies && this.scope.share ? [this.scope.share] : []);
+    this.announce();
+    const shares = this.scope.qualifies && this.scope.share ? [this.scope.share] : [];
+    this.sharing = shares.length > 0;
+    await this.publish(shares, { attempts: 2, signal: this.controller.signal });
     this.o.log(`answering automatically in ${this.scope.path}${this.scope.qualifies ? "" : " (no automatic reads)"}`);
     await this.inboxLoop();
+  }
+  /** §7 item 4: taking over answering is said in the working session and on the desktop. */
+  announce() {
+    const reads = this.scope.qualifies ? "reads inside it are automatic." : `reads inside it are not automatic (${this.scope.reason}): every read needs your approval.`;
+    void Promise.resolve(this.o.push(`team-relay: This session now answers teammates automatically from ${this.scope.path}; ${reads}`)).catch(() => {
+    });
+    this.notifyDesktop(TAKEOVER_TEXT);
   }
   async stop() {
     if (this.stopped) return;
@@ -34763,8 +35120,13 @@ var AnswerHost = class {
       clearApprovalsState(this.stateFile);
     } catch {
     }
+    const held = this.lock !== null;
     this.lock?.release();
     this.lock = null;
+    if (held && this.sharing) {
+      this.sharing = false;
+      await this.publish([], { attempts: 1, timeoutMs: WITHDRAW_MS, signal: AbortSignal.timeout(WITHDRAW_MS) });
+    }
   }
   sleep(ms) {
     return new Promise((resolve) => {
@@ -34780,32 +35142,46 @@ var AnswerHost = class {
     });
   }
   /** M4-SPEC §3 / M8-SPEC §1: the capabilities this member runs, and the folder it shares. */
-  async publish(shares) {
+  async publish(shares, opts) {
     try {
       const manifest = loadManifest(this.env.MANIFEST_PATH || defaultManifestPath());
       const { exposed } = exposedCapabilities(manifest, this.env);
       const payload = validateManifest(discoveryPayload(exposed, shares.map((name) => ({ name }))));
-      const res = await this.o.client.publishManifest(this.o.me.member, payload, { attempts: 2, signal: this.controller.signal });
+      const res = await this.o.client.publishManifest(this.o.me.member, payload, opts);
       this.o.log(`published capabilities: ${res.capabilities.join(", ") || "(none)"}; shared folder: ${shares.join(", ") || "(none)"}`);
     } catch (err) {
-      if (!this.stopped) this.o.log(`the capability manifest was not published (${describeError(err)})`);
+      if (!opts.signal.aborted || shares.length === 0) this.o.log(`the capability manifest was not published (${describeError(err)})`);
     }
   }
-  // -- the inbox --------------------------------------------------------------------------------
+  // -- the inbox and its cursor (§7 item 12) -----------------------------------------------------
   async inboxLoop() {
     let failures = 0;
     const { client } = this.o;
     while (!this.stopped) {
-      const started = Date.now();
+      const started = this.now();
       try {
-        const page2 = await client.readStream("inbox", { wait: 25, limit: 50 }, { attempts: 1, signal: this.controller.signal });
+        const q = { wait: 25, limit: 50, ...this.readAfter !== void 0 ? { after: this.readAfter } : {} };
+        const page2 = await client.readStream("inbox", q, { attempts: 1, signal: this.controller.signal });
         failures = 0;
+        if (this.readAfter === void 0) {
+          this.readAfter = page2.cursor;
+          this.cursorWanted = this.cursorPosted = page2.cursor;
+        }
         for (const envelope of page2.messages) {
           if (this.stopped) return;
-          await this.accept(envelope);
-          await client.ackCursor("inbox", envelope.seq, { attempts: 1, signal: this.controller.signal });
+          const seq = envelope.seq;
+          const tracked = Number.isSafeInteger(seq) && seq > (this.readAfter ?? 0);
+          if (tracked) {
+            this.open.add(seq);
+            this.maxSeen = Math.max(this.maxSeen, seq);
+          }
+          const kept = await this.accept(envelope, seq);
+          if (tracked) {
+            this.readAfter = seq;
+            if (!kept) this.handled(seq);
+          }
         }
-        if (page2.messages.length === 0 && Date.now() - started < 1e3) await this.sleep(1e3);
+        if (page2.messages.length === 0 && this.now() - started < 1e3) await this.sleep(1e3);
       } catch (err) {
         if (this.stopped) return;
         if (err instanceof RelayError && err.status === 401) {
@@ -34818,14 +35194,41 @@ var AnswerHost = class {
       }
     }
   }
-  /** One inbox envelope: acknowledged at the relay at once, then queued for an answerer. */
-  async accept(envelope) {
+  /**
+   * A question is fully handled: the cursor may move past it, and past every later one that is
+   * handled too, but never past one still open.
+   */
+  handled(seq) {
+    if (this.stopped) return;
+    this.open.delete(seq);
+    let target = this.maxSeen;
+    for (const s of this.open) target = Math.min(target, s - 1);
+    if (target <= this.cursorWanted) return;
+    this.cursorWanted = target;
+    this.cursorChain = this.cursorChain.then(() => this.postCursor());
+  }
+  async postCursor() {
+    const want = this.cursorWanted;
+    if (this.stopped || want <= this.cursorPosted) return;
+    try {
+      await this.o.client.ackCursor("inbox", want, { attempts: 2, signal: this.controller.signal });
+      this.cursorPosted = Math.max(this.cursorPosted, want);
+    } catch (err) {
+      if (!this.stopped) this.o.log(`the inbox cursor was not moved (${describeError(err)}); it moves with the next handled question`);
+      this.cursorWanted = this.cursorPosted;
+    }
+  }
+  /**
+   * One inbox envelope: acknowledged at the relay at once, then queued for an answerer.
+   * Returns whether a job was kept for it (false: nothing more to do, it is handled).
+   */
+  async accept(envelope, seq) {
     const { client, me } = this.o;
-    if (this.recent.has(envelope.id)) return;
+    if (this.recent.has(envelope.id)) return false;
     const n = envelopeToNotification(envelope, { stream: "inbox", team: me.team, member: me.member });
     if ("reject" in n) {
       this.o.log(`skipped inbox seq ${String(envelope.seq)}: ${n.reject}`);
-      return;
+      return false;
     }
     let ack;
     try {
@@ -34834,14 +35237,17 @@ var AnswerHost = class {
       if (err instanceof RelayError && [404, 409, 410].includes(err.status)) {
         this.recent.add(envelope.id);
         this.o.log(`${envelope.request_id} can no longer be answered (${err.status}); skipped`);
-        return;
+        return false;
       }
       throw err;
     }
     this.recent.add(envelope.id);
-    if (ack.status === "answered") return;
+    if (ack.status === "answered") {
+      this.o.log(`${envelope.request_id} is already answered; skipped`);
+      return false;
+    }
     const data = envelope.data ?? {};
-    const deadline = deadlineOf(ack.answer_deadline) ?? deadlineOf(data.answer_deadline) ?? new Date(Date.now() + 864e5).toISOString();
+    const deadline = deadlineOf(ack.answer_deadline) ?? deadlineOf(data.answer_deadline) ?? new Date(this.now() + 864e5).toISOString();
     const item = {
       request_id: envelope.request_id,
       from: envelope.from,
@@ -34850,36 +35256,85 @@ var AnswerHost = class {
       answer_deadline: Date.parse(deadline),
       ...envelope.type === "capability_call" ? { capability: { name: String(data.capability), params: isPlainObject4(data.params) ? data.params : {} } } : {}
     };
-    this.work.push(item);
+    const job = { item, seq, approved: false };
+    const queued = this.work.filter((j) => j.item.from === item.from).length;
+    if (queued >= this.perAsker) {
+      this.askToRun(job, `${item.from} already has ${queued} questions waiting to be answered automatically (at most ${this.perAsker})`);
+      return true;
+    }
+    this.work.push(job);
     void this.drain();
+    return true;
+  }
+  /** The job is over: the cursor may pass it (unless the host is stopping, when it is received again). */
+  finish(job) {
+    if (Number.isSafeInteger(job.seq)) this.handled(job.seq);
   }
   async drain() {
     if (this.working) return;
     this.working = true;
     try {
       while (!this.stopped) {
-        const item = this.work.shift();
-        if (!item) break;
-        if (Date.now() >= item.answer_deadline) {
+        const job = this.work.shift();
+        if (!job) break;
+        const item = job.item;
+        if (this.now() >= item.answer_deadline) {
           this.o.log(`${item.request_id} passed its answer deadline before it could be answered`);
+          this.finish(job);
           continue;
         }
+        if (!job.approved) {
+          const since = this.now() - HOUR_MS;
+          this.runStarts = this.runStarts.filter((t) => t > since);
+          if (this.runStarts.length >= this.perHour) {
+            this.askToRun(job, `${this.runStarts.length} questions were answered automatically in the last hour (at most ${this.perHour})`);
+            continue;
+          }
+          this.runStarts.push(this.now());
+        }
         try {
-          await this.answer(item);
+          await this.answer(job);
         } catch (err) {
           this.o.log(`answering ${item.request_id} failed: ${describeError(err)}`);
+          this.finish(job);
         }
       }
     } finally {
       this.working = false;
     }
   }
+  /** §7 item 5: past a volume limit, a question waits for the member's approval to run at all. */
+  askToRun(job, reason) {
+    const { outcome } = this.queue.add(this.ctxOf(job.item), { type: "run", reason }, job.item.answer_deadline);
+    void outcome.then(async (o) => {
+      if (o === "cancelled") return;
+      if (o === "allow") {
+        job.approved = true;
+        this.work.push(job);
+        void this.drain();
+        return;
+      }
+      if (o === "decline") {
+        try {
+          await this.sendReply(job.item.request_id, POLITE_DECLINE(this.o.me.member), null);
+          this.o.log(`declined ${job.item.request_id} politely`);
+        } catch (err) {
+          this.o.log(`the answer to ${job.item.request_id} could not be sent (${describeError(err)})`);
+        }
+      } else {
+        this.o.log(`nothing sent for ${job.item.request_id} (${o})`);
+      }
+      this.toolEvent(job.item.request_id, "approval", "error");
+      this.finish(job);
+    });
+  }
   // -- one answerer run -------------------------------------------------------------------------
   claudeBin() {
     const b = (this.o.claudeBin ?? this.env.TEAM_RELAY_CLAUDE_BIN ?? "").trim();
     return b && isAbsolute7(b) ? b : "claude";
   }
-  async answer(item) {
+  async answer(job) {
+    const item = job.item;
     const socket = this.socket;
     if (!socket) return;
     const runDir = mkdtempSync3(join8(socket.dir, "run-"));
@@ -34904,7 +35359,19 @@ var AnswerHost = class {
     }
     const active = new ActiveRequests(plan.stateDir, (err) => this.o.log(`open request not recorded: ${describeError(err)}`));
     await active.add(item.request_id, new Date(item.answer_deadline).toISOString());
-    const run3 = { item, replied: false, approvalNeeded: false, approvalRequested: null, waiting: 0, cwd: plan.cwd, denyDirs: plan.denyDirs };
+    const run3 = {
+      job,
+      item,
+      replied: false,
+      drafted: false,
+      approvalNeeded: false,
+      approvalRequested: null,
+      waiting: 0,
+      cwd: plan.cwd,
+      denyDirs: plan.denyDirs,
+      sensitiveReads: /* @__PURE__ */ new Set(),
+      openSearches: /* @__PURE__ */ new Set()
+    };
     this.current = run3;
     socket.setRun(plan.token, (method, params) => this.onCall(run3, method, params));
     try {
@@ -34932,6 +35399,7 @@ var AnswerHost = class {
       this.current = null;
       this.queue.cancelWhere((p) => p.ctx.request_id === item.request_id && p.ask.type === "permission");
       rmSync7(runDir, { recursive: true, force: true });
+      if (!run3.drafted) this.finish(job);
     }
   }
   ctxOf(item) {
@@ -34953,7 +35421,40 @@ var AnswerHost = class {
       return { ok: true, message: "Noted: your answer will wait for the member's approval before it is sent." };
     }
     if (method === "permission") return this.onPermission(run3, p);
+    if (method === "trail") return this.onTrail(run3, p);
     throw new Error(`unknown method: ${method}`);
+  }
+  // -- §7 item 1: the read trail ------------------------------------------------------------
+  /** A read-trail hook's report (read-trail.ts). Every field is checked again here. */
+  onTrail(run3, p) {
+    const phase = p.phase;
+    const tool = p.tool;
+    if (tool !== "Read" && tool !== "Grep") return { ok: false };
+    const id = typeof p.tool_use_id === "string" && p.tool_use_id ? p.tool_use_id.slice(0, 200) : "(no id)";
+    const note = (raw) => {
+      if (typeof raw !== "string" || raw === "") return;
+      const path = resolvePath(run3.cwd, raw.slice(0, 4096));
+      for (const candidate of [raw, path, realOr(path)]) {
+        if (sensitiveName(candidate)) run3.sensitiveReads.add(basename4(candidate.replace(/[/\\]+$/, "")));
+      }
+    };
+    if (phase === "pre") {
+      note(p.path);
+      if (tool === "Grep") run3.openSearches.add(id);
+      return { ok: true };
+    }
+    if (tool !== "Grep") return { ok: false };
+    if (phase === "post") {
+      const paths = Array.isArray(p.paths) ? p.paths.slice(0, 5e3) : [];
+      for (const x of paths) note(x);
+      run3.openSearches.delete(id);
+      return { ok: true };
+    }
+    if (phase === "failed") {
+      run3.openSearches.delete(id);
+      return { ok: true };
+    }
+    return { ok: false };
   }
   // -- §3: the reply decision table ---------------------------------------------------------
   async onReply(run3, p) {
@@ -34973,6 +35474,8 @@ var AnswerHost = class {
       reason: typeof p.reason === "string" ? p.reason : null,
       requested: run3.approvalRequested,
       approvalDuringRun: run3.approvalNeeded,
+      sensitiveReads: [...run3.sensitiveReads],
+      openSearches: run3.openSearches.size,
       text,
       data
     });
@@ -34987,14 +35490,17 @@ var AnswerHost = class {
       this.o.log(`answered ${run3.item.request_id} automatically`);
       return { ok: true, message: "Sent." };
     }
+    run3.drafted = true;
     const { outcome } = this.queue.add(this.ctxOf(run3.item), { type: "draft", text, data, reasons }, run3.item.answer_deadline);
-    void outcome.then((o) => this.settleDraft(run3.item, text, data, o));
+    void outcome.then((o) => this.settleDraft(run3.job, text, data, o));
     return { ok: true, message: "Your answer waits for the member's approval. Nothing more to do: end here." };
   }
   async sendReply(requestId, text, data) {
     await this.o.client.reply(requestId, { idempotency_key: randomUUID(), text, data });
   }
-  async settleDraft(item, text, data, outcome) {
+  async settleDraft(job, text, data, outcome) {
+    const item = job.item;
+    if (outcome === "cancelled") return;
     try {
       if (outcome === "send") {
         await this.sendReply(item.request_id, text, data);
@@ -35009,6 +35515,7 @@ var AnswerHost = class {
       this.o.log(`the answer to ${item.request_id} could not be sent (${describeError(err)})`);
     }
     this.toolEvent(item.request_id, "approval", outcome === "send" ? "ok" : "error");
+    this.finish(job);
   }
   // -- §3: the permission tool --------------------------------------------------------------
   async onPermission(run3, p) {
@@ -35033,22 +35540,34 @@ var AnswerHost = class {
     const message = result === "deny" ? "The member denied this. Answer without it, or say you could not." : "The member did not allow this in time. Answer without it, or say you could not.";
     return { allow: false, message };
   }
+  /** Whether an absolute path (or where it resolves to) is on the deny list or in a denied directory. */
+  denied(run3, path) {
+    const real = realOr(path);
+    const ctx = { home: this.env.HOME ?? "", credentialDirs: relayCredentialDirs(this.env) };
+    return credentialHit(path, ctx) !== null || credentialHit(real, ctx) !== null || run3.denyDirs.some((d) => within(real, realOr(d)) || within(path, d) || within(real, d));
+  }
   /** What the member is asked, or why it is denied without asking. */
   classify(run3, toolName, input) {
     const { server, tool } = splitToolName(toolName);
     if (server === null && (tool === "Read" || tool === "Glob" || tool === "Grep")) {
+      const refused = { deny: "That path is never readable (credentials and configuration are off limits). Do not try to reach it another way." };
       const raw = tool === "Read" ? input.file_path : input.path;
       const given = typeof raw === "string" && raw ? raw : run3.cwd;
       const path = resolvePath(run3.cwd, given);
-      const real = realOr(path);
-      const ctx = { home: this.env.HOME ?? "", credentialDirs: relayCredentialDirs(this.env) };
-      if (credentialHit(path, ctx) || credentialHit(real, ctx) || run3.denyDirs.some((d) => within(real, realOr(d)) || within(path, d))) {
-        return { deny: "That path is never readable (credentials and configuration are off limits). Do not try to reach it another way." };
+      if (this.denied(run3, path)) return refused;
+      for (const key of tool === "Glob" ? ["pattern"] : tool === "Grep" ? ["glob"] : []) {
+        const pattern2 = input[key];
+        if (typeof pattern2 !== "string" || pattern2 === "") continue;
+        const target = patternTarget(pattern2, path, this.env.HOME ?? "");
+        if (this.denied(run3, target.prefix) || credentialHit(target.whole, { home: this.env.HOME ?? "" }) !== null) return refused;
       }
+      const real = realOr(path);
+      const where = real !== path ? `${path} \u2192 ${real}` : path;
       const pattern = typeof input.pattern === "string" ? singleLine(input.pattern, 200) : "";
-      if (tool === "Read") return { tool, action: `read the file ${path}` };
-      if (tool === "Glob") return { tool, action: `list the files matching ${JSON.stringify(pattern)} in ${path}` };
-      return { tool, action: `search ${path} for ${JSON.stringify(pattern)}` };
+      if (tool === "Read") return { tool, action: `read the file ${where}` };
+      if (tool === "Glob") return { tool, action: `list the files matching ${JSON.stringify(pattern)} in ${where}` };
+      const glob = typeof input.glob === "string" ? ` (files matching ${JSON.stringify(singleLine(input.glob, 200))})` : "";
+      return { tool, action: `search ${where}${glob} for ${JSON.stringify(pattern)}` };
     }
     if (server === "capabilities") {
       const item = run3.item;
@@ -35065,19 +35584,33 @@ var AnswerHost = class {
     }
     return { deny: `${toolName || "That tool"} is not available when answering automatically.` };
   }
-  // -- telling the member and the asker -----------------------------------------------------
+  // -- telling the member and the asker (§4, §7 item 5) -----------------------------------------
   onQueueChange(type, item, _outcome) {
     this.writeState();
     if (type !== "added" || this.stopped) return;
     const n = this.queue.size;
-    const quoted = item.ctx.kind === "capability_call" && item.ctx.capability ? `run ${item.ctx.capability.name} ${singleLine(JSON.stringify(item.ctx.capability.params), QUOTE_LIMIT)}` : singleLine(item.ctx.question, QUOTE_LIMIT);
-    void Promise.resolve(
-      this.o.push(`team-relay: ${item.ctx.asker} asked: "${quoted}" \u2014 an answer is waiting for your approval (${n} pending). Run /team-relay:approvals.`)
-    ).catch(() => {
+    const now = this.now();
+    let content;
+    if (now - this.lastQuoted >= this.noticeGapMs) {
+      this.lastQuoted = now;
+      const quoted = item.ctx.kind === "capability_call" && item.ctx.capability ? `run ${item.ctx.capability.name} ${singleLine(JSON.stringify(item.ctx.capability.params), QUOTE_LIMIT)}` : singleLine(item.ctx.question, QUOTE_LIMIT);
+      const what = item.ask.type === "run" ? "answering it is waiting for your approval" : "an answer is waiting for your approval";
+      content = `team-relay: ${item.ctx.asker} asked: "${quoted}" \u2014 ${what} (${n} pending). Run /team-relay:approvals.`;
+    } else {
+      content = `team-relay: another item is waiting for your approval (${n} pending). Run /team-relay:approvals.`;
+    }
+    void Promise.resolve(this.o.push(content)).catch(() => {
     });
     this.toolEvent(item.ctx.request_id, item.ask.type === "permission" ? item.ask.tool : "approval", "waiting");
+    this.notifyDesktop(APPROVAL_TEXT);
+  }
+  /** A desktop notification (fixed text), at most one per NOTICE_GAP_MS. */
+  notifyDesktop(text) {
+    const now = this.now();
+    if (now - this.lastDesktop < this.noticeGapMs) return;
+    this.lastDesktop = now;
     try {
-      (this.o.notify ?? defaultNotify)();
+      (this.o.notify ?? defaultNotify)(text);
     } catch {
     }
   }
@@ -35117,6 +35650,18 @@ var AnswerHost = class {
     }
   }
 };
+function patternTarget(pattern, base2, home) {
+  let p = pattern;
+  if (p === "~" || p.startsWith("~/")) p = home + p.slice(1);
+  const whole = isAbsolute7(p) ? resolvePath(p) : resolvePath(base2, p);
+  const parts = whole.split("/");
+  const fixed = [];
+  for (const part of parts) {
+    if (/[*?[\]{}!]/.test(part)) break;
+    fixed.push(part);
+  }
+  return { prefix: fixed.join("/") || "/", whole };
+}
 function relayServerEnv(connection, env, runDir) {
   const c = connection;
   const out = { RELAY_URL: c.url, RELAY_TEAM: c.team, RELAY_AUTH: c.mode };
@@ -35185,16 +35730,19 @@ function planRun(p) {
   const mcpConfig = join8(runDir, "mcp.json");
   const settings = join8(runDir, "settings.json");
   const toolEventFile = relay.toolEvent ? join8(runDir, "tool-event.json") : null;
+  const readTrailFile = join8(runDir, "read-trail.json");
   const write = (path, value) => writeFileSync4(path, `${JSON.stringify(value, null, 2)}
 `, { mode: 384, flag: "wx" });
   write(mcpConfig, childMcpConfig({ node: p.node, answerTools: join8(p.dist, "answer-tools.js"), socket: p.socket.path, token, capabilities }));
   if (toolEventFile) write(toolEventFile, relay.toolEvent);
+  write(readTrailFile, { socket: p.socket.path, token });
   write(
     settings,
     childSettings({
       scope,
       denyFiles: relay.denyFiles,
       denyDirs,
+      readTrailHook: { node: p.node, script: join8(p.dist, "read-trail.js"), config: readTrailFile },
       ...toolEventFile ? { toolEventHook: { node: p.node, script: join8(p.dist, "tool-event.js"), config: toolEventFile } } : {}
     })
   );
@@ -35209,20 +35757,28 @@ function planRun(p) {
     args: childArgs({ mcpConfig, settings }, rubric(p.member, scope), model),
     env: childEnv(env),
     stdin: buildPrompt(p.item),
-    files: { mcpConfig, settings, toolEvent: toolEventFile }
+    files: { mcpConfig, settings, toolEvent: toolEventFile, readTrail: readTrailFile }
   };
 }
 function draftReasons(d) {
   const reasons = [];
-  if (d.needsApproval) reasons.push(`the answerer flagged it${d.reason ? ` ("${singleLine(d.reason, 200)}")` : ""}`);
-  if (d.requested !== null) reasons.push(`the answerer asked for your approval ("${singleLine(d.requested, 200)}")`);
+  const words = (r) => ` (in the answerer's own words: "${singleLine(r, 200)}")`;
+  if (d.needsApproval) reasons.push(`the answerer flagged it${d.reason ? words(d.reason) : ""}`);
+  if (d.requested !== null) reasons.push(`the answerer asked for your approval${words(d.requested)}`);
   const secrets = screenDraft(d.text, d.data);
   if (secrets.length) reasons.push(`the secret screen found ${secrets.map((s) => s.kind).join(", ")}`);
+  const sensitive = [...new Set(d.sensitiveReads ?? [])];
+  if (sensitive.length) {
+    const names = sensitive.slice(0, 3).map((n) => singleLine(n, 80)).join(", ");
+    const more = sensitive.length > 3 ? ` and ${sensitive.length - 3} more` : "";
+    reasons.push(`it read files whose names suggest secrets (${names}${more})`);
+  }
+  if ((d.openSearches ?? 0) > 0) reasons.push("what one of its searches read could not be recorded");
   if (d.approvalDuringRun) reasons.push("it needed your permission for a step while it worked");
   return reasons;
 }
-function defaultNotify() {
-  const cmd = notifyCommand(process.platform, APPROVAL_TEXT);
+function defaultNotify(text) {
+  const cmd = notifyCommand(process.platform, text);
   if (!cmd) return;
   execFile5(cmd.file, cmd.args, { timeout: 3e3, windowsHide: true }, () => {
   });
@@ -35643,12 +36199,15 @@ var AskerConnection = class {
   start() {
     void this.watch().catch((err) => log(`connection watcher ended: ${describeError(err)}`));
   }
+  /** Stops everything; resolves once the host has stopped (its shared folder withdrawn, M8-SPEC §7 item 12). */
   stop() {
     this.stopper.stop();
     this.live?.stopper.stop();
     this.pending?.cancel();
-    void this.host?.stop();
+    const host = this.host;
     this.host = null;
+    return host ? host.stop().catch(() => {
+    }) : Promise.resolve();
   }
   answerHost() {
     return this.host;
@@ -36183,9 +36742,9 @@ async function main() {
     if (stopper.stopped) return;
     stopper.stop();
     answeringLock?.release();
-    connection?.stop();
-    void server.close().finally(() => process.exit(0));
-    setTimeout(() => process.exit(0), 2e3).unref();
+    const stopped = connection?.stop() ?? Promise.resolve();
+    void Promise.race([stopped, new Promise((r) => setTimeout(r, 1600))]).then(() => server.close()).finally(() => process.exit(0));
+    setTimeout(() => process.exit(0), 2500).unref();
   };
   process.stdin.on("end", shutdown);
   process.stdin.on("close", shutdown);

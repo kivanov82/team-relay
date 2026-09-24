@@ -7,7 +7,8 @@ var NOTICE_TEXT = "Team relay: your answering session is waiting for your permis
 var CAP_MS = 3e3;
 var STDIN_LIMIT = 1024 * 1024;
 var APPROVAL_TEXT = "Team relay: an answer is waiting for your approval";
-var TEXTS = [NOTICE_TEXT, APPROVAL_TEXT];
+var TAKEOVER_TEXT = "Team relay: this session now answers teammates automatically";
+var TEXTS = [NOTICE_TEXT, APPROVAL_TEXT, TAKEOVER_TEXT];
 function notifyCommand(platform, text = NOTICE_TEXT) {
   if (!TEXTS.includes(text)) return null;
   if (platform === "darwin") {
@@ -63,6 +64,7 @@ export {
   APPROVAL_TEXT,
   NOTICE_TEXT,
   NOTICE_TITLE,
+  TAKEOVER_TEXT,
   isPermissionPrompt,
   notifyCommand
 };
