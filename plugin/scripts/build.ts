@@ -23,6 +23,7 @@ export const ENTRIES = [
   'answer-tools',
   'answering-lock-info',
   'answer-dry-run',
+  'read-trail',
 ] as const;
 
 export async function build(outdir = join(root, 'dist')): Promise<void> {

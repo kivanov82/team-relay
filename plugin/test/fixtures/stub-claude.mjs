@@ -11,6 +11,12 @@
 //   {"permission": {"tool_name": "Read", "input": {...}}}   ask, as Claude Code would
 //   {"capability": "name"}                                   ask for mcp__capabilities__<name> with
 //                                                            the call's params, run it if allowed
+//   {"read": {"tool_name": "Read", "input": {...}, "response": {...}, "fail": false, "skip_post": false}}
+//                                                            a tool use a rule allows (inside the
+//                                                            folder): runs the settings' PreToolUse
+//                                                            hooks, then (unless a hook blocked it)
+//                                                            its PostToolUse or PostToolUseFailure
+//                                                            hooks, as Claude Code would
 //   {"request_approval": "reason"}
 //   {"reply": {"text": "...", "needs_approval": true, ...}}  "{{decision}}" in text is replaced by
 //                                                            the last permission's behavior
@@ -18,6 +24,7 @@
 // Every run is recorded (argv, cwd, stdin, the environment's keys, settings, mcp config with the
 // token replaced, and each tool call's result) in $TMPDIR/stub-claude/<request_id>.json.
 
+import { spawn } from 'node:child_process';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
@@ -81,6 +88,42 @@ async function call(client, name, args) {
   return out;
 }
 
+/** Run the settings' hooks for one event and tool; resolves to the exit codes (async hooks: not awaited). */
+async function runHooks(event, toolName, payload) {
+  const codes = [];
+  for (const group of settings.hooks?.[event] ?? []) {
+    if (group.matcher !== '*' && !new RegExp(`^(?:${group.matcher})$`).test(toolName)) continue;
+    for (const h of group.hooks) {
+      const child = spawn(h.command, h.args ?? [], { stdio: ['pipe', 'pipe', 'pipe'], env: process.env });
+      let err = '';
+      child.stderr.on('data', (c) => (err += c));
+      child.stdin.end(JSON.stringify({ hook_event_name: event, session_id: 'stub', cwd: process.cwd(), ...payload }));
+      const done = new Promise((resolve) => child.on('close', (code) => resolve({ code, err })));
+      if (h.async) continue;
+      codes.push(await done);
+    }
+  }
+  return codes;
+}
+
+let hookSeq = 0;
+async function read(step) {
+  const id = `toolu_read_${hookSeq++}`;
+  const base = { tool_name: step.tool_name, tool_input: step.input, tool_use_id: id };
+  const pre = await runHooks('PreToolUse', step.tool_name, base);
+  const blocked = pre.some((r) => r.code === 2);
+  const out = { tool: step.tool_name, hook: true, args: step.input, blocked, pre: pre.map((r) => r.code), stderr: pre.map((r) => r.err).join('') };
+  // skip_post: the search's result is never reported (a lost PostToolUse).
+  if (!blocked && !step.skip_post) {
+    const post = step.fail
+      ? await runHooks('PostToolUseFailure', step.tool_name, { ...base, error: 'failed' })
+      : await runHooks('PostToolUse', step.tool_name, { ...base, tool_response: step.response ?? {} });
+    out.post = post.map((r) => r.code);
+  }
+  record.calls.push(out);
+  save();
+}
+
 let decision = 'none';
 async function permission(toolName, input) {
   const r = await call(host, 'permission', { tool_name: toolName, input, tool_use_id: 'toolu_stub' });
@@ -103,6 +146,7 @@ if (cap) {
 let capResult = null;
 for (const step of steps) {
   if (step.permission) await permission(step.permission.tool_name, step.permission.input);
+  if (step.read) await read(step.read);
   if (step.capability) {
     const input = { ...params, request_id: requestId };
     const p = await permission(`mcp__capabilities__${step.capability}`, input);

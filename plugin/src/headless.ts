@@ -144,9 +144,14 @@ export type SettingsInput = {
   /** Absolute paths (files) and directories never readable, besides the lists. */
   denyFiles: readonly string[];
   denyDirs: readonly string[];
+  /** The read-trail hook (read-trail.js with its config): always there (M8-SPEC §7 item 1). */
+  readTrailHook: { node: string; script: string; config: string };
   /** The tool-event hook (tool-event.js with its config), when tool events are posted. */
   toolEventHook?: { node: string; script: string; config: string };
 };
+
+/** How long Claude Code lets the read-trail hook run (s); the hook gives up by itself before. */
+export const READ_TRAIL_TIMEOUT_S = 10;
 
 export function childSettings(input: SettingsInput): Record<string, unknown> {
   const allow = [REPLY_TOOL, REQUEST_APPROVAL_TOOL];
@@ -161,6 +166,20 @@ export function childSettings(input: SettingsInput): Record<string, unknown> {
       deny,
     },
   };
+  // M8-SPEC §7 item 1: the read trail. Not async: the host has the report before the tool
+  // runs (PreToolUse, which blocks the tool when the report fails) and before the answerer
+  // goes on after a search (PostToolUse).
+  const trail = {
+    type: 'command',
+    command: input.readTrailHook.node,
+    args: [input.readTrailHook.script, '--config', input.readTrailHook.config],
+    timeout: READ_TRAIL_TIMEOUT_S,
+  };
+  const hooks: Record<string, Array<{ matcher: string; hooks: unknown[] }>> = {
+    PreToolUse: [{ matcher: 'Read|Grep', hooks: [trail] }],
+    PostToolUse: [{ matcher: 'Grep', hooks: [trail] }],
+    PostToolUseFailure: [{ matcher: 'Grep', hooks: [trail] }],
+  };
   if (input.toolEventHook) {
     // M2-SPEC §4.3: the tool's name, outcome and duration go to the asker's console, in the
     // background; the script gives up by itself after 3 s.
@@ -171,11 +190,10 @@ export function childSettings(input: SettingsInput): Record<string, unknown> {
       async: true,
       timeout: 5,
     };
-    settings.hooks = {
-      PostToolUse: [{ matcher: '*', hooks: [hook] }],
-      PostToolUseFailure: [{ matcher: '*', hooks: [hook] }],
-    };
+    hooks.PostToolUse!.push({ matcher: '*', hooks: [hook] });
+    hooks.PostToolUseFailure!.push({ matcher: '*', hooks: [hook] });
   }
+  settings.hooks = hooks;
   return settings;
 }
 
