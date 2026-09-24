@@ -4,6 +4,10 @@
 //
 // Security boundary: this server declares `claude/channel` only. It never declares
 // `claude/channel/permission`, so no teammate can approve tool use in this session.
+//
+// Only a channel session reads a stream (channel-mode.ts): Claude Code drops channel events in
+// a session started without the channel flag, so a stream read there would acknowledge
+// answers nobody can see. Such a session keeps its tools and says plainly where answers appear.
 
 import { randomUUID } from 'node:crypto';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
@@ -37,6 +41,7 @@ import { envelopeToNotification, neutraliseDeep, RecentIds } from './notify.js';
 import { findCapability, loadManifest, validateManifest, validateParams, codePointLength, hasLoneSurrogate } from './manifest.js';
 import { defaultManifestPath, discoveryPayload, exposedCapabilities, sharesFromEnv } from './exposed.js';
 import { makeLogger } from './log.js';
+import { answersAppearNote, detectChannelSession, notChannelNote } from './channel-mode.js';
 import { ActiveRequests, AnswerDeadlines, deadlineOf } from './active.js';
 import {
   describeError,
@@ -464,9 +469,18 @@ async function streamLoop(
 
 /** What the login tool's result says about the sign-in URL (M5-SPEC §9 item 3). */
 export const SIGN_IN_URL_RULE =
-  'sign_in_url is for the user of this session only: show it to them once, as a link to open themselves if no browser tab opened. ' +
+  'sign_in_url is for the user of this session only: show it to them once, exactly as it is, as plain text on a line of its own ' +
+  '(not as a markdown link), to open themselves if no browser tab opened. ' +
   'Never repeat it to anyone else, never put it in a message to a teammate or in any tool call, and never open or fetch it yourself: ' +
   'whoever finishes the sign-in at that link decides who this computer is signed in as.';
+
+/** How long login_wait waits for the sign-in (TEAM_RELAY_LOGIN_WAIT_SECONDS shortens it, for tests). */
+const LOGIN_WAIT_MS = 180_000;
+
+function loginWaitMs(env: NodeJS.ProcessEnv): number {
+  const v = Number(env.TEAM_RELAY_LOGIN_WAIT_SECONDS);
+  return Number.isInteger(v) && v >= 1 && v * 1000 <= LOGIN_WAIT_MS ? v * 1000 : LOGIN_WAIT_MS;
+}
 
 const SESSION_TOOLS = [
   {
@@ -474,7 +488,14 @@ const SESSION_TOOLS = [
     description:
       'Sign in to the team relay (/team-relay:login). Takes no arguments: the relay is the one this plugin is configured for. ' +
       'Opens the browser on the relay, where the user signs in with Google and picks their team. Returns at once with the sign-in URL ' +
-      '(for the user only, never for anyone else); a status event on this channel says when the sign-in completes.',
+      '(for the user only, never for anyone else); then call login_wait, which says when the sign-in completes.',
+    inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+  },
+  {
+    name: 'login_wait',
+    description:
+      'Wait for the sign-in that login started to finish (at most 3 minutes). Takes no arguments. ' +
+      'Returns "Connected as <member> (<email>) on team <team>", or why the sign-in did not complete.',
     inputSchema: { type: 'object', properties: {}, additionalProperties: false },
   },
   {
@@ -505,6 +526,12 @@ class AskerConnection {
   private wake: (() => void) | null = null;
   private failures = 0;
   private pending: LoginFlow | null = null;
+  /** How the latest sign-in started in this session ends (login_wait), while it runs. */
+  private outcome: Promise<LoginOutcome> | null = null;
+  /** How the latest sign-in in this session ended, once it has. */
+  private lastOutcome: LoginOutcome | null = null;
+  /** Set while connected: what a refused credential does (the stream's 401, or a tool's). */
+  private refused: (() => void) | null = null;
   /** Said plainly after a sign-in in this session changed the member or team. */
   private changed: string | null = null;
   private readonly path: string;
@@ -512,6 +539,8 @@ class AskerConnection {
   constructor(
     private readonly env: NodeJS.ProcessEnv,
     private readonly server: Server,
+    /** Whether this session shows channel events (channel-mode.ts): only then is a stream read. */
+    private readonly channel: boolean,
   ) {
     this.path = credentialsPath(env);
   }
@@ -533,6 +562,8 @@ class AskerConnection {
 
   /** A status line pushed into the session: fixed text and id-shaped values only. */
   private async status(content: string) {
+    // Claude Code drops channel events in a session without the channel: login_wait says it there.
+    if (!this.channel) return;
     try {
       await this.server.notification({ method: 'notifications/claude/channel', params: { content, meta: { type: 'status' } } });
     } catch {
@@ -574,6 +605,12 @@ class AskerConnection {
     this.live.stopper.stop();
     log(`disconnected (${why})`);
     this.live = null;
+    this.refused = null;
+  }
+
+  /** A tool call the relay refused with 401: the same as the stream's 401 (M5-SPEC §6). */
+  unauthorized() {
+    this.refused?.();
   }
 
   private async watch() {
@@ -642,15 +679,19 @@ class AskerConnection {
     const onUnauthorized =
       c.mode === 'credential'
         ? () => {
+            if (this.live?.stopper !== stopper) return;
             this.refusedAt = fp;
             this.disconnect('the relay refused the sign-in');
             void this.status(`team-relay: not connected: ${SIGN_IN_AGAIN}.`);
             this.poke();
           }
         : undefined;
-    void streamLoop(this.server, client, me, 'replies', stopper, undefined, onUnauthorized).catch((err) =>
-      log(`stream loop ended: ${describeError(err)}`),
-    );
+    this.refused = onUnauthorized ?? null;
+    if (this.channel) {
+      void streamLoop(this.server, client, me, 'replies', stopper, undefined, onUnauthorized).catch((err) =>
+        log(`stream loop ended: ${describeError(err)}`),
+      );
+    }
     return 2000;
   }
 
@@ -673,6 +714,7 @@ class AskerConnection {
       return toolError(describeError(err));
     }
     this.pending?.cancel();
+    this.lastOutcome = null;
     let flow: LoginFlow;
     try {
       flow = await startLogin({ relayUrl, credentialsFile: this.path, log });
@@ -680,23 +722,32 @@ class AskerConnection {
       return toolError(err instanceof LoginError ? `not signed in: ${err.message}` : `could not start the sign-in: ${describeError(err)}`);
     }
     this.pending = flow;
-    flow.done.then(
+    const outcome: Promise<LoginOutcome> = flow.done.then(
       ({ stored, replaced }) => {
-        if (this.pending === flow) this.pending = null;
         const change = identityChange(stored, replaced);
         this.changed = change;
         log(`signed in as ${stored.member} in team ${stored.team}${change ? ' (a different member or team than before)' : ''}`);
         this.poke();
         void this.status(`team-relay: ${connectedAs(stored)}. Teammate tools are ready.${change ? ` ${change}` : ''}`);
+        return { ok: true, member: stored.member, team: stored.team, email: stored.email, changed: change };
       },
       (err: unknown) => {
-        if (this.pending === flow) this.pending = null;
         const why = describeError(err);
         log(`sign-in ended: ${why}`);
         // A sign-in replaced by a newer one is not news; anything else is.
-        if (!why.includes(SUPERSEDED)) void this.status(`team-relay: the sign-in did not complete: ${why}.`);
+        const superseded = why.includes(SUPERSEDED);
+        if (!superseded) void this.status(`team-relay: the sign-in did not complete: ${why}.`);
+        return { ok: false, superseded, why };
       },
     );
+    this.outcome = outcome;
+    void outcome.then((o) => {
+      if (this.pending === flow) this.pending = null;
+      if (this.outcome === outcome) {
+        this.outcome = null;
+        if (!(!o.ok && o.superseded)) this.lastOutcome = o;
+      }
+    });
     const envMode = configValue(this.env.RELAY_AUTH);
     return toolJson({
       status: 'waiting_for_browser',
@@ -706,10 +757,80 @@ class AskerConnection {
       expires_in_seconds: 300,
       next:
         'A browser tab should have opened on the relay: the user signs in with Google there and chooses the team. ' +
-        'A status event on this channel says when it is done (or call whoami).',
+        'Show the user sign_in_url as the rule says, then call login_wait (no arguments): it returns when the sign-in completes or fails, and says who you are connected as.',
       ...(envMode && envMode !== 'credential'
         ? { note: `this session signs in with RELAY_AUTH=${envMode} from its environment; restart Claude Code without it to use the new sign-in` }
         : {}),
+    });
+  }
+
+  /**
+   * Wait for the sign-in this session started (login) to complete, fail, or run out of time.
+   * It never depends on channel events reaching the session. `progress` keeps the call alive
+   * in a client that times tool calls out.
+   */
+  async loginWait(args: Record<string, unknown>, progress: (message: string) => void = () => {}): Promise<ToolResult> {
+    const bad = unknownKey(args, []);
+    if (bad) return toolError('login_wait takes no arguments');
+    const waitMs = loginWaitMs(this.env);
+    const deadline = Date.now() + waitMs;
+    const tick = setInterval(() => progress('waiting for the sign-in in the browser'), 15_000);
+    try {
+      for (;;) {
+        const current = this.outcome;
+        if (!current) {
+          if (this.lastOutcome) return await this.reportOutcome(this.lastOutcome, deadline);
+          return toolError('No sign-in is waiting in this session: run /team-relay:login to start one.');
+        }
+        const timedOut = Symbol('timed out');
+        let timer: NodeJS.Timeout | undefined;
+        const result = await Promise.race([
+          current,
+          new Promise<typeof timedOut>((resolve) => {
+            timer = setTimeout(() => resolve(timedOut), Math.max(0, deadline - Date.now()));
+          }),
+        ]).finally(() => clearTimeout(timer));
+        if (result === timedOut) {
+          return toolError(
+            `The sign-in has not completed after ${Math.round(waitMs / 1000)} s. If the user is still in the browser, ` +
+              'they can finish there and you can call login_wait again; otherwise run /team-relay:login to start over.',
+          );
+        }
+        if (!result.ok && result.superseded) {
+          // Replaced by a newer login in this session: wait for that one instead (it is being
+          // started, so give it a moment to appear).
+          const until = Math.min(deadline, Date.now() + 5000);
+          while (Date.now() < until && (!this.outcome || this.outcome === current)) await new Promise((r) => setTimeout(r, 50));
+          if (this.outcome && this.outcome !== current) continue;
+        }
+        return await this.reportOutcome(result, deadline);
+      }
+    } finally {
+      clearInterval(tick);
+    }
+  }
+
+  private async reportOutcome(o: LoginOutcome, deadline: number): Promise<ToolResult> {
+    if (!o.ok) {
+      return toolError(
+        o.superseded
+          ? 'That sign-in was replaced by a newer one: call login_wait again to wait for the newer one.'
+          : `The sign-in did not complete: ${o.why}. Run /team-relay:login to try again.`,
+      );
+    }
+    // The connection picks the new credential up within a moment; wait for it (bounded) so the
+    // teammate tools work as soon as this returns.
+    const until = Math.min(deadline, Date.now() + 5000);
+    while (Date.now() < until && !(this.live && this.live.me.member === o.member && this.live.me.team === o.team)) {
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    return toolJson({
+      connected: true,
+      message: connectedAs(o),
+      member: o.member,
+      team: o.team,
+      ...(o.email ? { email: o.email } : {}),
+      ...(o.changed ? { changed: o.changed } : {}),
     });
   }
 
@@ -750,6 +871,10 @@ class AskerConnection {
   }
 }
 
+type LoginOutcome =
+  | { ok: true; member: string; team: string; email?: string | undefined; changed: string | null }
+  | { ok: false; superseded: boolean; why: string };
+
 const SIGNED_IN_WITH: Record<AuthMode, string> = {
   credential: 'device credential (/team-relay:login)',
   google: 'gcloud identity',
@@ -759,6 +884,35 @@ const SIGNED_IN_WITH: Record<AuthMode, string> = {
 
 // ---------------------------------------------------------------------------------------
 // Main
+
+function instructionsText(role: Role, channel: boolean, env: NodeJS.ProcessEnv): string {
+  if (role === 'answerer') {
+    return channel
+      ? instructionsFor(role)
+      : `${instructionsFor(role)} This session was not started with the relay channel, so no question reaches it; start the answering session with /team-relay:answering.`;
+  }
+  const base = `${instructionsFor(role)} ${STATUS_NOTE}`;
+  if (channel) return base;
+  return (
+    `${base} In this session, tell the user that answers to what they ask appear only in a session started with the channel, ` +
+    'use request_status to see who has acknowledged and answered, and to sign in call login and then login_wait. ' +
+    notChannelNote(env)
+  );
+}
+
+/** A result from a session without the channel: the note as fields (JSON) or a sentence (errors). */
+function withNote(result: ToolResult, note: string, extra: Record<string, unknown>): ToolResult {
+  const text = result.content.map((c) => c.text).join('');
+  if (!result.isError) {
+    try {
+      const value = JSON.parse(text) as unknown;
+      if (isPlainObject(value)) return toolJson({ ...value, ...extra, channel_session: false, channel_note: note });
+    } catch {
+      // not JSON: fall through to the sentence
+    }
+  }
+  return { ...result, content: [{ type: 'text', text: `${text}\n\n${note}` }] };
+}
 
 function fail(message: string): never {
   log(message);
@@ -783,6 +937,10 @@ async function main(): Promise<void> {
   const env = process.env;
   const role = env.RELAY_ROLE;
   if (role !== 'asker' && role !== 'answerer') fail('RELAY_ROLE must be "asker" or "answerer"');
+  // Decided once, before anything reads a stream: a session that cannot show channel events
+  // never polls or acknowledges one.
+  const { channel, reason } = await detectChannelSession({ env, role });
+  log(`${channel ? 'channel session' : 'not a channel session: no stream is read'} (${reason})`);
 
   const waiting = role === 'asker' && usesStoredSignIn(env);
   let fixed: Live | null = null;
@@ -839,21 +997,41 @@ async function main(): Promise<void> {
     { name: 'relay', version: VERSION },
     {
       capabilities: { experimental: { 'claude/channel': {} }, tools: {} },
-      instructions: role === 'asker' ? `${instructionsFor(role)} ${STATUS_NOTE}` : instructionsFor(role),
+      instructions: instructionsText(role, channel, env),
     },
   );
 
-  const connection = role === 'asker' ? new AskerConnection(env, server) : null;
+  const connection = role === 'asker' ? new AskerConnection(env, server, channel) : null;
   const liveNow = (): Live | null => fixed ?? connection?.current() ?? null;
 
   const tools = role === 'asker' ? [...ASKER_TOOLS, ...SESSION_TOOLS] : ANSWERER_TOOLS;
   server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: tools.map((t) => ({ ...t })) }));
-  server.setRequestHandler(CallToolRequestSchema, async (req) => {
+  // A session without the channel says so in every asker tool result, and where answers appear.
+  const note = role === 'asker' && !channel ? notChannelNote(env) : null;
+  const noted = (result: ToolResult, extra: Record<string, unknown> = {}): ToolResult => (note ? withNote(result, note, extra) : result);
+  server.setRequestHandler(CallToolRequestSchema, async (req, extra) => {
     const name = req.params.name;
     const args = req.params.arguments ?? {};
-    if (!isPlainObject(args)) return toolError('arguments must be an object');
+    if (!isPlainObject(args)) return noted(toolError('arguments must be an object'));
+    const result = await callTool(name, args, extra);
+    if (name === 'ask_question' || name === 'invoke_capability') return noted(result, { where_answers_appear: answersAppearNote(env) });
+    return noted(result);
+  });
+
+  type Extra = { _meta?: { progressToken?: string | number }; sendNotification: (n: { method: 'notifications/progress'; params: { progressToken: string | number; progress: number; message?: string } }) => Promise<void> };
+  async function callTool(name: string, args: Record<string, unknown>, extra: Extra): Promise<ToolResult> {
     try {
       if (role === 'asker') {
+        if (name === 'login_wait') {
+          if (!connection) return toolError('this session signs in with RELAY_AUTH from its environment; unset it and restart Claude Code to use /team-relay:login');
+          const token = extra._meta?.progressToken;
+          let n = 0;
+          const progress = (message: string) => {
+            if (token === undefined) return;
+            void extra.sendNotification({ method: 'notifications/progress', params: { progressToken: token, progress: ++n, message } }).catch(() => {});
+          };
+          return await connection.loginWait(args, progress);
+        }
         if (name === 'login' || name === 'whoami') {
           if (!connection) {
             if (name === 'whoami' && fixed) {
@@ -893,9 +1071,11 @@ async function main(): Promise<void> {
       }
       return toolError(`unknown tool: ${name}`);
     } catch (err) {
+      // Without a stream loop, a tool call is where a refused credential shows first.
+      if (err instanceof RelayError && err.status === 401) connection?.unauthorized();
       return toolError(describeError(err));
     }
-  });
+  }
 
   const stopper = new Stopper();
   let loop: Promise<void> | undefined;
@@ -904,7 +1084,7 @@ async function main(): Promise<void> {
       connection.start();
       return;
     }
-    if (!fixed) return;
+    if (!fixed || !channel) return;
     // The answerer remembers each pushed request's answer deadline for active.json (§7.6).
     const onPushed = (e: Envelope) => deadlines.remember(e.request_id, e.data?.answer_deadline);
     const stream: StreamName = role === 'asker' ? 'replies' : 'inbox';

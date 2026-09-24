@@ -1,4 +1,5 @@
 // The M1 gate (M1-SPEC §9): seven scenarios against a real relay on the Firestore emulator,
+// and an eighth for a working session started without the channel (it must never consume),
 // driving the bundled servers over stdio the way Claude Code would. Run through
 // scripts/e2e.sh (it sets E2E=1, RELAY_URL and the E2E_TOKEN_* values); `pnpm test` never
 // includes this directory.
@@ -38,6 +39,7 @@ let bob: Party; // bob's answering session (answerer)
 let carol: Party; // carol's answering session (answerer)
 let bobCaps: Party; // bob's capability server
 const aliceProcesses: Party[] = [];
+let quiet: Party | undefined; // scenario 8: alice's session without the channel (TEAM_RELAY_CHANNEL=0)
 let broadcastRequestId = ''; // scenario 2's broadcast question, reused by scenario 3's binding checks
 
 // member -> the notifications that member's session is expected to receive, as
@@ -110,7 +112,7 @@ describe.skipIf(!ENABLED)('M1 end to end (relay + Firestore emulator + bundled s
   });
 
   afterAll(async () => {
-    await Promise.all([...aliceProcesses, bob, carol, bobCaps].filter(Boolean).map((p) => p.close()));
+    await Promise.all([...aliceProcesses, bob, carol, bobCaps, quiet].filter((p): p is Party => Boolean(p)).map((p) => p.close()));
   });
 
   it('0. the servers are what Claude Code expects: channel capability only, the right tools, discovery published', async () => {
@@ -121,7 +123,7 @@ describe.skipIf(!ENABLED)('M1 end to end (relay + Firestore emulator + bundled s
     }
     const askerTools = (await alice.client.listTools()).tools.map((t) => t.name).sort();
     // M5-SPEC §6: login and whoami join the asker's tools; §9 item 2: logout is not a tool.
-    expect(askerTools).toEqual(['ask_question', 'invoke_capability', 'list_teammates', 'login', 'request_status', 'whoami']);
+    expect(askerTools).toEqual(['ask_question', 'invoke_capability', 'list_teammates', 'login', 'login_wait', 'request_status', 'whoami']);
     const answererTools = (await bob.client.listTools()).tools.map((t) => t.name).sort();
     expect(answererTools).toEqual(['ack_question', 'reply']);
     expect((await bobCaps.client.listTools()).tools.map((t) => t.name)).toEqual(['staging_db_query']);
@@ -487,6 +489,46 @@ describe.skipIf(!ENABLED)('M1 end to end (relay + Firestore emulator + bundled s
     expect(a.meta).toEqual({ type: 'answer', request_id: requestId, from: 'carol', message_id: messageId });
   });
 
+  it('8. a session without the channel (TEAM_RELAY_CHANNEL=0) never reads or acknowledges replies: the answer waits for a channel session', async () => {
+    const before = await drained('alice', 'replies');
+    // alice's channel session goes away; a session without the channel is all she has running.
+    const dead = alice;
+    await dead.crash();
+    quiet = await Party.start('alice-no-channel', 'channel.js', channelEnv('alice', 'asker', { TEAM_RELAY_CHANNEL: '0' }));
+    expect(quiet.client.getInstructions()).toMatch(/This session was not started with the team-relay channel/);
+
+    // Its tools work, and say where the answer will appear.
+    const asked = await quiet.ok('ask_question', { to: ['bob'], question: 'Asked from a session without the channel: does the answer wait?' });
+    const requestId = asked.request_id as string;
+    expect(requestId).toMatch(REQUEST_ID_RE);
+    expect(asked.channel_session).toBe(false);
+    expect(String(asked.channel_note)).toMatch(/Start one with: claude --dangerously-load-development-channels plugin:team-relay@/);
+    expect(String(asked.where_answers_appear)).toMatch(/The answer is not shown in this session/);
+    expectNote('bob', requestId, 'question', 'alice');
+    expectNote('alice', requestId, 'answer', 'bob');
+
+    await bob.waitNote((n) => n.meta.request_id === requestId, DELIVERY_MS, 'the question');
+    const messageId = await answer(bob, requestId, 'Yes: it waits in your replies stream.');
+
+    // The answer is stored past alice's cursor and stays there: nothing read or acked it.
+    await sleep(SETTLE_MS);
+    expect(await streamPosition('alice', 'replies')).toEqual({ cursor: before.cursor, head: before.head + 1 });
+    expect(quiet.notes).toEqual([]);
+    const status = await quiet.ok('request_status', { request_id: requestId });
+    expect((status.recipients as Record<string, { status: string }>).bob!.status).toBe('answered');
+
+    // A channel session started beside it gets the answer, once; the quiet one still gets nothing.
+    alice = await startAlice();
+    const a = await alice.waitNote((n) => n.meta.request_id === requestId, DELIVERY_MS, 'the answer in the channel session');
+    expect(a.meta).toEqual({ type: 'answer', request_id: requestId, from: 'bob', message_id: messageId });
+    expect(a.content).toBe('Yes: it waits in your replies stream.');
+    await sleep(SETTLE_MS);
+    expect(alice.forRequest(requestId)).toHaveLength(1);
+    expect(await drained('alice', 'replies')).toEqual({ cursor: before.head + 1, head: before.head + 1 });
+    expect(quiet.notes).toEqual([]);
+    expect(quiet.stderr()).toMatch(/not a channel session: no stream is read \(TEAM_RELAY_CHANNEL=0\)/);
+  });
+
   it('every session received exactly the notifications the scenarios expected, each once, and no progress ever', async () => {
     await sleep(SETTLE_MS);
     const actual: Record<Member, Note[]> = { alice: aliceNotes(), bob: bob.notes, carol: carol.notes };
@@ -509,7 +551,7 @@ describe.skipIf(!ENABLED)('M1 end to end (relay + Firestore emulator + bundled s
       expect(pos.cursor, `${member}/${stream}`).toBe(pos.head);
     }
     // The token never reaches a server's log.
-    for (const p of [...aliceProcesses, bob, carol, bobCaps]) {
+    for (const p of [...aliceProcesses, bob, carol, bobCaps, ...(quiet ? [quiet] : [])]) {
       for (const m of ['alice', 'bob', 'carol'] as const) {
         if (p.stderr().includes(tokenOf(m))) throw new Error(`${p.label}'s stderr contains a token`);
       }

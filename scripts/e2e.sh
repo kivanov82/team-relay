@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # The M1 end-to-end gate (docs/M1-SPEC.md §9), and the plugin side of the M2 scenarios
-# (docs/M2-SPEC.md §6) when the relay serves them. Starts a throwaway Firestore emulator
+# (docs/M2-SPEC.md §6) when the relay serves them. The harness plays Claude Code sessions
+# started with the channel, so every channel server it expects to read a stream gets
+# TEAM_RELAY_CHANNEL=1 (there is no claude process for it to find); M1 scenario 8 runs a
+# working session with TEAM_RELAY_CHANNEL=0 and checks it never reads or acknowledges a stream. Starts a throwaway Firestore emulator
 # (Docker, 127.0.0.1:8682, container ma-fs-e2e), writes a throwaway team config for team
 # "demo" (alice, bob, carol, each with a fresh random static token stored only as its
 # SHA-256), starts the relay on a free 127.0.0.1 port with RELAY_AUTH_MODE=static, builds
@@ -16,7 +19,8 @@
 # provider on the same 127.0.0.1 port; static tokens still work), the team file names alice
 # as the seed owner and gives each member a synthetic Google email, and test/e2e/m5.test.ts
 # runs when the relay answers GET /v1/login/start with 400: the whole sign-in through the real
-# login tool (no arguments; RELAY_URL names the relay) with a stub browser, streams with the
+# login tool (no arguments; RELAY_URL names the relay) with a stub browser, confirmed by the
+# login_wait tool (and by the status event, in a channel session), streams with the
 # stored credential, /team-relay:logout (dist/logout.js), an owner adding
 # a member through the console server, the new member signing in and appearing in the
 # directory, and removal refusing them within 30 s.

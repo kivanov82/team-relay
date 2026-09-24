@@ -133,6 +133,9 @@ describe('bin/answerer --print-command', () => {
       CAP_STAGING_DB_QUERY_ENABLED: 'true',
       CAP_STAGING_DB_QUERY_RUNNER: '/opt/runners/staging db query',
     });
+    // The answering session is started with the relay channel: its channel server is told so.
+    expect(relay.env.TEAM_RELAY_CHANNEL).toBe('1');
+    expect(capabilities.env.TEAM_RELAY_CHANNEL).toBeUndefined();
     expect(relay.env.RELAY_TOKEN).toBeUndefined();
     expect(capabilities.env.RELAY_TOKEN).toBeUndefined();
     expect(capabilities.env.RELAY_ROLE).toBeUndefined();
@@ -566,6 +569,11 @@ describe('bin/answerer session files drive working servers', () => {
       const res = await capClient!.callTool({ name: 'staging_db_query', arguments: { dataset: 'users', request_id } });
       expect(JSON.parse(textOf(res)).rows.length).toBeGreaterThan(0);
       expect(relay.progress).toHaveLength(2);
+      // TEAM_RELAY_CHANNEL=1 from mcp.json: the channel server reads bob's inbox without looking
+      // for a claude process (there is none here).
+      const deadline = Date.now() + 5000;
+      while (!relay.requests.some((q) => q.path === '/v1/teams/demo/streams/inbox') && Date.now() < deadline) await new Promise((r) => setTimeout(r, 50));
+      expect(relay.requests.some((q) => q.path === '/v1/teams/demo/streams/inbox')).toBe(true);
       expect(relay.requests.every((q) => q.member === 'bob')).toBe(true);
     } finally {
       for (const c of clients) await c.close().catch(() => {});

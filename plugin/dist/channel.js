@@ -3880,10 +3880,10 @@ var require_fast_uri = __commonJS({
       schemelessOptions.skipEscape = true;
       return serialize(resolved, schemelessOptions);
     }
-    function resolveComponent(base, relative, options, skipNormalization) {
+    function resolveComponent(base2, relative, options, skipNormalization) {
       const target = {};
       if (!skipNormalization) {
-        base = parse3(serialize(base, options), options);
+        base2 = parse3(serialize(base2, options), options);
         relative = parse3(serialize(relative, options), options);
       }
       options = options || {};
@@ -3903,32 +3903,32 @@ var require_fast_uri = __commonJS({
           target.query = relative.query;
         } else {
           if (!relative.path) {
-            target.path = base.path;
+            target.path = base2.path;
             if (relative.query !== void 0) {
               target.query = relative.query;
             } else {
-              target.query = base.query;
+              target.query = base2.query;
             }
           } else {
             if (relative.path[0] === "/") {
               target.path = removeDotSegments(relative.path);
             } else {
-              if ((base.userinfo !== void 0 || base.host !== void 0 || base.port !== void 0) && !base.path) {
+              if ((base2.userinfo !== void 0 || base2.host !== void 0 || base2.port !== void 0) && !base2.path) {
                 target.path = "/" + relative.path;
-              } else if (!base.path) {
+              } else if (!base2.path) {
                 target.path = relative.path;
               } else {
-                target.path = base.path.slice(0, base.path.lastIndexOf("/") + 1) + relative.path;
+                target.path = base2.path.slice(0, base2.path.lastIndexOf("/") + 1) + relative.path;
               }
               target.path = removeDotSegments(target.path);
             }
             target.query = relative.query;
           }
-          target.userinfo = base.userinfo;
-          target.host = base.host;
-          target.port = base.port;
+          target.userinfo = base2.userinfo;
+          target.host = base2.host;
+          target.port = base2.port;
         }
-        target.scheme = base.scheme;
+        target.scheme = base2.scheme;
       }
       target.fragment = relative.fragment;
       return target;
@@ -11168,10 +11168,10 @@ var require_resolve_block_map = __commonJS({
       let offset = bm.offset;
       let commentEnd = null;
       for (const collItem of bm.items) {
-        const { start, key, sep, value } = collItem;
+        const { start, key, sep: sep2, value } = collItem;
         const keyProps = resolveProps.resolveProps(start, {
           indicator: "explicit-key-ind",
-          next: key ?? sep?.[0],
+          next: key ?? sep2?.[0],
           offset,
           onError,
           parentIndent: bm.indent,
@@ -11185,7 +11185,7 @@ var require_resolve_block_map = __commonJS({
             else if ("indent" in key && key.indent !== bm.indent)
               onError(offset, "BAD_INDENT", startColMsg);
           }
-          if (!keyProps.anchor && !keyProps.tag && !sep) {
+          if (!keyProps.anchor && !keyProps.tag && !sep2) {
             commentEnd = keyProps.end;
             if (keyProps.comment) {
               if (map.comment)
@@ -11209,7 +11209,7 @@ var require_resolve_block_map = __commonJS({
         ctx.atKey = false;
         if (utilMapIncludes.mapIncludes(ctx, map.items, keyNode))
           onError(keyStart, "DUPLICATE_KEY", "Map keys must be unique");
-        const valueProps = resolveProps.resolveProps(sep ?? [], {
+        const valueProps = resolveProps.resolveProps(sep2 ?? [], {
           indicator: "map-value-ind",
           next: value,
           offset: keyNode.range[2],
@@ -11225,7 +11225,7 @@ var require_resolve_block_map = __commonJS({
             if (ctx.options.strict && keyProps.start < valueProps.found.offset - 1024)
               onError(keyNode.range, "KEY_OVER_1024_CHARS", "The : indicator must be at most 1024 chars after the start of an implicit block mapping key");
           }
-          const valueNode = value ? composeNode(ctx, value, valueProps, onError) : composeEmptyNode(ctx, offset, sep, null, valueProps, onError);
+          const valueNode = value ? composeNode(ctx, value, valueProps, onError) : composeEmptyNode(ctx, offset, sep2, null, valueProps, onError);
           if (ctx.schema.compat)
             utilFlowIndentCheck.flowIndentCheck(bm.indent, value, onError);
           offset = valueNode.range[2];
@@ -11316,7 +11316,7 @@ var require_resolve_end = __commonJS({
       let comment = "";
       if (end) {
         let hasSpace = false;
-        let sep = "";
+        let sep2 = "";
         for (const token of end) {
           const { source, type } = token;
           switch (type) {
@@ -11330,13 +11330,13 @@ var require_resolve_end = __commonJS({
               if (!comment)
                 comment = cb;
               else
-                comment += sep + cb;
-              sep = "";
+                comment += sep2 + cb;
+              sep2 = "";
               break;
             }
             case "newline":
               if (comment)
-                sep += source;
+                sep2 += source;
               hasSpace = true;
               break;
             default:
@@ -11379,18 +11379,18 @@ var require_resolve_flow_collection = __commonJS({
       let offset = fc.offset + fc.start.source.length;
       for (let i = 0; i < fc.items.length; ++i) {
         const collItem = fc.items[i];
-        const { start, key, sep, value } = collItem;
+        const { start, key, sep: sep2, value } = collItem;
         const props = resolveProps.resolveProps(start, {
           flow: fcName,
           indicator: "explicit-key-ind",
-          next: key ?? sep?.[0],
+          next: key ?? sep2?.[0],
           offset,
           onError,
           parentIndent: fc.indent,
           startOnNewline: false
         });
         if (!props.found) {
-          if (!props.anchor && !props.tag && !sep && !value) {
+          if (!props.anchor && !props.tag && !sep2 && !value) {
             if (i === 0 && props.comma)
               onError(props.comma, "UNEXPECTED_TOKEN", `Unexpected , in ${fcName}`);
             else if (i < fc.items.length - 1)
@@ -11444,8 +11444,8 @@ var require_resolve_flow_collection = __commonJS({
             }
           }
         }
-        if (!isMap && !sep && !props.found) {
-          const valueNode = value ? composeNode(ctx, value, props, onError) : composeEmptyNode(ctx, props.end, sep, null, props, onError);
+        if (!isMap && !sep2 && !props.found) {
+          const valueNode = value ? composeNode(ctx, value, props, onError) : composeEmptyNode(ctx, props.end, sep2, null, props, onError);
           coll.items.push(valueNode);
           offset = valueNode.range[2];
           if (isBlock(value))
@@ -11457,7 +11457,7 @@ var require_resolve_flow_collection = __commonJS({
           if (isBlock(key))
             onError(keyNode.range, "BLOCK_IN_FLOW", blockMsg);
           ctx.atKey = false;
-          const valueProps = resolveProps.resolveProps(sep ?? [], {
+          const valueProps = resolveProps.resolveProps(sep2 ?? [], {
             flow: fcName,
             indicator: "map-value-ind",
             next: value,
@@ -11468,8 +11468,8 @@ var require_resolve_flow_collection = __commonJS({
           });
           if (valueProps.found) {
             if (!isMap && !props.found && ctx.options.strict) {
-              if (sep)
-                for (const st of sep) {
+              if (sep2)
+                for (const st of sep2) {
                   if (st === valueProps.found)
                     break;
                   if (st.type === "newline") {
@@ -11486,7 +11486,7 @@ var require_resolve_flow_collection = __commonJS({
             else
               onError(valueProps.start, "MISSING_CHAR", `Missing , or : between ${fcName} items`);
           }
-          const valueNode = value ? composeNode(ctx, value, valueProps, onError) : valueProps.found ? composeEmptyNode(ctx, valueProps.end, sep, null, valueProps, onError) : null;
+          const valueNode = value ? composeNode(ctx, value, valueProps, onError) : valueProps.found ? composeEmptyNode(ctx, valueProps.end, sep2, null, valueProps, onError) : null;
           if (valueNode) {
             if (isBlock(value))
               onError(valueNode.range, "BLOCK_IN_FLOW", blockMsg);
@@ -11666,7 +11666,7 @@ var require_resolve_block_scalar = __commonJS({
           chompStart = i + 1;
       }
       let value = "";
-      let sep = "";
+      let sep2 = "";
       let prevMoreIndented = false;
       for (let i = 0; i < contentStart; ++i)
         value += lines[i][0].slice(trimIndent) + "\n";
@@ -11683,24 +11683,24 @@ var require_resolve_block_scalar = __commonJS({
           indent = "";
         }
         if (type === Scalar.Scalar.BLOCK_LITERAL) {
-          value += sep + indent.slice(trimIndent) + content;
-          sep = "\n";
+          value += sep2 + indent.slice(trimIndent) + content;
+          sep2 = "\n";
         } else if (indent.length > trimIndent || content[0] === "	") {
-          if (sep === " ")
-            sep = "\n";
-          else if (!prevMoreIndented && sep === "\n")
-            sep = "\n\n";
-          value += sep + indent.slice(trimIndent) + content;
-          sep = "\n";
+          if (sep2 === " ")
+            sep2 = "\n";
+          else if (!prevMoreIndented && sep2 === "\n")
+            sep2 = "\n\n";
+          value += sep2 + indent.slice(trimIndent) + content;
+          sep2 = "\n";
           prevMoreIndented = true;
         } else if (content === "") {
-          if (sep === "\n")
+          if (sep2 === "\n")
             value += "\n";
           else
-            sep = "\n";
+            sep2 = "\n";
         } else {
-          value += sep + content;
-          sep = " ";
+          value += sep2 + content;
+          sep2 = " ";
           prevMoreIndented = false;
         }
       }
@@ -11883,25 +11883,25 @@ var require_resolve_flow_scalar = __commonJS({
         trimBoth = /^[ \t]+|[ \t]+$/g;
       }
       let res = match[1].replace(trimEnd, "");
-      let sep = " ";
+      let sep2 = " ";
       let pos = line.lastIndex;
       while (match = line.exec(source)) {
         const lm = match[1].replace(trimBoth, "");
         if (lm === "") {
-          if (sep === "\n")
-            res += sep;
+          if (sep2 === "\n")
+            res += sep2;
           else
-            sep = "\n";
+            sep2 = "\n";
         } else {
-          res += sep + lm;
-          sep = " ";
+          res += sep2 + lm;
+          sep2 = " ";
         }
         pos = line.lastIndex;
       }
       const last = /[ \t]*(.*)/sy;
       last.lastIndex = pos;
       match = last.exec(source);
-      return res + sep + (match?.[1] ?? "");
+      return res + sep2 + (match?.[1] ?? "");
     }
     function doubleQuotedValue(source, onError) {
       let res = "";
@@ -12711,14 +12711,14 @@ var require_cst_stringify = __commonJS({
         }
       }
     }
-    function stringifyItem({ start, key, sep, value }) {
+    function stringifyItem({ start, key, sep: sep2, value }) {
       let res = "";
       for (const st of start)
         res += st.source;
       if (key)
         res += stringifyToken(key);
-      if (sep)
-        for (const st of sep)
+      if (sep2)
+        for (const st of sep2)
           res += st.source;
       if (value)
         res += stringifyToken(value);
@@ -13885,18 +13885,18 @@ var require_parser = __commonJS({
         if (this.type === "map-value-ind") {
           const prev = getPrevProps(this.peek(2));
           const start = getFirstKeyStartProps(prev);
-          let sep;
+          let sep2;
           if (scalar.end) {
-            sep = scalar.end;
-            sep.push(this.sourceToken);
+            sep2 = scalar.end;
+            sep2.push(this.sourceToken);
             delete scalar.end;
           } else
-            sep = [this.sourceToken];
+            sep2 = [this.sourceToken];
           const map = {
             type: "block-map",
             offset: scalar.offset,
             indent: scalar.indent,
-            items: [{ start, key: scalar, sep }]
+            items: [{ start, key: scalar, sep: sep2 }]
           };
           this.onKeyLine = true;
           this.stack[this.stack.length - 1] = map;
@@ -14049,15 +14049,15 @@ var require_parser = __commonJS({
                 } else if (isFlowToken(it.key) && !includesToken(it.sep, "newline")) {
                   const start2 = getFirstKeyStartProps(it.start);
                   const key = it.key;
-                  const sep = it.sep;
-                  sep.push(this.sourceToken);
+                  const sep2 = it.sep;
+                  sep2.push(this.sourceToken);
                   delete it.key;
                   delete it.sep;
                   this.stack.push({
                     type: "block-map",
                     offset: this.offset,
                     indent: this.indent,
-                    items: [{ start: start2, key, sep }]
+                    items: [{ start: start2, key, sep: sep2 }]
                   });
                 } else if (start.length > 0) {
                   it.sep = it.sep.concat(start, this.sourceToken);
@@ -14251,13 +14251,13 @@ var require_parser = __commonJS({
             const prev = getPrevProps(parent);
             const start = getFirstKeyStartProps(prev);
             fixFlowSeqItems(fc);
-            const sep = fc.end.splice(1, fc.end.length);
-            sep.push(this.sourceToken);
+            const sep2 = fc.end.splice(1, fc.end.length);
+            sep2.push(this.sourceToken);
             const map = {
               type: "block-map",
               offset: fc.offset,
               indent: fc.indent,
-              items: [{ start, key: fc, sep }]
+              items: [{ start, key: fc, sep: sep2 }]
             };
             this.onKeyLine = true;
             this.stack[this.stack.length - 1] = map;
@@ -18838,14 +18838,14 @@ var memo = {
     var _a3;
     (_a3 = inst._zod).deferred ?? (_a3.deferred = []);
     inst._zod.deferred.push(() => {
-      const base = inst._zod.parse;
+      const base2 = inst._zod.parse;
       const wrapped = (payload, ctx) => {
         if (ctx.direction !== "backward" && isBackEdge(ctx, payload.value))
           throw new $ZodCyclicError();
-        return base(payload, ctx);
+        return base2(payload, ctx);
       };
       inst._zod.parse = wrapped;
-      if (inst._zod.run === base)
+      if (inst._zod.run === base2)
         inst._zod.run = wrapped;
     });
   },
@@ -18857,15 +18857,15 @@ var memo = {
     let lastBucket;
     (_a3 = inst._zod).deferred ?? (_a3.deferred = []);
     inst._zod.deferred.push(() => {
-      const base = inst._zod.parse;
+      const base2 = inst._zod.parse;
       const wrapped = (payload, ctx) => {
         if (isRecursiveInst === void 0) {
           const walked = isRecursive(inst, /* @__PURE__ */ new Set(), false);
           if (walked === NONE) {
-            inst._zod.parse = base;
+            inst._zod.parse = base2;
             if (inst._zod.run === wrapped)
-              inst._zod.run = base;
-            return base(payload, ctx);
+              inst._zod.run = base2;
+            return base2(payload, ctx);
           }
           if (walked === PROVEN || rechecked)
             isRecursiveInst = true;
@@ -18874,7 +18874,7 @@ var memo = {
         }
         const input = payload.value;
         if (!isRef(input))
-          return base(payload, ctx);
+          return base2(payload, ctx);
         let state = ctx[STATE];
         if (!state) {
           state = { buckets: /* @__PURE__ */ new WeakMap(), backEdges: void 0 };
@@ -18903,7 +18903,7 @@ var memo = {
         }
         handoff = bucket;
         const depth = open.length;
-        const result = base(payload, ctx);
+        const result = base2(payload, ctx);
         handoff = void 0;
         const entry = open.length > depth ? open.pop() : void 0;
         if (result instanceof Promise) {
@@ -18918,7 +18918,7 @@ var memo = {
         return result;
       };
       inst._zod.parse = wrapped;
-      if (inst._zod.run === base)
+      if (inst._zod.run === base2)
         inst._zod.run = wrapped;
     });
   }
@@ -24275,8 +24275,8 @@ var Protocol = class {
 function isPlainObject2(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
-function mergeCapabilities(base, additional) {
-  const result = { ...base };
+function mergeCapabilities(base2, additional) {
+  const result = { ...base2 };
   for (const key in additional) {
     const k = key;
     const addValue = additional[k];
@@ -25146,8 +25146,8 @@ function credentialsPath(env = process.env) {
     return explicit;
   }
   const xdg = env.XDG_CONFIG_HOME?.trim();
-  const base = xdg && isAbsolute(xdg) ? xdg : join(env.HOME?.trim() || homedir(), ".config");
-  return join(base, CREDENTIALS_DIR, CREDENTIALS_FILE);
+  const base2 = xdg && isAbsolute(xdg) ? xdg : join(env.HOME?.trim() || homedir(), ".config");
+  return join(base2, CREDENTIALS_DIR, CREDENTIALS_FILE);
 }
 function uid() {
   return typeof process.getuid === "function" ? process.getuid() : null;
@@ -25568,9 +25568,9 @@ var RelayClient = class {
   constructor(opts) {
     if (!TEAM_RE.test(opts.team)) throw new Error("RELAY_TEAM is not a valid team id");
     this.team = opts.team;
-    const base = parseRelayUrl(opts.url);
-    if (!base.pathname.endsWith("/")) base.pathname += "/";
-    this.base = base;
+    const base2 = parseRelayUrl(opts.url);
+    if (!base2.pathname.endsWith("/")) base2.pathname += "/";
+    this.base = base2;
     this.token = opts.token;
     this.backoff = opts.backoff ?? DEFAULT_BACKOFF;
     this.attempts = Math.max(1, opts.attempts ?? 4);
@@ -25932,8 +25932,8 @@ async function startLogin(opts) {
   const relay = parseRelayUrl(opts.relayUrl);
   const relayNorm = normaliseRelayUrl(opts.relayUrl);
   replaceableCredential(opts.credentialsFile, relayNorm);
-  const base = new URL(relay.toString());
-  if (!base.pathname.endsWith("/")) base.pathname += "/";
+  const base2 = new URL(relay.toString());
+  if (!base2.pathname.endsWith("/")) base2.pathname += "/";
   const device = opts.device ?? deviceLabel();
   if (!DEVICE_RE.test(device)) throw new LoginError("the device label is not valid");
   const verifier = base64url2(randomBytes2(48));
@@ -25972,7 +25972,7 @@ async function startLogin(opts) {
   let port = 0;
   let used = false;
   const discard = (credential, team) => {
-    void doFetch(new URL(`v1/teams/${team}/credentials/self`, base).toString(), {
+    void doFetch(new URL(`v1/teams/${team}/credentials/self`, base2).toString(), {
       method: "DELETE",
       headers: { Authorization: `Bearer ${credential}`, Accept: "application/json", "User-Agent": "team-relay-plugin/0.1.0" },
       redirect: "error",
@@ -25986,7 +25986,7 @@ async function startLogin(opts) {
   const exchange = async (code) => {
     let res;
     try {
-      res = await doFetch(new URL("v1/login/token", base).toString(), {
+      res = await doFetch(new URL("v1/login/token", base2).toString(), {
         method: "POST",
         headers: { "Content-Type": "application/json", Accept: "application/json", "User-Agent": "team-relay-plugin/0.1.0" },
         body: JSON.stringify({ code, code_verifier: verifier }),
@@ -26101,7 +26101,7 @@ async function startLogin(opts) {
     });
   });
   port = server.address().port;
-  const start = new URL("v1/login/start", base);
+  const start = new URL("v1/login/start", base2);
   start.searchParams.set("port", String(port));
   start.searchParams.set("state", state);
   start.searchParams.set("code_challenge", challenge);
@@ -26160,7 +26160,7 @@ function envelopeToNotification(env, expect) {
   if (!STREAM_TYPES[expect.stream].has(env.type)) return { reject: `type ${String(env.type)} is not pushed on ${expect.stream}` };
   const data = typeof env.data === "object" && env.data !== null ? env.data : {};
   const from = str(env.from) ?? "";
-  const base = { type: env.type, request_id: env.request_id, message_id: env.id };
+  const base2 = { type: env.type, request_id: env.request_id, message_id: env.id };
   switch (env.type) {
     case "question": {
       if (!MEMBER_RE.test(from)) return { reject: "bad sender" };
@@ -26170,7 +26170,7 @@ function envelopeToNotification(env, expect) {
       if (!RFC33392.test(ackDeadline)) return { reject: "bad ack_deadline" };
       return {
         content: neutraliseChannelTags(question),
-        meta: { ...base, from, ack_deadline: ackDeadline, broadcast: env.broadcast === true ? "true" : "false" }
+        meta: { ...base2, from, ack_deadline: ackDeadline, broadcast: env.broadcast === true ? "true" : "false" }
       };
     }
     case "capability_call": {
@@ -26183,7 +26183,7 @@ function envelopeToNotification(env, expect) {
       return {
         content: neutraliseChannelTags(`${from} asks you to run ${capability} with ${JSON.stringify(params)}`),
         meta: {
-          ...base,
+          ...base2,
           from,
           ack_deadline: ackDeadline,
           broadcast: env.broadcast === true ? "true" : "false",
@@ -26201,14 +26201,14 @@ function envelopeToNotification(env, expect) {
 
 ${truncateUtf8(JSON.stringify(data.data), DATA_JSON_LIMIT)}`;
       }
-      return { content: neutraliseChannelTags(content), meta: { ...base, from } };
+      return { content: neutraliseChannelTags(content), meta: { ...base2, from } };
     }
     case "no_response":
     case "timed_out": {
       const member = str(data.member) ?? "";
       if (!MEMBER_RE.test(member)) return { reject: "bad member" };
       const detail = str(data.detail) ?? (env.type === "no_response" ? `No response yet from ${member}.` : `${member} acknowledged but has not answered yet.`);
-      return { content: neutraliseChannelTags(detail), meta: { ...base, member } };
+      return { content: neutraliseChannelTags(detail), meta: { ...base2, member } };
     }
     default:
       return { reject: "unknown type" };
@@ -27871,15 +27871,15 @@ var Inst = class Inst2 {
       }
       return false;
     }
-    let base = 0;
+    let base2 = 0;
     let n = len >> 1;
     while (n > 1) {
       const half = n >> 1;
-      base += this.runes[base + half << 1] <= r ? half : 0;
+      base2 += this.runes[base2 + half << 1] <= r ? half : 0;
       n -= half;
     }
-    base += this.runes[base << 1] <= r ? 1 : 0;
-    const m = base - 1;
+    base2 += this.runes[base2 << 1] <= r ? 1 : 0;
+    const m = base2 - 1;
     return m >= 0 && r <= this.runes[m << 1 | 1];
   }
   matchRunePos(r) {
@@ -27897,15 +27897,15 @@ var Inst = class Inst2 {
       }
       return -1;
     }
-    let base = 0;
+    let base2 = 0;
     let n = len >> 1;
     while (n > 1) {
       const half = n >> 1;
-      base += this.runes[base + half << 1] <= r ? half : 0;
+      base2 += this.runes[base2 + half << 1] <= r ? half : 0;
       n -= half;
     }
-    base += this.runes[base << 1] <= r ? 1 : 0;
-    const m = base - 1;
+    base2 += this.runes[base2 << 1] <= r ? 1 : 0;
+    const m = base2 - 1;
     return m >= 0 && r <= this.runes[m << 1 | 1] ? m : -1;
   }
   /**
@@ -29221,10 +29221,10 @@ var Regexp = class Regexp2 {
         else out += sub.appendTo();
         break;
       case Regexp2.Op.ALTERNATE: {
-        let sep = "";
+        let sep2 = "";
         for (let sub of this.subs) {
-          out += sep;
-          sep = "|";
+          out += sep2;
+          sep2 = "|";
           out += sub.appendTo();
         }
         break;
@@ -32988,6 +32988,151 @@ function makeLogger(component) {
   };
 }
 
+// src/channel-mode.ts
+import { execFile as execFile3 } from "node:child_process";
+import { readFile } from "node:fs/promises";
+import { dirname as dirname2, sep } from "node:path";
+import { fileURLToPath as fileURLToPath3 } from "node:url";
+var CHANNEL_FLAGS = ["--dangerously-load-development-channels", "--channels"];
+var MAX_ANCESTORS = 4;
+var DEFAULT_PLUGIN = "team-relay";
+var DEFAULT_MARKETPLACE = "team-relay-dev";
+var NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+function channelEntries(argv) {
+  const out = [];
+  const add = (value) => {
+    for (const part of value.split(/[,\s]+/)) if (part) out.push(part);
+  };
+  for (let i = 1; i < argv.length; i++) {
+    const tok = argv[i];
+    if (tok === "--") break;
+    const eq = CHANNEL_FLAGS.find((f) => tok.startsWith(`${f}=`));
+    if (eq) {
+      add(tok.slice(eq.length + 1));
+      continue;
+    }
+    if (!CHANNEL_FLAGS.includes(tok)) continue;
+    while (i + 1 < argv.length && !argv[i + 1].startsWith("-")) add(argv[++i]);
+  }
+  return out;
+}
+function entryLoads(entry, role, plugin = DEFAULT_PLUGIN) {
+  if (role === "answerer") return entry === "server:relay";
+  const prefix = `plugin:${plugin}@`;
+  return entry.startsWith(prefix) && entry.length > prefix.length;
+}
+function argvLoadsChannel(argv, role, plugin = DEFAULT_PLUGIN) {
+  return channelEntries(argv).some((e) => entryLoads(e, role, plugin));
+}
+var base = (p) => p.split(/[\\/]/).pop() ?? "";
+function isClaudeArgv(argv) {
+  const a0 = base(argv[0] ?? "");
+  if (/^claude(\.exe)?$/i.test(a0)) return true;
+  if (/^(node|nodejs|bun)(\.exe)?$/i.test(a0) && argv[1]) {
+    return /^claude(\.m?js)?$/i.test(base(argv[1])) || /[\\/]@anthropic-ai[\\/]claude-code[\\/]/.test(argv[1]);
+  }
+  return false;
+}
+function splitPsArgs(args, comm) {
+  const a = args.trim();
+  const c = comm.trim();
+  if (c && (a === c || a.startsWith(`${c} `))) {
+    const rest = a.slice(c.length).trim();
+    return [c, ...rest ? rest.split(/\s+/) : []];
+  }
+  return a ? a.split(/\s+/) : [];
+}
+function run(file, args) {
+  return new Promise((resolve, reject) => {
+    execFile3(
+      file,
+      args,
+      { encoding: "utf8", timeout: 2e3, maxBuffer: 1024 * 1024, env: { PATH: "/bin:/usr/bin:/usr/sbin:/sbin", LC_ALL: "C" } },
+      (err, stdout) => err ? reject(err) : resolve(stdout)
+    );
+  });
+}
+async function inspectProc(pid) {
+  const [cmdline, stat] = await Promise.all([readFile(`/proc/${pid}/cmdline`), readFile(`/proc/${pid}/stat`, "utf8")]);
+  const argv = cmdline.toString("utf8").split("\0");
+  if (argv.at(-1) === "") argv.pop();
+  const after = stat.slice(stat.lastIndexOf(")") + 1).trim().split(/\s+/);
+  return { ppid: Number(after[1]), argv };
+}
+async function inspectPs(pid) {
+  const [line, comm] = await Promise.all([
+    run("ps", ["-ww", "-o", "ppid=,args=", "-p", String(pid)]),
+    run("ps", ["-ww", "-o", "comm=", "-p", String(pid)])
+  ]);
+  const m = /^\s*(\d+)\s+([\s\S]*?)\s*$/.exec(line);
+  if (!m) throw new Error(`ps gave no entry for ${pid}`);
+  return { ppid: Number(m[1]), argv: splitPsArgs(m[2], comm.replace(/\n[\s\S]*$/, "")) };
+}
+async function inspectProcess(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) throw new Error(`not a pid: ${pid}`);
+  try {
+    return await inspectProc(pid);
+  } catch {
+    return inspectPs(pid);
+  }
+}
+function channelOverride(env) {
+  const v = (env.TEAM_RELAY_CHANNEL ?? "").trim();
+  if (v === "1") return true;
+  if (v === "0") return false;
+  return null;
+}
+async function detectChannelSession(opts) {
+  const override = channelOverride(opts.env);
+  if (override !== null) return { channel: override, reason: `TEAM_RELAY_CHANNEL=${override ? 1 : 0}` };
+  const inspect = opts.inspect ?? inspectProcess;
+  const plugin = opts.plugin ?? pluginRef(opts.env).plugin;
+  let pid = opts.startPid ?? process.ppid;
+  for (let depth = 1; depth <= MAX_ANCESTORS && pid > 1; depth++) {
+    let info;
+    try {
+      info = await inspect(pid);
+    } catch (err) {
+      return { channel: false, reason: `could not inspect ancestor ${depth} (${err instanceof Error ? err.message : "error"})` };
+    }
+    if (isClaudeArgv(info.argv)) {
+      const on = argvLoadsChannel(info.argv, opts.role, plugin);
+      return { channel: on, reason: on ? `claude (ancestor ${depth}) loads this channel` : `claude (ancestor ${depth}) was started without this channel` };
+    }
+    if (!Number.isInteger(info.ppid) || info.ppid === pid) break;
+    pid = info.ppid;
+  }
+  return { channel: false, reason: `no claude process among the ${MAX_ANCESTORS} nearest ancestors` };
+}
+function pluginRef(env, bundleRoot = ownRoot()) {
+  for (const root of [env.CLAUDE_PLUGIN_ROOT, bundleRoot]) {
+    if (!root) continue;
+    const parts = root.split(/[\\/]+/).filter(Boolean);
+    const [cache, marketplace, plugin] = parts.slice(-4);
+    if (parts.length >= 4 && cache === "cache" && marketplace && plugin && NAME_RE.test(marketplace) && NAME_RE.test(plugin)) {
+      return { plugin, marketplace };
+    }
+  }
+  return { plugin: DEFAULT_PLUGIN, marketplace: DEFAULT_MARKETPLACE };
+}
+function ownRoot() {
+  try {
+    return dirname2(dirname2(fileURLToPath3(import.meta.url))) + sep;
+  } catch {
+    return null;
+  }
+}
+function channelCommand(env) {
+  const { plugin, marketplace } = pluginRef(env);
+  return `claude --dangerously-load-development-channels plugin:${plugin}@${marketplace}`;
+}
+function notChannelNote(env) {
+  return `This session was not started with the team-relay channel, so teammates' answers are not shown here. Start one with: ${channelCommand(env)}`;
+}
+function answersAppearNote(env) {
+  return `The answer is not shown in this session. It is delivered to a session started with the team-relay channel: one running now, or the next one you start with: ${channelCommand(env)}. Here, request_status with this request_id shows who has acknowledged and answered.`;
+}
+
 // src/active.ts
 import { randomBytes as randomBytes3 } from "node:crypto";
 import { mkdirSync as mkdirSync2, readFileSync as readFileSync5, renameSync as renameSync2, rmSync as rmSync3, writeFileSync as writeFileSync2 } from "node:fs";
@@ -33457,11 +33602,21 @@ async function streamLoop(server, client, me, stream, stopper, onPushed = () => 
     }
   }
 }
-var SIGN_IN_URL_RULE = "sign_in_url is for the user of this session only: show it to them once, as a link to open themselves if no browser tab opened. Never repeat it to anyone else, never put it in a message to a teammate or in any tool call, and never open or fetch it yourself: whoever finishes the sign-in at that link decides who this computer is signed in as.";
+var SIGN_IN_URL_RULE = "sign_in_url is for the user of this session only: show it to them once, exactly as it is, as plain text on a line of its own (not as a markdown link), to open themselves if no browser tab opened. Never repeat it to anyone else, never put it in a message to a teammate or in any tool call, and never open or fetch it yourself: whoever finishes the sign-in at that link decides who this computer is signed in as.";
+var LOGIN_WAIT_MS = 18e4;
+function loginWaitMs(env) {
+  const v = Number(env.TEAM_RELAY_LOGIN_WAIT_SECONDS);
+  return Number.isInteger(v) && v >= 1 && v * 1e3 <= LOGIN_WAIT_MS ? v * 1e3 : LOGIN_WAIT_MS;
+}
 var SESSION_TOOLS = [
   {
     name: "login",
-    description: "Sign in to the team relay (/team-relay:login). Takes no arguments: the relay is the one this plugin is configured for. Opens the browser on the relay, where the user signs in with Google and picks their team. Returns at once with the sign-in URL (for the user only, never for anyone else); a status event on this channel says when the sign-in completes.",
+    description: "Sign in to the team relay (/team-relay:login). Takes no arguments: the relay is the one this plugin is configured for. Opens the browser on the relay, where the user signs in with Google and picks their team. Returns at once with the sign-in URL (for the user only, never for anyone else); then call login_wait, which says when the sign-in completes.",
+    inputSchema: { type: "object", properties: {}, additionalProperties: false }
+  },
+  {
+    name: "login_wait",
+    description: 'Wait for the sign-in that login started to finish (at most 3 minutes). Takes no arguments. Returns "Connected as <member> (<email>) on team <team>", or why the sign-in did not complete.',
     inputSchema: { type: "object", properties: {}, additionalProperties: false }
   },
   {
@@ -33472,13 +33627,15 @@ var SESSION_TOOLS = [
 ];
 var STATUS_NOTE = 'type="status" events come from this plugin itself (never from a teammate) and say whether you are signed in.';
 var AskerConnection = class {
-  constructor(env, server) {
+  constructor(env, server, channel) {
     this.env = env;
     this.server = server;
+    this.channel = channel;
     this.path = credentialsPath(env);
   }
   env;
   server;
+  channel;
   live = null;
   problem = null;
   refusedAt = void 0;
@@ -33487,6 +33644,12 @@ var AskerConnection = class {
   wake = null;
   failures = 0;
   pending = null;
+  /** How the latest sign-in started in this session ends (login_wait), while it runs. */
+  outcome = null;
+  /** How the latest sign-in in this session ended, once it has. */
+  lastOutcome = null;
+  /** Set while connected: what a refused credential does (the stream's 401, or a tool's). */
+  refused = null;
   /** Said plainly after a sign-in in this session changed the member or team. */
   changed = null;
   path;
@@ -33504,6 +33667,7 @@ var AskerConnection = class {
   }
   /** A status line pushed into the session: fixed text and id-shaped values only. */
   async status(content) {
+    if (!this.channel) return;
     try {
       await this.server.notification({ method: "notifications/claude/channel", params: { content, meta: { type: "status" } } });
     } catch {
@@ -33539,6 +33703,11 @@ var AskerConnection = class {
     this.live.stopper.stop();
     log(`disconnected (${why})`);
     this.live = null;
+    this.refused = null;
+  }
+  /** A tool call the relay refused with 401: the same as the stream's 401 (M5-SPEC §6). */
+  unauthorized() {
+    this.refused?.();
   }
   async watch() {
     while (!this.stopper.stopped) {
@@ -33603,14 +33772,18 @@ var AskerConnection = class {
     this.lastLogged = "";
     log(`asker for ${me.member} in team ${me.team}`);
     const onUnauthorized = c.mode === "credential" ? () => {
+      if (this.live?.stopper !== stopper) return;
       this.refusedAt = fp;
       this.disconnect("the relay refused the sign-in");
       void this.status(`team-relay: not connected: ${SIGN_IN_AGAIN}.`);
       this.poke();
     } : void 0;
-    void streamLoop(this.server, client, me, "replies", stopper, void 0, onUnauthorized).catch(
-      (err) => log(`stream loop ended: ${describeError(err)}`)
-    );
+    this.refused = onUnauthorized ?? null;
+    if (this.channel) {
+      void streamLoop(this.server, client, me, "replies", stopper, void 0, onUnauthorized).catch(
+        (err) => log(`stream loop ended: ${describeError(err)}`)
+      );
+    }
     return 2e3;
   }
   // -- the tools ------------------------------------------------------------------------
@@ -33630,6 +33803,7 @@ var AskerConnection = class {
       return toolError(describeError(err));
     }
     this.pending?.cancel();
+    this.lastOutcome = null;
     let flow;
     try {
       flow = await startLogin({ relayUrl, credentialsFile: this.path, log });
@@ -33637,22 +33811,31 @@ var AskerConnection = class {
       return toolError(err instanceof LoginError ? `not signed in: ${err.message}` : `could not start the sign-in: ${describeError(err)}`);
     }
     this.pending = flow;
-    flow.done.then(
+    const outcome = flow.done.then(
       ({ stored, replaced }) => {
-        if (this.pending === flow) this.pending = null;
         const change = identityChange(stored, replaced);
         this.changed = change;
         log(`signed in as ${stored.member} in team ${stored.team}${change ? " (a different member or team than before)" : ""}`);
         this.poke();
         void this.status(`team-relay: ${connectedAs(stored)}. Teammate tools are ready.${change ? ` ${change}` : ""}`);
+        return { ok: true, member: stored.member, team: stored.team, email: stored.email, changed: change };
       },
       (err) => {
-        if (this.pending === flow) this.pending = null;
         const why = describeError(err);
         log(`sign-in ended: ${why}`);
-        if (!why.includes(SUPERSEDED)) void this.status(`team-relay: the sign-in did not complete: ${why}.`);
+        const superseded = why.includes(SUPERSEDED);
+        if (!superseded) void this.status(`team-relay: the sign-in did not complete: ${why}.`);
+        return { ok: false, superseded, why };
       }
     );
+    this.outcome = outcome;
+    void outcome.then((o) => {
+      if (this.pending === flow) this.pending = null;
+      if (this.outcome === outcome) {
+        this.outcome = null;
+        if (!(!o.ok && o.superseded)) this.lastOutcome = o;
+      }
+    });
     const envMode = configValue(this.env.RELAY_AUTH);
     return toolJson({
       status: "waiting_for_browser",
@@ -33660,8 +33843,70 @@ var AskerConnection = class {
       sign_in_url: flow.url,
       sign_in_url_rule: SIGN_IN_URL_RULE,
       expires_in_seconds: 300,
-      next: "A browser tab should have opened on the relay: the user signs in with Google there and chooses the team. A status event on this channel says when it is done (or call whoami).",
+      next: "A browser tab should have opened on the relay: the user signs in with Google there and chooses the team. Show the user sign_in_url as the rule says, then call login_wait (no arguments): it returns when the sign-in completes or fails, and says who you are connected as.",
       ...envMode && envMode !== "credential" ? { note: `this session signs in with RELAY_AUTH=${envMode} from its environment; restart Claude Code without it to use the new sign-in` } : {}
+    });
+  }
+  /**
+   * Wait for the sign-in this session started (login) to complete, fail, or run out of time.
+   * It never depends on channel events reaching the session. `progress` keeps the call alive
+   * in a client that times tool calls out.
+   */
+  async loginWait(args, progress = () => {
+  }) {
+    const bad = unknownKey(args, []);
+    if (bad) return toolError("login_wait takes no arguments");
+    const waitMs = loginWaitMs(this.env);
+    const deadline = Date.now() + waitMs;
+    const tick = setInterval(() => progress("waiting for the sign-in in the browser"), 15e3);
+    try {
+      for (; ; ) {
+        const current = this.outcome;
+        if (!current) {
+          if (this.lastOutcome) return await this.reportOutcome(this.lastOutcome, deadline);
+          return toolError("No sign-in is waiting in this session: run /team-relay:login to start one.");
+        }
+        const timedOut = /* @__PURE__ */ Symbol("timed out");
+        let timer;
+        const result = await Promise.race([
+          current,
+          new Promise((resolve) => {
+            timer = setTimeout(() => resolve(timedOut), Math.max(0, deadline - Date.now()));
+          })
+        ]).finally(() => clearTimeout(timer));
+        if (result === timedOut) {
+          return toolError(
+            `The sign-in has not completed after ${Math.round(waitMs / 1e3)} s. If the user is still in the browser, they can finish there and you can call login_wait again; otherwise run /team-relay:login to start over.`
+          );
+        }
+        if (!result.ok && result.superseded) {
+          const until = Math.min(deadline, Date.now() + 5e3);
+          while (Date.now() < until && (!this.outcome || this.outcome === current)) await new Promise((r) => setTimeout(r, 50));
+          if (this.outcome && this.outcome !== current) continue;
+        }
+        return await this.reportOutcome(result, deadline);
+      }
+    } finally {
+      clearInterval(tick);
+    }
+  }
+  async reportOutcome(o, deadline) {
+    if (!o.ok) {
+      return toolError(
+        o.superseded ? "That sign-in was replaced by a newer one: call login_wait again to wait for the newer one." : `The sign-in did not complete: ${o.why}. Run /team-relay:login to try again.`
+      );
+    }
+    const until = Math.min(deadline, Date.now() + 5e3);
+    while (Date.now() < until && !(this.live && this.live.me.member === o.member && this.live.me.team === o.team)) {
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    return toolJson({
+      connected: true,
+      message: connectedAs(o),
+      member: o.member,
+      team: o.team,
+      ...o.email ? { email: o.email } : {},
+      ...o.changed ? { changed: o.changed } : {}
     });
   }
   async whoami(args) {
@@ -33705,6 +33950,27 @@ var SIGNED_IN_WITH = {
   token: "static development token",
   metadata: "service account"
 };
+function instructionsText(role, channel, env) {
+  if (role === "answerer") {
+    return channel ? instructionsFor(role) : `${instructionsFor(role)} This session was not started with the relay channel, so no question reaches it; start the answering session with /team-relay:answering.`;
+  }
+  const base2 = `${instructionsFor(role)} ${STATUS_NOTE}`;
+  if (channel) return base2;
+  return `${base2} In this session, tell the user that answers to what they ask appear only in a session started with the channel, use request_status to see who has acknowledged and answered, and to sign in call login and then login_wait. ` + notChannelNote(env);
+}
+function withNote(result, note, extra) {
+  const text = result.content.map((c) => c.text).join("");
+  if (!result.isError) {
+    try {
+      const value = JSON.parse(text);
+      if (isPlainObject4(value)) return toolJson({ ...value, ...extra, channel_session: false, channel_note: note });
+    } catch {
+    }
+  }
+  return { ...result, content: [{ type: "text", text: `${text}
+
+${note}` }] };
+}
 function fail(message) {
   log(message);
   process.exit(1);
@@ -33722,6 +33988,8 @@ async function main() {
   const env = process.env;
   const role = env.RELAY_ROLE;
   if (role !== "asker" && role !== "answerer") fail('RELAY_ROLE must be "asker" or "answerer"');
+  const { channel, reason } = await detectChannelSession({ env, role });
+  log(`${channel ? "channel session" : "not a channel session: no stream is read"} (${reason})`);
   const waiting = role === "asker" && usesStoredSignIn(env);
   let fixed = null;
   if (!waiting) {
@@ -33769,19 +34037,37 @@ async function main() {
     { name: "relay", version: VERSION },
     {
       capabilities: { experimental: { "claude/channel": {} }, tools: {} },
-      instructions: role === "asker" ? `${instructionsFor(role)} ${STATUS_NOTE}` : instructionsFor(role)
+      instructions: instructionsText(role, channel, env)
     }
   );
-  const connection = role === "asker" ? new AskerConnection(env, server) : null;
+  const connection = role === "asker" ? new AskerConnection(env, server, channel) : null;
   const liveNow = () => fixed ?? connection?.current() ?? null;
   const tools = role === "asker" ? [...ASKER_TOOLS, ...SESSION_TOOLS] : ANSWERER_TOOLS;
   server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: tools.map((t) => ({ ...t })) }));
-  server.setRequestHandler(CallToolRequestSchema, async (req) => {
+  const note = role === "asker" && !channel ? notChannelNote(env) : null;
+  const noted = (result, extra = {}) => note ? withNote(result, note, extra) : result;
+  server.setRequestHandler(CallToolRequestSchema, async (req, extra) => {
     const name = req.params.name;
     const args = req.params.arguments ?? {};
-    if (!isPlainObject4(args)) return toolError("arguments must be an object");
+    if (!isPlainObject4(args)) return noted(toolError("arguments must be an object"));
+    const result = await callTool(name, args, extra);
+    if (name === "ask_question" || name === "invoke_capability") return noted(result, { where_answers_appear: answersAppearNote(env) });
+    return noted(result);
+  });
+  async function callTool(name, args, extra) {
     try {
       if (role === "asker") {
+        if (name === "login_wait") {
+          if (!connection) return toolError("this session signs in with RELAY_AUTH from its environment; unset it and restart Claude Code to use /team-relay:login");
+          const token = extra._meta?.progressToken;
+          let n = 0;
+          const progress = (message) => {
+            if (token === void 0) return;
+            void extra.sendNotification({ method: "notifications/progress", params: { progressToken: token, progress: ++n, message } }).catch(() => {
+            });
+          };
+          return await connection.loginWait(args, progress);
+        }
         if (name === "login" || name === "whoami") {
           if (!connection) {
             if (name === "whoami" && fixed) {
@@ -33821,9 +34107,10 @@ async function main() {
       }
       return toolError(`unknown tool: ${name}`);
     } catch (err) {
+      if (err instanceof RelayError && err.status === 401) connection?.unauthorized();
       return toolError(describeError(err));
     }
-  });
+  }
   const stopper = new Stopper();
   let loop;
   server.oninitialized = () => {
@@ -33831,7 +34118,7 @@ async function main() {
       connection.start();
       return;
     }
-    if (!fixed) return;
+    if (!fixed || !channel) return;
     const onPushed = (e) => deadlines.remember(e.request_id, e.data?.answer_deadline);
     const stream = role === "asker" ? "replies" : "inbox";
     loop ??= streamLoop(server, fixed.client, fixed.me, stream, stopper, onPushed).catch((err) => log(`stream loop ended: ${describeError(err)}`));

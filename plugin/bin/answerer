@@ -439,7 +439,9 @@ for (const [k, v] of Object.entries(e)) {
   if (/^CAP_[A-Z][A-Z0-9_]*_(ENABLED|RUNNER)$/.test(k) && typeof v === "string") common[k] = v;
 }
 const root = e.ANSWERER_PLUGIN_ROOT;
-const relayEnv = { ...common, RELAY_ROLE: "answerer", ANSWERER_STATE_DIR: stateDir };
+// This session is started with the relay channel (below), so its channel server reads the
+// inbox: said explicitly, never left to the process-tree check (channel-mode.ts).
+const relayEnv = { ...common, RELAY_ROLE: "answerer", ANSWERER_STATE_DIR: stateDir, TEAM_RELAY_CHANNEL: "1" };
 // M4-SPEC §3: the answering channel publishes the shared folders' names (never their paths).
 if (shares.length > 0) relayEnv.ANSWERER_SHARES = JSON.stringify(shares);
 const mcp = {

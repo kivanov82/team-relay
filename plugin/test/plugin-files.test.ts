@@ -47,6 +47,20 @@ describe('commands (M5-SPEC §6, §9)', () => {
     expect(text).toMatch(/Never repeat it\s+to anyone else/);
   });
 
+  it('/team-relay:login shows the raw URL, then confirms with login_wait, not with a channel event', () => {
+    const text = command('login').replace(/\s+/g, ' ');
+    expect(text).toMatch(/the raw URL exactly as it is, as plain text on a line of its own, not as a markdown link/);
+    expect(text).toMatch(/do not open, fetch or change it yourself/);
+    expect(text).toMatch(/Right after that, call the `login_wait` tool of the same server, with no arguments/);
+    expect(text).toMatch(/Tell me its message in one line: "Connected as \.\.\.", or why the sign-in did not complete/);
+    expect(text).toMatch(/different member or on a different team/);
+    // The confirmation never waits for a channel event, which a session without the channel never shows.
+    expect(text).not.toMatch(/<channel/);
+    const order = ['`login` tool', 'sign_in_url', '`login_wait`'].map((k) => text.indexOf(k));
+    expect(order.every((i) => i >= 0)).toBe(true);
+    expect([...order].sort((a, b) => a - b)).toEqual(order);
+  });
+
   it('/team-relay:logout runs dist/logout.js itself, at expansion, and allows the model no tools (§9 item 2)', () => {
     const text = command('logout');
     const fm = frontmatter(text);
@@ -74,7 +88,12 @@ describe('SessionStart hook', () => {
       const child = execFile(
         process.execPath,
         [join(DIST, 'session-start.js')],
-        { env: { PATH: process.env.PATH ?? '', XDG_CONFIG_HOME: process.env.XDG_CONFIG_HOME ?? '', ...env }, encoding: 'utf8', timeout: 10_000 },
+        {
+          // A channel session unless the test says otherwise (the process-tree check is channel-mode.test.ts).
+          env: { PATH: process.env.PATH ?? '', XDG_CONFIG_HOME: process.env.XDG_CONFIG_HOME ?? '', TEAM_RELAY_CHANNEL: '1', ...env },
+          encoding: 'utf8',
+          timeout: 10_000,
+        },
         (err, stdout, stderr) => resolve({ status: err ? ((err as { code?: number }).code ?? 1) : 0, stdout, stderr }),
       );
       child.stdin?.end('{"hook_event_name":"SessionStart"}');
@@ -101,5 +120,25 @@ describe('SessionStart hook', () => {
     expect(refused.stdout.trimEnd().split('\n')).toHaveLength(1);
     expect(refused.stdout).toMatch(/relay refused this session \(401 unauthenticated\)/);
     expect(refused.stdout).not.toContain('tok-bad-secret-123');
+  });
+
+  it('in a session without the channel, the same one line also says answers are not shown and how to start one', async () => {
+    const note =
+      "This session was not started with the team-relay channel, so teammates' answers are not shown here. " +
+      'Start one with: claude --dangerously-load-development-channels plugin:team-relay@team-relay-dev';
+    const connected = await run({ RELAY_URL: relay.url, RELAY_TEAM: 'demo', RELAY_AUTH: 'token', RELAY_TOKEN: TOKEN_OF.alice!, TEAM_RELAY_CHANNEL: '0' });
+    expect(connected.status).toBe(0);
+    expect(connected.stdout.trimEnd().split('\n')).toHaveLength(1);
+    expect(connected.stdout).toMatch(/^team-relay: you are alice in team demo; teammates: bob, carol/);
+    expect(connected.stdout.trimEnd().endsWith(note)).toBe(true);
+    const unconfigured = await run({ TEAM_RELAY_CHANNEL: '0' });
+    expect(unconfigured.stdout).toMatch(/^team-relay: Not connected: run \/team-relay:login/);
+    expect(unconfigured.stdout.trimEnd().endsWith(note)).toBe(true);
+    // The marketplace comes from where the plugin is installed.
+    const installed = await run({ TEAM_RELAY_CHANNEL: '0', CLAUDE_PLUGIN_ROOT: '/home/u/.claude/plugins/cache/acme-tools/team-relay/0.1.0' });
+    expect(installed.stdout.trimEnd()).toMatch(/Start one with: claude --dangerously-load-development-channels plugin:team-relay@acme-tools$/);
+    // A channel session: no note.
+    const channel = await run({ RELAY_URL: relay.url, RELAY_TEAM: 'demo', RELAY_AUTH: 'token', RELAY_TOKEN: TOKEN_OF.alice! });
+    expect(channel.stdout).not.toContain('not started with the team-relay channel');
   });
 });

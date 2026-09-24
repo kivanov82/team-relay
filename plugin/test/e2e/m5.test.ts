@@ -50,6 +50,8 @@ async function freshAsker(label: string, email: string): Promise<Signed> {
     TEAM_RELAY_OPEN_COMMAND: join(FIXTURES, 'fake-browser.mjs'),
     FAKE_BROWSER_LOG: log,
     FAKE_BROWSER_EMAIL: email,
+    // A working session started with the channel: it reads the replies stream.
+    TEAM_RELAY_CHANNEL: '1',
   });
   open.push(party);
   return { party, xdg, file: join(xdg, 'team-relay', 'credentials.json'), log };
@@ -66,6 +68,12 @@ async function signIn(s: Signed, member: string): Promise<string> {
   expect(r.relay_url).toBe(relayUrl());
   expect(String(r.sign_in_url).startsWith(`${relayUrl()}/v1/login/start?`)).toBe(true);
   expect(String(r.sign_in_url_rule)).toMatch(/Never repeat it to anyone else/);
+  expect(String(r.sign_in_url_rule)).toMatch(/as plain text on a line of its own \(not as a markdown link\)/);
+  // The confirmation that needs no channel event: login_wait blocks until the sign-in ends.
+  const waited = await s.party.call('login_wait', {});
+  if (waited.isError) throw new Error(`login_wait: ${waited.text}; stderr: ${s.party.stderr().slice(-1500)}`);
+  expect(String(waited.json.message)).toMatch(new RegExp(`^Connected as ${member}( \\(${member}@example\\.com\\))? on team demo$`));
+  // In a channel session the status event still comes, as an extra.
   const note = await s.party
     .waitNote((n) => n.meta.type === 'status' && /Connected as|did not complete/.test(n.content), 30_000, 'the sign-in status')
     .catch((err: unknown) => {
@@ -198,6 +206,7 @@ describe.skipIf(!M5)('M5: sign in with the login tool', () => {
       RELAY_CREDENTIALS_FILE: bob.file,
       RELAY_URL: relayUrl(),
       RELAY_TEAM: 'demo',
+      TEAM_RELAY_CHANNEL: '1',
     });
     open.push(bobAnswerer);
     const aliceAsker = await Party.start('alice-asker-m5', 'channel.js', channelEnv('alice', 'asker'));

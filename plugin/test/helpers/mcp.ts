@@ -21,13 +21,16 @@ export type Spawned = {
 /**
  * Minimal parent environment for a spawned server: only what node needs, plus `env`. The
  * suites use static test tokens, so RELAY_AUTH is `token` unless `env` says otherwise (the
- * default, `google`, is covered by identity.test.ts with a fake gcloud).
+ * default, `google`, is covered by identity.test.ts with a fake gcloud). The test process is
+ * no Claude Code session, so each server is told it is a channel session (TEAM_RELAY_CHANNEL=1)
+ * unless `env` says otherwise; channel-mode.test.ts covers the detection itself.
  */
 export function baseEnv(env: Record<string, string>): Record<string, string> {
   const out: Record<string, string> = {
     PATH: process.env.PATH ?? '/usr/bin:/bin',
     HOME: process.env.HOME ?? '/tmp',
     RELAY_AUTH: 'token',
+    TEAM_RELAY_CHANNEL: '1',
     // test/helpers/isolate.ts: never the developer's own stored sign-in.
     ...(process.env.XDG_CONFIG_HOME ? { XDG_CONFIG_HOME: process.env.XDG_CONFIG_HOME } : {}),
   };

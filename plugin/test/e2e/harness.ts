@@ -201,8 +201,13 @@ function alive(pid: number): boolean {
   }
 }
 
+/**
+ * A channel server's environment. TEAM_RELAY_CHANNEL=1: this harness plays a Claude Code session
+ * started with the channel, so the server reads its stream (there is no claude process here for
+ * it to find). Scenario 8 of m1.test.ts overrides it with 0: a session without the channel.
+ */
 export function channelEnv(member: Member, role: 'asker' | 'answerer', extra: Record<string, string> = {}): Record<string, string> {
-  return { RELAY_URL: relayUrl(), RELAY_TEAM: TEAM, RELAY_TOKEN: tokenOf(member), RELAY_ROLE: role, ...extra };
+  return { RELAY_URL: relayUrl(), RELAY_TEAM: TEAM, RELAY_TOKEN: tokenOf(member), RELAY_ROLE: role, TEAM_RELAY_CHANNEL: '1', ...extra };
 }
 
 /** bob offers staging_db_query with the synthetic runner; nobody else offers anything. */
