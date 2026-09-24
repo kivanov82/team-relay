@@ -267,5 +267,53 @@ gcloud beta services identity create --service=iap.googleapis.com --project="$PR
   --quiet >/dev/null 2>&1
 echo "   service-<number>@gcp-sa-iap: exists"
 
+# ------------------------------------------------------- 8. login OAuth client (M5)
+# The relay's Google sign-in (docs/M5-SPEC.md §5) uses a Web OAuth client created in the
+# Cloud Console. Given OAUTH_CLIENT_FILE (the client's downloaded JSON), its id and secret
+# are stored as the secret team-relay-oauth-client; the value is never printed.
+OAUTH_SECRET="team-relay-oauth-client"
+echo "8. login OAuth client"
+if [[ -n "${OAUTH_CLIENT_FILE:-}" ]]; then
+  WANTED_OAUTH="$(python3 - "$OAUTH_CLIENT_FILE" <<'PYEOF'
+import json, sys
+web = json.load(open(sys.argv[1], encoding="utf-8")).get("web") or {}
+if not web.get("client_id") or not web.get("client_secret"):
+    sys.exit("error: not a Web application OAuth client JSON")
+print(json.dumps({"client_id": web["client_id"], "client_secret": web["client_secret"]},
+                 sort_keys=True, separators=(",", ":")))
+PYEOF
+)"
+  if gcloud secrets describe "$OAUTH_SECRET" --project="$PROJECT" >/dev/null 2>&1; then
+    CURRENT_OAUTH="$(gcloud secrets versions access latest --secret="$OAUTH_SECRET" \
+      --project="$PROJECT" 2>/dev/null || true)"
+    if [[ "$CURRENT_OAUTH" == "$WANTED_OAUTH" ]]; then
+      echo "   secret ${OAUTH_SECRET}: exists (current)"
+    else
+      printf '%s' "$WANTED_OAUTH" | gcloud secrets versions add "$OAUTH_SECRET" \
+        --project="$PROJECT" --data-file=- --quiet >/dev/null
+      echo "   secret ${OAUTH_SECRET}: updated (redeploy the relay)"
+    fi
+  else
+    printf '%s' "$WANTED_OAUTH" | gcloud secrets create "$OAUTH_SECRET" --project="$PROJECT" \
+      --replication-policy=user-managed --locations="$REGION" --data-file=- --quiet >/dev/null
+    echo "   secret ${OAUTH_SECRET}: created"
+  fi
+  unset WANTED_OAUTH CURRENT_OAUTH
+fi
+if gcloud secrets describe "$OAUTH_SECRET" --project="$PROJECT" >/dev/null 2>&1; then
+  if gcloud secrets get-iam-policy "$OAUTH_SECRET" --project="$PROJECT" --flatten='bindings[].members' \
+      --format='csv[no-heading](bindings.role,bindings.members)' \
+      | has_binding roles/secretmanager.secretAccessor "serviceAccount:${RUNTIME_EMAIL}"; then
+    echo "   accessor on ${OAUTH_SECRET}: exists"
+  else
+    gcloud secrets add-iam-policy-binding "$OAUTH_SECRET" --project="$PROJECT" \
+      --member="serviceAccount:${RUNTIME_EMAIL}" --role=roles/secretmanager.secretAccessor \
+      --quiet >/dev/null
+    echo "   accessor on ${OAUTH_SECRET}: created"
+  fi
+else
+  echo "   secret ${OAUTH_SECRET}: skipped (set OAUTH_CLIENT_FILE=<client JSON> to create it)"
+fi
+
 echo
 echo "Bootstrap complete. Deploy with: bash scripts/deploy.sh, then bash scripts/deploy-console.sh"
