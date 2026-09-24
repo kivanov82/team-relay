@@ -1,7 +1,7 @@
 import { QueryClient, useMutation, useQuery, useQueryClient, type Query } from '@tanstack/react-query'
 
 import { ApiError, ChangeError, api } from '@/api/client'
-import type { Directory, Join, Me, RequestDetail, Roster, RosterRole } from '@/api/types'
+import type { Directory, InboxSummary, Join, Me, RequestDetail, Roster, RosterRole } from '@/api/types'
 import { emptyActivity, pollActivity, PollError, type ActivityState } from '@/lib/activity'
 
 // Polling cadence (M2 §5): the feed every 3 s, incrementally from `next_since` (less the
@@ -99,6 +99,18 @@ export function useDirectory() {
     queryKey: ['directory'],
     queryFn: () => tracked('directory', async () => (await api.directory()).data),
     refetchInterval: whileVisible('directory', DIRECTORY_INTERVAL_MS),
+  })
+}
+
+/**
+ * M7 §3: what waits for the viewer's own answering session, polled with the directory. A
+ * console server or relay without the route (404) is not asked again.
+ */
+export function useInboxSummary() {
+  return useQuery<InboxSummary, ApiError>({
+    queryKey: ['inbox-summary'],
+    queryFn: () => tracked('inbox-summary', async () => (await api.inboxSummary()).data),
+    refetchInterval: (query) => (query.state.error?.kind === 'not_found' ? false : whileVisible<InboxSummary>('inbox-summary', DIRECTORY_INTERVAL_MS)(query)),
   })
 }
 

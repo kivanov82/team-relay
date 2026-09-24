@@ -26,6 +26,8 @@ async function start() {
     // Members panel as a member (not an owner) sees it.
     relay.stranger = params.get('mock') === 'stranger'
     if (params.get('role') === 'member') relay.role = 'member'
+    // M7 §3: ?waiting shows questions waiting for answering sessions that are not running.
+    relay.waiting = params.has('waiting')
     setTransport((path, init) => relay.handle(path, init))
     setConsoleKey('mock-console-key-0000000000000000')
     Object.assign(window, { __mockRelay: relay })

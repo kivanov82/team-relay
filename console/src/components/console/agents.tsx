@@ -4,9 +4,10 @@ import type { DirectoryMember } from '@/api/types'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import { PRESENCE_LABEL, presenceOf } from '@/lib/presence'
+import { agentWaiting } from '@/lib/waiting'
 import { formatAgo, formatDuration, ms } from '@/lib/time'
 import { cn } from '@/lib/utils'
-import { Avatar, EnvBadge, Panel, PresenceDot } from './primitives'
+import { Avatar, EnvBadge, Panel, PresenceDot, StatusPill } from './primitives'
 
 function Session({ label, lastSeen, now }: { label: string; lastSeen: string | null; now: number }) {
   const p = presenceOf(lastSeen, now)
@@ -59,9 +60,33 @@ function Shares({ agent }: { agent: DirectoryMember }) {
   )
 }
 
+/**
+ * M7 §3: questions waiting in the teammate's inbox while their answering session is not
+ * running. They are delivered when it starts.
+ */
+function Waiting({ agent, count }: { agent: DirectoryMember; count: number }) {
+  const noun = count === 1 ? 'question' : 'questions'
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <span tabIndex={0} className="rounded-full" data-waiting={count}>
+          <StatusPill tone="warn" className="tnum">
+            {count >= 50 ? '50+' : count} waiting
+          </StatusPill>
+        </span>
+      </TooltipTrigger>
+      <TooltipContent side="bottom" className="max-w-64">
+        {count >= 50 ? '50 or more' : count} {noun} waiting for {agent.member}. Their answering session is not running;
+        the {noun} will reach it when it starts.
+      </TooltipContent>
+    </Tooltip>
+  )
+}
+
 export function AgentRow({ agent, now }: { agent: DirectoryMember; now: number }) {
   const caps = agent.manifest?.capabilities ?? []
   const published = ms(agent.published_at)
+  const waiting = agentWaiting(agent, now)
   return (
     <li className="flex flex-col gap-3 px-4 py-3.5" data-agent={agent.member}>
       <div className="flex flex-wrap items-center gap-x-2.5 gap-y-1">
@@ -75,6 +100,7 @@ export function AgentRow({ agent, now }: { agent: DirectoryMember; now: number }
             {published !== null ? <span className="tnum">, published {formatAgo(now - published)}</span> : null}
           </div>
         </div>
+        {waiting !== null ? <Waiting agent={agent} count={waiting} /> : null}
         <Shares agent={agent} />
       </div>
 

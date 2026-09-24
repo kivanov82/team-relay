@@ -112,6 +112,23 @@ export interface DirectoryMember {
     answering: SessionPresence
   }
   stats: MemberStats
+  /**
+   * M7 §1: unexpired questions in the member's inbox their answering session has not taken
+   * yet, at most 50. Absent from older relays.
+   */
+  inbox_waiting?: number
+}
+
+/** GET /api/inbox/summary (M7 §1): what waits for the viewer's own answering session. */
+export interface InboxSummary {
+  /** At most 50. */
+  pending: number
+  /** The count stopped at 50 and more are waiting. */
+  more?: boolean
+  oldest_at: Iso | null
+  /** Distinct senders, at most five. */
+  from: string[]
+  answering: SessionPresence
 }
 
 export interface Directory {

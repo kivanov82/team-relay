@@ -13,6 +13,7 @@ import type {
   ActivityRequest,
   Directory,
   DirectoryMember,
+  InboxSummary,
   ProgressEntry,
   RequestDetail,
   Roster,
@@ -507,6 +508,11 @@ export class MockRelay {
   rateLimited = false
   /** M6 §4: answers as the console server does for a signed-in account not on the team. */
   stranger = false
+  /**
+   * M7 §3, for the dev view (?waiting): the viewer has questions waiting and no answering
+   * session, and carol's answering session has stopped with questions waiting for her.
+   */
+  waiting = false
   /** The viewer's role on the roster (M6 §4): an owner manages members; a member only reads. */
   role: 'owner' | 'member' = 'owner'
   /** M6 §1, in memory: changes an owner makes, under the relay's invariants. */
@@ -571,8 +577,10 @@ export class MockRelay {
       if (m.member === 'bob') {
         d.sessions = { working: { last_seen: polling }, answering: { last_seen: polling } }
       } else {
-        d.sessions = { working: { last_seen: this.carolWorkingSeen(now) }, answering: { last_seen: polling } }
+        d.sessions = { working: { last_seen: this.carolWorkingSeen(now) }, answering: { last_seen: this.waiting ? iso(now - 20 * 60_000) : polling } }
       }
+      // M7 §1: an answering session that is polling takes what arrives at once.
+      d.inbox_waiting = this.waiting && m.member === 'carol' ? 3 : 0
       d.last_seen =
         [d.sessions.working.last_seen, d.sessions.answering.last_seen]
           .filter((x): x is string => x !== null)
@@ -604,6 +612,12 @@ export class MockRelay {
       return d
     })
     return { members, stats_complete: true }
+  }
+
+  /** GET /api/inbox/summary (M7 §1) as the viewer reads it. */
+  inboxSummary(now = this.now()): InboxSummary {
+    if (!this.waiting) return { pending: 0, more: false, oldest_at: null, from: [], answering: { last_seen: iso(now - (now % 15_000)) } }
+    return { pending: 2, more: false, oldest_at: iso(now - 7 * 60_000), from: ['bob', 'carol'], answering: { last_seen: null } }
   }
 
   /**
@@ -729,6 +743,7 @@ export class MockRelay {
     if (p === '/api/roster') return json(this.roster())
     if (p === '/api/me') return json(fixtureMe)
     if (p === '/api/directory') return json(this.directory())
+    if (p === '/api/inbox/summary') return json(this.inboxSummary())
     if (p === '/api/activity') {
       const limit = Math.min(200, Math.max(1, Number(url.searchParams.get('limit') ?? 100)))
       return json(this.activity(url.searchParams.get('since'), limit))

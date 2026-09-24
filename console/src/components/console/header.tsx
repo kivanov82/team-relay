@@ -2,12 +2,13 @@ import { Monitor, Moon, Sun } from 'lucide-react'
 
 import { Button } from '@/components/ui/button'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
-import { useConnection, useMe } from '@/hooks/queries'
+import { useConnection, useInboxSummary, useMe } from '@/hooks/queries'
 import { useNow } from '@/hooks/use-now'
 import { useTheme, type ThemeChoice } from '@/hooks/use-theme'
 import { formatAgo, formatClock } from '@/lib/time'
+import { waitingLine } from '@/lib/waiting'
 import { cn } from '@/lib/utils'
-import { Avatar, RelayMark } from './primitives'
+import { Avatar, RelayMark, StatusPill } from './primitives'
 
 const THEME_LABEL: Record<ThemeChoice, string> = {
   system: 'Theme follows the system',
@@ -97,6 +98,32 @@ export function ConnectionStatus() {
   )
 }
 
+/**
+ * M7 §3: the viewer's own questions waiting for their answering session, while it is not
+ * running (from /api/inbox/summary; nothing from a server without it).
+ */
+function InboxWaiting() {
+  const summary = useInboxSummary()
+  const now = useNow()
+  const line = waitingLine(summary.data, now)
+  if (line === null) return null
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <span tabIndex={0} className="min-w-0 rounded-full" data-inbox-waiting={summary.data?.pending}>
+          <StatusPill tone="warn" className="tnum max-w-full truncate">
+            {line}
+          </StatusPill>
+        </span>
+      </TooltipTrigger>
+      <TooltipContent side="bottom" className="max-w-72">
+        Your answering session is not running. Start it in a second terminal with the command /team-relay:answering
+        shows in Claude Code; the questions reach it then.
+      </TooltipContent>
+    </Tooltip>
+  )
+}
+
 export function Header() {
   const me = useMe()
   return (
@@ -119,6 +146,7 @@ export function Header() {
               <span className="font-medium">{me.data.member}</span>
               <span className="text-subtle">(you)</span>
             </span>
+            <InboxWaiting />
           </div>
         ) : null}
         <div className="ml-auto flex items-center gap-2 sm:gap-3">
