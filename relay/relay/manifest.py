@@ -240,6 +240,13 @@ class ManifestValidator:
                     raise ManifestError(
                         f"capability '{name}': required '{req}' may not declare a default"
                     )
+        # M4-SPEC §3: share names are unique, compared exactly (case-sensitive). The schema's
+        # uniqueItems already refuses equal entries; this names the share that repeats.
+        shares: list[str] = []
+        for share in manifest.get("shares", []):
+            if share["name"] in shares:
+                raise ManifestError(f"share '{share['name']}': name used twice")
+            shares.append(share["name"])
         return names
 
 

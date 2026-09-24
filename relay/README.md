@@ -76,6 +76,18 @@ block, all optional:
 | `concurrent_polls` | 2 | long-polls (`wait > 0`) at once per member and stream, per relay instance |
 | `reads_per_minute` | 120 | reads of `/activity` and `/directory` together, per member and calendar minute (M2-SPEC §7.3) |
 
+## Manifest shares (M4-SPEC §3, 24 Sep 2026)
+
+- A manifest may carry an optional top-level `shares`: at most 16 objects `{"name": ...}`,
+  `name` matching `^[A-Za-z0-9._-]{1,64}$` (a folder's basename, never a path), no other key.
+  The schema refuses equal entries (`uniqueItems`) and the relay's own check refuses a name
+  used twice (compared exactly, so `Docs` and `docs` are two shares): `422 invalid_manifest`.
+- The directory returns the manifest as published, `shares` included and in order; a
+  manifest published without it comes back without it.
+- The schema's own patterns (`shares`, identifiers, enum values) read a final `$` as the end
+  of the string, as JSON Schema and the plugin do; Python's `re` alone would also accept a
+  trailing newline.
+
 ## Read-only delegates (M3-SPEC §2, 24 Sep 2026)
 
 The hosted console reads the relay as a delegate: a service principal that reads a team's

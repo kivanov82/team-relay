@@ -586,3 +586,118 @@ async def test_huge_bounds_without_defaults_are_accepted(client):
     param = {"type": "number", "min": -(10**400), "max": 10**400, "description": "d"}
     r = await client.put(URL.format("bob"), headers=auth("bob"), json=_cap_with(param))
     assert r.status_code == 200
+
+
+# M4-SPEC §3: the optional shares list ---------------------------------------------------------
+
+
+def _with_shares(shares: Any) -> dict[str, Any]:
+    return {**copy.deepcopy(MANIFEST), "shares": shares}
+
+
+@pytest.mark.parametrize(
+    "shares",
+    [
+        [],
+        [{"name": "docs"}],
+        [{"name": "a"}, {"name": "x" * 64}, {"name": "A-z_0.9"}, {"name": "..."}],
+        [{"name": "Docs"}, {"name": "docs"}, {"name": "DOCS"}],  # case-sensitive: all distinct
+        [{"name": f"share-{i:02d}"} for i in range(16)],
+    ],
+    ids=["empty", "one", "bounds", "case", "sixteen"],
+)
+def test_shares_are_accepted(validator, shares):
+    assert validator.validate(_with_shares(shares)) == ["staging_db_query", "service_health"]
+
+
+def test_a_manifest_without_shares_is_still_accepted(validator):
+    assert "shares" not in MANIFEST
+    assert validator.validate(copy.deepcopy(MANIFEST)) == ["staging_db_query", "service_health"]
+
+
+BAD_SHARES = [
+    ("not a list", {"name": "docs"}),
+    ("a string", "docs"),
+    ("null", None),
+    ("seventeen", [{"name": f"share-{i:02d}"} for i in range(17)]),
+    ("a bare string item", ["docs"]),
+    ("a null item", [None]),
+    ("no name", [{}]),
+    ("an extra key", [{"name": "docs", "path": "/Users/bob/docs"}]),
+    ("a path key only", [{"path": "/Users/bob/docs"}]),
+    ("empty name", [{"name": ""}]),
+    ("65 characters", [{"name": "x" * 65}]),
+    ("a full path", [{"name": "/Users/bob/docs"}]),
+    ("a relative path", [{"name": "bob/docs"}]),
+    ("a home path", [{"name": "~"}]),
+    ("a backslash", [{"name": "a\\b"}]),
+    ("a space", [{"name": "my docs"}]),
+    ("a trailing newline", [{"name": "docs\n"}]),
+    ("a leading newline", [{"name": "\ndocs"}]),
+    ("non-ASCII", [{"name": "döcs"}]),
+    ("a number", [{"name": 5}]),
+    ("a null name", [{"name": None}]),
+    ("the same name twice", [{"name": "docs"}, {"name": "docs"}]),
+]
+
+
+@pytest.mark.parametrize("label, shares", BAD_SHARES, ids=[b[0] for b in BAD_SHARES])
+def test_bad_shares_are_refused(validator, label, shares):
+    with pytest.raises(ManifestError) as exc:
+        validator.validate(_with_shares(shares))
+    assert "shares" in str(exc.value)
+
+
+def test_duplicate_share_names_are_refused_by_the_relay_check_too():
+    """The relay's own check, not only the schema's uniqueItems (M4-SPEC §3)."""
+    schema = copy.deepcopy(load_schema(SCHEMA_PATH))
+    del schema["properties"]["shares"]["uniqueItems"]
+    lax = ManifestValidator(schema)
+    assert lax.validate(_with_shares([{"name": "docs"}, {"name": "Docs"}]))
+    with pytest.raises(ManifestError, match="share 'docs': name used twice"):
+        lax.validate(_with_shares([{"name": "docs"}, {"name": "notes"}, {"name": "docs"}]))
+
+
+async def test_shares_round_trip_through_publish_and_directory(api):
+    shares = [{"name": "notes"}, {"name": "Docs"}, {"name": "runbooks.v2"}]
+    published = _with_shares(shares)
+    r = await api.client.put(api.url("/members/bob/manifest"), headers=auth("bob"), json=published)
+    assert r.status_code == 200, r.text
+    assert r.json()["capabilities"] == ["staging_db_query", "service_health"]
+    directory = await api.directory("alice")
+    assert directory["bob"]["manifest"] == published  # as published, order kept
+    assert directory["bob"]["manifest"]["shares"] == shares
+    # A manifest without shares comes back without the key; one with none, with [].
+    await api.publish("carol")
+    r = await api.client.put(
+        api.url("/members/bob/manifest"), headers=auth("bob"), json=_with_shares([])
+    )
+    assert r.status_code == 200
+    directory = await api.directory("alice")
+    assert "shares" not in directory["carol"]["manifest"]
+    assert directory["bob"]["manifest"]["shares"] == []
+
+
+@pytest.mark.parametrize(
+    "shares",
+    [
+        [{"name": "/Users/bob/docs"}],
+        [{"name": "docs", "path": "/Users/bob/docs"}],
+        [{"name": "docs"}, {"name": "docs"}],
+        [{"name": f"s{i}"} for i in range(17)],
+    ],
+    ids=["path", "extra key", "twice", "seventeen"],
+)
+async def test_a_manifest_with_bad_shares_is_422_and_not_stored(api, shares):
+    await api.publish("bob")
+    r = await api.client.put(
+        api.url("/members/bob/manifest"), headers=auth("bob"), json=_with_shares(shares)
+    )
+    assert r.status_code == 422 and r.json()["error"] == "invalid_manifest"
+    assert "shares" in r.json()["detail"]
+    assert (await api.directory("alice"))["bob"]["manifest"] == MANIFEST  # the earlier one
+    audit = [a for a in await api.store.list_audit(api.team) if a.action == "manifest.publish"]
+    assert [(a.outcome, a.detail) for a in audit] == [
+        ("published", None),
+        ("refused", "422 invalid_manifest"),
+    ]
