@@ -4,13 +4,16 @@ Lets the members of a small team ask each other's Claude Code sessions questions
 teammate to run one of a fixed set of named, parameterised operations (a *capability*). The
 answer is pushed into the asker's session over a Claude Code channel. The contract is
 `../docs/M1-SPEC.md` (this plugin is its §8, as corrected in §11), `../docs/M2-SPEC.md`
-§2 and §4 (Google identity, tool events, the console) and `../docs/M4-SPEC.md` (what the
-answering session may read, and how a member grants more).
+§2 and §4 (Google identity, tool events, the console), `../docs/M4-SPEC.md` (what the
+answering session may read, and how a member grants more), `../docs/M5-SPEC.md` (install
+with no questions, sign in with `/team-relay:login`) and `../docs/M6-SPEC.md` (owners manage
+members in the console).
 
 Each member runs two sessions:
 
 - **Working session** (your normal `claude`): the plugin's `relay` channel in *asker* role.
-  Tools `list_teammates`, `ask_question`, `invoke_capability`, `request_status`; answers,
+  Tools `list_teammates`, `ask_question`, `invoke_capability`, `request_status`, and
+  `login`, `logout`, `whoami` for signing in; answers,
   "no response yet" and "acknowledged but not answered" notices arrive as
   `<channel source="relay" ...>` events.
 - **Answering session** (`bin/answerer`): a separate, locked-down `claude` that receives
@@ -22,27 +25,21 @@ The repository root is a marketplace (`.claude-plugin/marketplace.json`, name
 `team-relay-dev`) with this one plugin.
 
 ```
-/plugin marketplace add /path/to/multiagent
+/plugin marketplace add <github-owner>/team-relay      # or a local clone's path
 /plugin install team-relay@team-relay-dev
 ```
 
-When the plugin is enabled, Claude Code asks the questions generated from `manifest.yaml`:
+There are no install questions (`.claude-plugin/plugin.json` has no `userConfig`): the relay
+URL defaults to the plugin's own relay (`relay.default.json`, the one place it is written),
+and capabilities are enabled where they run, in the answering session's environment.
 
-| Key | Type | What to answer |
-|---|---|---|
-| `relay_url` | string, required | The relay's base URL. `https://` (plain `http://` is accepted only for `localhost`). |
-| `relay_team` | string, required | Your team id, for example `demo`. |
-| `relay_auth` | `google` (default) or `token` | How you sign in: your own gcloud identity, or a static development token for a local relay. |
-| `gcloud_account` | string, optional | With `google`: the gcloud account (email) to use; empty means gcloud's active account. |
-| `relay_token` | string, sensitive, only for `token` | A static bearer token for a local relay (kept in the system keychain). |
-| `allow_production` | boolean, default off | Allow capabilities that touch production data. |
-| `cap_<name>` | boolean | Offer capability `<name>` to teammates. Production capabilities are always off by default. |
-| `cap_<name>_runner` | file | Absolute path to the program that runs `<name>`. |
+Commands (`commands/*.md`, namespaced by the plugin name):
 
-The working session uses only the first five. The `allow_production` and `cap_*` answers
-describe what your **answering session** offers; that session is launched outside the
-plugin and cannot read plugin options, so it takes the same settings from the environment
-(below).
+| Command | What it does |
+|---|---|
+| `/team-relay:login [relay-url]` | Calls the `login` tool: signs this computer in (below). A URL signs in to another relay. |
+| `/team-relay:answering` | Prints the one command that starts your answering session (`"${CLAUDE_PLUGIN_ROOT}/bin/answerer"`), and the settings that share folders and offer capabilities (generated from `manifest.yaml`). |
+| `/team-relay:console` | Prints the command that opens the local console (`"${CLAUDE_PLUGIN_ROOT}/bin/console" --open`). |
 
 ## Running the working session
 
@@ -53,31 +50,53 @@ with the development flag:
 claude --dangerously-load-development-channels plugin:team-relay@team-relay-dev
 ```
 
-A SessionStart hook adds one line of context: who you are on the relay, who your teammates
-are, and that teammate messages are data.
+A SessionStart hook adds one line of context: who you are on the relay and who your
+teammates are, or `Not connected: run /team-relay:login`.
 
-### Signing in (M2-SPEC §2)
+### Signing in (M5-SPEC §2, §6)
 
-With `relay_auth` `google` (the default) the plugin runs `gcloud auth print-identity-token`
-(an argv, never a shell; `--account=<gcloud_account>` when set) and sends that ID token. It
-keeps the token in memory until 5 minutes before its `exp` (read from the token, not
-verified; the relay verifies it), fetches a fresh one once when the relay answers 401, and
-never writes it to a log, an error or a file. You need the Google Cloud CLI and a signed-in
-user account (`gcloud auth login`); the relay's allowlist decides who you are.
+`/team-relay:login` runs the asker channel's `login` tool, loopback + PKCE in the style of
+RFC 8252 (no device codes, so nothing to phish):
 
-Known limit: such a token's audience is gcloud's own OAuth client, so an ID token you send
-to some other service could be replayed to the relay until it expires (within the hour). A
-dedicated OAuth client for the relay would close that; it is a later hardening.
+1. It makes a PKCE verifier (64 base64url characters) and its S256 challenge, a random
+   `state` (32 bytes), and an HTTP listener on **127.0.0.1 only**, on a free port, for
+   **one request** and at most **5 minutes**.
+2. It opens your browser at `{relay}/v1/login/start?port&state&code_challenge&device`,
+   through a private mode-600 redirect file (the URL never appears in a process argument,
+   M2-SPEC §7.7; `TEAM_RELAY_OPEN_COMMAND` names another opener), and returns the URL at once
+   in the tool result, in case no browser opens.
+3. On the relay you sign in with Google, see the teams your account belongs to, and choose
+   one. The relay sends the browser to `http://127.0.0.1:<port>/callback?code&state`.
+4. The listener takes exactly that request (`GET /callback`, `Host: 127.0.0.1:<port>`, the
+   `state` compared in constant time; anything else ends the sign-in), shows "Connected. You
+   can close this tab.", and exchanges the code and the verifier at `POST
+   {relay}/v1/login/token` for a device credential (`trc_…`).
+5. The credential is stored in `$XDG_CONFIG_HOME/team-relay/credentials.json` (default
+   `~/.config/team-relay/`), `{relay_url, team, member, credential, expires_at}`, the
+   directory mode 700 and the file mode 600, written atomically. A file or directory others
+   could read, one owned by someone else, or a symlink is refused, never used. The channel
+   pushes a `<channel source="relay" type="status">` line saying you are signed in, and its
+   stream starts without a restart.
 
-`token` is for the local emulator and tests only (the relay refuses static tokens on Cloud
-Run); it needs `relay_token` (or `RELAY_TOKEN` / `RELAY_TOKEN_FILE`).
+With no stored sign-in the channel starts anyway, waits quietly (it looks for the file every
+2 s, so a login from another session counts too), and every teammate tool answers `Not
+connected: run /team-relay:login`. A credential the relay refuses (401: signed out, expired,
+or removed from the team) is never retried in a loop: the tools and a status line say to run
+`/team-relay:login` again, and a new login reconnects. `whoami` says who you are signed in
+as; `logout` revokes the credential at the relay (`DELETE /credentials/self`) and deletes the
+file. The credential is only ever sent to the relay it came from.
+
+`RELAY_AUTH` (when set) wins over the stored credential: `google` signs in with your gcloud
+identity (`gcloud auth print-identity-token`, an argv, never a shell; `--account=` with
+`RELAY_GCLOUD_ACCOUNT`), cached until 5 minutes before its `exp` and refreshed once on a 401;
+it needs `RELAY_TEAM` (and `RELAY_URL` for another relay). `token` is for the local emulator
+and tests only (the relay refuses static tokens on Cloud Run). Unset, the credential file is
+used when there is one, else `google`.
 
 ## Running the answering session
 
 ```
-export RELAY_URL=https://relay.example.com
-export RELAY_TEAM=demo
-export RELAY_GCLOUD_ACCOUNT=you@example.com                  # optional; RELAY_AUTH=google is the default
+# after /team-relay:login: no relay settings needed
 export CAP_STAGING_DB_QUERY_ENABLED=true
 export CAP_STAGING_DB_QUERY_RUNNER=/absolute/path/to/your/runner
 export ANSWERER_READ_DIRS=~/src/orders-service:~/notes/runbooks   # optional: folders it may read without asking
@@ -110,7 +129,11 @@ only when it is inside a folder you share, or when you allow it at the moment it
 `bin/answerer` creates `${ANSWERER_HOME:-~/.claude-team-relay/answerer}` (mode 700) with:
 
 - `mcp.json`: the `relay` channel in *answerer* role and the `capabilities` server, with the
-  settings passed explicitly. With `RELAY_AUTH=google` (the default) no token is stored:
+  settings passed explicitly. With the stored sign-in (the default after `/team-relay:login`;
+  `dist/credential-info.js` checks the file by the same rules and prints only its relay,
+  team and member) the servers get `RELAY_AUTH=credential` and `RELAY_CREDENTIALS_FILE`, its
+  absolute path, and the relay and team come from it (`RELAY_URL` / `RELAY_TEAM`, when set,
+  must agree). Without one and with `RELAY_AUTH=google` no token is stored:
   the servers run gcloud themselves (`PATH`, `RELAY_GCLOUD_ACCOUNT` and any `CLOUDSDK_*`
   settings are passed through), and a `token` file left by an earlier token-mode run is
   removed. With `RELAY_AUTH=token` the token is handed over as `RELAY_TOKEN_FILE`; a
@@ -131,7 +154,8 @@ only when it is inside a folder you share, or when you allow it at the moment it
     (M2-SPEC §7.5). In the home directory: `~/.ssh/**`, `~/.gnupg/**`, `~/.aws/**`,
     `~/.config/gcloud/**`, `~/.azure/**`, `~/.kube/**`, `~/.docker/**`, `~/.netrc`,
     `~/.npmrc`, `~/.pypirc`, `~/.git-credentials`, `~/.claude/**`,
-    `~/.claude-team-relay/**`, `~/Library/Keychains/**`, `~/.config/gh/**`,
+    `~/.claude-team-relay/**`, `~/.config/team-relay/**` (the relay's own credential),
+    `~/Library/Keychains/**`, `~/.config/gh/**`,
     `~/.zsh_history`, `~/.bash_history`, `~/.*_history`,
     `~/Library/Application Support/**/Cookies*`, `~/Library/Application Support/Firefox/**`,
     `~/Library/Application Support/Google/Chrome/**`, `~/.terraform.d/**`,
@@ -142,15 +166,16 @@ only when it is inside a folder you share, or when you allow it at the moment it
     `.env`, `.env.*`, `.envrc`, `*.pem`, `*.key`, `id_rsa*`, `id_ed25519*`, `*.p12`, `*.pfx`,
     `*.keystore`, `*.jks`, `credentials.json`, `*.tfvars`, `keystore/**`;
   - and the session's own files: `~/.claude.json`, `ANSWERER_HOME`, the token file (token
-    mode), `CLOUDSDK_CONFIG` and your own `CLAUDE_CONFIG_DIR` when set (literal paths, with
+    mode), the credential file and its directory (also `$XDG_CONFIG_HOME/team-relay` when
+    set), `CLOUDSDK_CONFIG` and your own `CLAUDE_CONFIG_DIR` when set (literal paths, with
     glob characters escaped);
   - `PostToolUse`, `PostToolUseFailure` and `PermissionRequest` hooks (exec form,
     `"async": true`, so they run in the background and never delay a tool call or a dialog)
     running `node dist/tool-event.js --config $ANSWERER_HOME/tool-event.json` (below);
   - a `Notification` hook for `permission_prompt` only (exec form, async) running
     `node dist/notify-desktop.js` (below).
-- `tool-event.json`: the hook's relay settings (URL, team, sign-in mode, account or token
-  file path, state directory); no secret.
+- `tool-event.json`: the hook's relay settings (URL, team, sign-in mode, account, token file
+  or credential file path, state directory); no secret.
 - `state/` (mode 700): `active.json`, the requests this session has acknowledged and not yet
   answered (ids and times only, each with its answer deadline), written atomically by the
   answering channel, which clears it when it starts. An entry past its answer deadline is
@@ -232,9 +257,11 @@ is no longer open, so tool calls after it are not reported.
 
 | Name | Used by | Meaning |
 |---|---|---|
-| `RELAY_URL` | both servers, `bin/answerer` | Relay base URL. |
-| `RELAY_TEAM` | both servers, `bin/answerer` | Team id. |
-| `RELAY_AUTH` | both servers, `bin/answerer`, `bin/console` | `google` (default: `gcloud auth print-identity-token`) or `token`; `metadata` (the runtime service account) for the hosted console. |
+| `RELAY_URL` | both servers, `bin/answerer` | Relay base URL. From the stored sign-in by default; otherwise the plugin's default relay. |
+| `RELAY_TEAM` | both servers, `bin/answerer` | Team id. From the stored sign-in by default; needed for `google` and `token`. |
+| `RELAY_AUTH` | both servers, `bin/answerer`, `bin/console` | Unset: the stored credential if there is one, else `google`. `credential`, `google` (`gcloud auth print-identity-token`) or `token`; `metadata` (the runtime service account) for the hosted console. |
+| `RELAY_CREDENTIALS_FILE` | every part | Optional: the credential file's absolute path. Default `$XDG_CONFIG_HOME/team-relay/credentials.json` or `~/.config/team-relay/credentials.json`. |
+| `TEAM_RELAY_OPEN_COMMAND` | `login`, `bin/console --open` | Optional: an absolute path to the program that opens the browser, given only the redirect file's path (tests use a stub). |
 | `RELAY_GCLOUD_ACCOUNT` | both servers, `bin/answerer`, `bin/console` | Optional, with `google`: `--account=` for gcloud (an email address). |
 | `RELAY_TOKEN_FILE` / `RELAY_TOKEN` | both servers, `bin/answerer`, `bin/console` | Only with `token`: bearer token; the file wins, trailing newline stripped, re-read on every request. |
 | `RELAY_ROLE` | channel | `asker` or `answerer`. |
@@ -247,7 +274,8 @@ is no longer open, so tool calls after it are not reported.
 | `ANSWERER_HOME` | `bin/answerer` | Where the session's configuration lives (`mcp.json`, `settings.json`, `tool-event.json`, `config/`, `state/`). Default `~/.claude-team-relay/answerer`. |
 | `ANSWERER_STATE_DIR` | answerer channel | Set by `bin/answerer` to `$ANSWERER_HOME/state`: where `active.json` is kept. |
 | `CONSOLE_PORT` | `bin/console` | Default 4317; `0` picks a free port. |
-| `JOIN_REPO_URL` | console server | Optional: the `https://` URL of this repository, shown to new members in the console's join panel as the one to clone. |
+| `JOIN_MARKETPLACE` | console server | Optional: what the join panel tells new members to `/plugin marketplace add` (a GitHub `owner/repo`, or a plain `https://` URL). |
+| `JOIN_REPO_URL` | console server | Optional: the `https://` URL of this repository; a GitHub URL becomes the marketplace source when `JOIN_MARKETPLACE` is unset. |
 | `CONSOLE_MODE` | console server | `local` (default) or `hosted` (the container only). |
 | `PORT`, `CONSOLE_PUBLIC_HOST`, `IAP_AUDIENCE` | hosted console | Listening port (default 8080), the exact public host, the IAP audience. |
 | `ANSWERER_WORKDIR` | `bin/answerer` | The session's working directory: absolute, outside `$HOME`, empty. Default `${TMPDIR:-/tmp}/team-relay-answerer-<uid>/work`. |
@@ -279,7 +307,7 @@ synthetic example.
 
 ```
 bin/console --demo --open     # a synthetic team (demo: alice, bob, carol), no relay needed
-bin/console --open            # your team, with the RELAY_* settings above
+bin/console --open            # your team, with your stored sign-in (or the RELAY_* settings above)
 ```
 
 `bin/console` runs `node dist/console-server.js`, which binds **127.0.0.1 only** and prints
@@ -290,16 +318,24 @@ it back as `X-Console-Key` on every API call. The server:
 - refuses any request whose `Host` is not `127.0.0.1:<port>` or `localhost:<port>` (DNS
   rebinding), any `/api/*` call without the key (401) or with a wrong one (403, compared in
   constant time), and any call the browser marks cross-site; it sends no CORS headers;
-- proxies exactly four read-only GETs to the relay with your own credentials:
-  `/api/me`, `/api/directory`, `/api/activity` (`since`, `limit`) and `/api/requests/{id}`.
-  Nothing else is proxied and no other method is accepted: nothing can be sent, acked or
-  replied from the console;
+- proxies five GETs to the relay with your own credentials: `/api/me`, `/api/directory`,
+  `/api/activity` (`since`, `limit`), `/api/requests/{id}` and `/api/roster` (M6-SPEC §2);
+- proxies an owner's roster changes and nothing else (M6-SPEC §3): `POST /api/roster`
+  `{member, email, role?}`, `PATCH /api/roster/{member}` `{add_email?, remove_email?, role?}`
+  and `DELETE /api/roster/{member}`. Each needs `Content-Type: application/json` (else 415)
+  and `Sec-Fetch-Site: same-origin` (else 403, before anything is read), a body of at most
+  4 KiB that is checked here (known fields only, a member id, lower-cased emails) before it is
+  sent on once, never retried. The relay decides whether you are an owner. Every other
+  method and path is refused: nothing can be sent, acked or replied from the console;
+- passes a relay refusal on as `502 {"error": "relay_refused", "relay_status",
+  "relay_error", "detail"}`, so the Members panel can say why a change was refused;
 - answers `GET /api/join` itself, never asking the relay, behind the same key (IAP when
-  hosted): `{"relay_url", "team", "repo_url", "marketplace": "team-relay-dev", "plugin":
-  "team-relay"}` from `RELAY_URL`, `RELAY_TEAM` and `JOIN_REPO_URL` (`null` when unset;
-  demo values with `--demo`). The console's *Join the team* panel builds its install steps
-  from it. Nothing in it is secret; a `JOIN_REPO_URL` that is not a plain `https://` URL
-  (no credentials, query or fragment) stops the server at startup;
+  hosted): `{"relay_url", "team", "repo_url", "marketplace_source", "marketplace":
+  "team-relay-dev", "plugin": "team-relay", "default_relay"}` from the relay and team in use,
+  `JOIN_MARKETPLACE` and `JOIN_REPO_URL` (`null` when unset; demo values with `--demo`);
+  `default_relay` says whether a bare `/team-relay:login` reaches this relay. The console's
+  *Join the team* panel builds its three steps from it. Nothing in it is secret; a
+  `JOIN_REPO_URL` or `JOIN_MARKETPLACE` that is not plain stops the server at startup;
 - with `--open`, opens the console without putting the key in any process's arguments
   (which other local users can list): it writes a mode-600 HTML file that redirects to the
   URL into a private temp directory (mode 700), hands the browser opener (`open` on macOS,
@@ -333,9 +369,13 @@ The same server runs in a container on Cloud Run behind IAP (`Dockerfile.console
   minutes), `iss` `https://cloud.google.com/iap`, `aud` exactly `IAP_AUDIENCE`, `exp` and
   `iat` within 30 s of skew, and an `email` claim. Anything else is a bare `401`; the reason
   is logged, the token and the email never are;
-- proxies the same four GETs, with the service account's ID token (`RELAY_AUTH=metadata`,
+- proxies the same routes, with the service account's ID token (`RELAY_AUTH=metadata`,
   required in hosted mode) and `X-Relay-On-Behalf-Of: <viewer email, lower-cased>`; the
-  relay reads as that member (M3-SPEC §2).
+  relay acts as that member (M3-SPEC §2; roster changes need the delegate's `manage-roster`
+  scope and an owner, M6-SPEC §3);
+- answers `403 {"error": "not_on_team", "email"}` when the relay does not know the signed-in
+  account (IAP admits any Google account, M6-SPEC §5), and the console shows "You're not on
+  this team yet. Ask the owner to add <email>." with no data.
 
 `IAP_AUDIENCE` for a Cloud Run service is, in Google's "signed headers" documentation,
 `/projects/PROJECT_NUMBER/locations/REGION/services/SERVICE_NAME` (the project *number*).
@@ -372,11 +412,12 @@ fetches a fresh one once when the relay answers 401.
   `default`, `request_id` is reserved, integers and numbers must be finite and within ±2^53
   (`5.0` is the integer 5), `max_length` counts code points, and strings with lone
   surrogates are rejected.
-- **Production data is opt-in** at install and in the answering session's environment.
+- **Production data is opt-in** in the answering session's environment.
 - **Identity is the relay's.** The sender of every message is the member the relay
   resolved from a verified credential; nothing a client writes can claim another sender.
-- The token (static or Google ID token) is never logged, never put in an error and never
-  written to a file by the plugin. All logs go to stderr (stdout is the MCP transport).
+- The token (device credential, static or Google ID token) is never logged, never put in an
+  error or a tool result. The only file the plugin writes one to is the credential file
+  (mode 600). All logs go to stderr (stdout is the MCP transport).
 - **The answering session reads nothing by default**: only folders you share, and files or
   folders you allow in Claude Code's own dialog for that session; credential stores stay
   denied whatever you answer. These are permission rules, not an OS sandbox (see above).
@@ -392,10 +433,10 @@ fetches a fresh one once when the relay answers 401.
 pnpm install
 pnpm typecheck
 pnpm test             # builds dist/ first; the stdio suites drive node dist/*.js
-pnpm build            # esbuild → dist/{channel,capabilities,session-start,tool-event,notify-desktop,console-server}.js (committed); never touches dist/console/
-pnpm generate         # manifest.yaml → .claude-plugin/plugin.json userConfig and .mcp.json
+pnpm build            # esbuild → dist/{channel,capabilities,session-start,tool-event,notify-desktop,console-server,credential-info}.js (committed); never touches dist/console/
+pnpm generate         # manifest.yaml → commands/answering.md, and plugin.json (no userConfig) and .mcp.json
 pnpm generate --check # fails when those files are out of date
-../scripts/e2e.sh     # the M1 gate (all seven §9 scenarios) and the M2 scenarios when the relay serves them
+../scripts/e2e.sh     # the M1 gate, the M2 scenarios, and the M5/M6 sign-in and roster scenarios when the relay serves them
 ```
 
 `pnpm test` never runs `test/e2e/`. `../scripts/e2e.sh` (Docker and `../relay/.venv` needed)
