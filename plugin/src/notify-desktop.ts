@@ -19,12 +19,21 @@ export const NOTICE_TEXT = 'Team relay: your answering session is waiting for yo
 const CAP_MS = 3000;
 const STDIN_LIMIT = 1024 * 1024;
 
-/** The command that shows the notice on `platform`, or null where there is none. Constants only. */
-export function notifyCommand(platform: NodeJS.Platform): { file: string; args: string[] } | null {
+/** M8-SPEC §4: the host's notice when an answer waits for the member's approval. */
+export const APPROVAL_TEXT = 'Team relay: an answer is waiting for your approval';
+const TEXTS = [NOTICE_TEXT, APPROVAL_TEXT] as const;
+export type NoticeText = (typeof TEXTS)[number];
+
+/**
+ * The command that shows `text` (one of the fixed notices, nothing else) on `platform`, or null
+ * where there is none.
+ */
+export function notifyCommand(platform: NodeJS.Platform, text: NoticeText = NOTICE_TEXT): { file: string; args: string[] } | null {
+  if (!(TEXTS as readonly string[]).includes(text)) return null;
   if (platform === 'darwin') {
-    return { file: 'osascript', args: ['-e', `display notification "${NOTICE_TEXT}" with title "${NOTICE_TITLE}"`] };
+    return { file: 'osascript', args: ['-e', `display notification "${text}" with title "${NOTICE_TITLE}"`] };
   }
-  if (platform === 'linux') return { file: 'notify-send', args: [NOTICE_TITLE, NOTICE_TEXT] };
+  if (platform === 'linux') return { file: 'notify-send', args: [NOTICE_TITLE, text] };
   return null;
 }
 
