@@ -283,20 +283,29 @@ async def test_only_owners_mutate(api: Api):
 
 
 async def test_patch_emails_and_roles(api: Api):
-    r = await _patch(api, "bob", {"add_email": "Bob.Work@Example.com"})
+    # An owner adds their own second account (M6-SPEC §7.1).
+    r = await _patch(api, "alice", {"add_email": "Alice.Work@Example.com"})
     assert r.status_code == 200 and r.json()["emails"] == [
-        "bob@example.com",
-        "bob.work@example.com",
+        "alice@example.com",
+        "alice.work@example.com",
     ]
-    r = await _patch(api, "bob", {"remove_email": "bob@example.com", "role": "owner"})
-    assert r.status_code == 200
-    assert r.json()["emails"] == ["bob.work@example.com"] and r.json()["role"] == "owner"
+    r = await _patch(api, "alice", {"remove_email": "alice@example.com"})
+    assert r.status_code == 200 and r.json()["emails"] == ["alice.work@example.com"]
     # Swap the last email in one call.
-    r = await _patch(api, "bob", {"remove_email": "bob.work@example.com", "add_email": "b@x.io"})
-    assert r.status_code == 200 and r.json()["emails"] == ["b@x.io"]
+    r = await _patch(
+        api, "alice", {"remove_email": "alice.work@example.com", "add_email": "a@x.io"}
+    )
+    assert r.status_code == 200 and r.json()["emails"] == ["a@x.io"]
+    # Another member's role, and an email taken off another member's entry.
+    r = await _patch(api, "bob", {"role": "owner"})
+    assert r.status_code == 200 and r.json()["role"] == "owner"
+    assert (await _patch(api, "bob", {"add_email": "bob.work@example.com"}, by="bob")).is_success
+    r = await _patch(api, "bob", {"remove_email": "bob@example.com", "role": "member"})
+    assert r.status_code == 200
+    assert r.json()["emails"] == ["bob.work@example.com"] and r.json()["role"] == "member"
     # A no-op changes nothing and writes nothing.
     version = await api.store.roster_version(api.team)
-    r = await _patch(api, "bob", {"role": "owner"})
+    r = await _patch(api, "bob", {"role": "member"})
     assert r.status_code == 200 and await api.store.roster_version(api.team) == version
 
 
@@ -312,8 +321,13 @@ async def test_patch_emails_and_roles(api: Api):
         ("nobody", {"role": "owner"}, 404, "not_found"),
         ("bob", {"remove_email": "bob@example.com"}, 409, "last_email"),
         ("bob", {"remove_email": "carol@example.com"}, 409, "no_such_email"),
-        ("bob", {"add_email": "carol@example.com"}, 409, "email_taken"),
-        ("bob", {"add_email": "bob@example.com"}, 409, "email_taken"),
+        ("alice", {"add_email": "carol@example.com"}, 409, "email_taken"),
+        ("alice", {"add_email": "alice@example.com"}, 409, "email_taken"),
+        # M6-SPEC §7.1: never an email onto someone else's entry, whatever else is asked.
+        ("bob", {"add_email": "carol@example.com"}, 403, "forbidden"),
+        ("bob", {"add_email": "b2@example.com"}, 403, "forbidden"),
+        ("bob", {"add_email": "b2@example.com", "role": "owner"}, 403, "forbidden"),
+        ("nobody", {"add_email": "n@example.com"}, 403, "forbidden"),
         ("alice", {"role": "member"}, 409, "last_owner"),
     ],
 )
@@ -324,8 +338,8 @@ async def test_patch_refusals(api: Api, member: str, body: Any, status: int, err
 
 async def test_at_most_five_emails(api: Api):
     for i in range(4):
-        assert (await _patch(api, "bob", {"add_email": f"b{i}@example.com"})).status_code == 200
-    r = await _patch(api, "bob", {"add_email": "b9@example.com"})
+        assert (await _patch(api, "alice", {"add_email": f"a{i}@example.com"})).status_code == 200
+    r = await _patch(api, "alice", {"add_email": "a9@example.com"})
     assert (r.status_code, r.json()["error"]) == (409, "too_many_emails")
 
 
@@ -373,9 +387,16 @@ async def test_the_last_owner_cannot_be_removed_and_seed_members_stay(api: Api):
 # Retired ids --------------------------------------------------------------------------------
 
 
+async def _own_email(api: Api, member: str, email: str, new: str) -> None:
+    """``member`` (an owner) signs in with ``email`` and adds ``new`` to their own entry."""
+    cred = bearer((await login(api, member, email=email))["credential"])
+    r = await api.client.patch(api.url(f"/roster/{member}"), headers=cred, json={"add_email": new})
+    assert r.status_code == 200, r.text
+
+
 async def test_a_removed_id_goes_back_only_to_the_same_person_while_retired(api: Api):
-    assert (await _add(api, "erin", "erin@example.com")).status_code == 201
-    assert (await _patch(api, "erin", {"add_email": "erin.work@example.com"})).status_code == 200
+    assert (await _add(api, "erin", "erin@example.com", role="owner")).status_code == 201
+    await _own_email(api, "erin", "erin@example.com", "erin.work@example.com")
     assert (await _delete(api, "erin")).status_code == 200
     # Someone else under the old id would read its inbox and requests: refused.
     r = await _add(api, "erin", "someone.else@example.com")
@@ -391,8 +412,8 @@ async def test_a_removed_id_goes_back_only_to_the_same_person_while_retired(api:
 async def test_a_retired_id_keeps_every_email_it_had(api: Api):
     assert (await _add(api, "erin", "e1@example.com")).status_code == 201
     assert (await _delete(api, "erin")).status_code == 200
-    assert (await _add(api, "erin", "e1@example.com")).status_code == 201
-    assert (await _patch(api, "erin", {"add_email": "e2@example.com"})).status_code == 200
+    assert (await _add(api, "erin", "e1@example.com", role="owner")).status_code == 201
+    await _own_email(api, "erin", "e1@example.com", "e2@example.com")
     assert (await _patch(api, "erin", {"remove_email": "e1@example.com"})).status_code == 200
     assert (await _delete(api, "erin")).status_code == 200
     assert (await _add(api, "erin", "e1@example.com")).status_code == 201
@@ -507,24 +528,30 @@ async def test_changes_are_audited_with_email_hashes_only(api: Api):
     # One second apart: the audit is ordered by time, and entries of one instant are not.
     await _add(api, "erin", "erin@example.com")
     api.clock.advance(1)
-    await _patch(api, "erin", {"add_email": "erin.two@example.com", "role": "owner"})
+    await _patch(api, "erin", {"role": "owner"})
+    api.clock.advance(1)
+    erin = bearer((await login(api, "erin", email="erin@example.com"))["credential"])
+    api.clock.advance(1)
+    r = await api.client.patch(
+        api.url("/roster/erin"), headers=erin, json={"add_email": "erin.two@example.com"}
+    )
+    assert r.status_code == 200
     api.clock.advance(1)
     await _patch(api, "erin", {"remove_email": "erin@example.com"})
     api.clock.advance(1)
     await _delete(api, "erin")
     entries = [e for e in await api.store.list_audit(api.team) if e.action.startswith("roster.")]
-    # One PATCH files its email and role entries at one instant: compare those as a set.
-    assert [(e.action, e.actor, e.member, e.outcome) for e in entries[:1] + entries[3:]] == [
+    assert [(e.action, e.actor, e.member, e.outcome) for e in entries] == [
         ("roster.add", "alice", "erin", "added"),
+        ("roster.role", "alice", "erin", "changed"),
+        ("roster.bind", "erin", "erin", "bound"),  # her first sign-in (M6-SPEC §7.2)
+        ("roster.email_add", "erin", "erin", "changed"),
         ("roster.email_remove", "alice", "erin", "changed"),
         ("roster.remove", "alice", "erin", "removed"),
     ]
-    assert {(e.action, e.outcome) for e in entries[1:3]} == {
-        ("roster.email_add", "changed"),
-        ("roster.role", "changed"),
-    }
     by_action = {e.action: e for e in entries}
     assert by_action["roster.add"].email_sha256 == [_sha("erin@example.com")]
+    assert by_action["roster.bind"].email_sha256 == [_sha("erin@example.com")]
     assert by_action["roster.email_add"].email_sha256 == [_sha("erin.two@example.com")]
     assert by_action["roster.email_remove"].email_sha256 == [_sha("erin@example.com")]
     assert by_action["roster.role"].email_sha256 == []

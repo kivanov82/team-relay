@@ -73,6 +73,7 @@ from .store import (
     ToolEvent,
     credentials_over_cap,
     monotonic_updated_at,
+    revocable_by_email,
     stamp_deliveries,
 )
 
@@ -352,6 +353,8 @@ def _roster_to_doc(entry: RosterEntry) -> dict[str, Any]:
         "added_by": entry.added_by,
         "added_at": entry.added_at,
         "updated_at": entry.updated_at,
+        # A list, not a map: an email is not a safe Firestore field name.
+        "subs": [{"email": e, "sub": entry.subs[e]} for e in sorted(entry.subs)],
     }
 
 
@@ -363,6 +366,7 @@ def _roster_from_doc(doc: dict[str, Any]) -> RosterEntry:
         added_by=doc["added_by"],
         added_at=_dt(doc["added_at"]),  # type: ignore[arg-type]
         updated_at=_dt(doc["updated_at"]),  # type: ignore[arg-type]
+        subs={b["email"]: b["sub"] for b in doc.get("subs") or []},
     )
 
 
@@ -394,6 +398,7 @@ def _credential_to_doc(record: CredentialRecord) -> dict[str, Any]:
         "expire_at": record.expire_at,
         "revoked": record.revoked,
         "revoked_at": record.revoked_at,
+        "email_sha256": record.email_sha256,
     }
 
 
@@ -408,6 +413,7 @@ def _credential_from_doc(key: str, doc: dict[str, Any]) -> CredentialRecord:
         expire_at=_dt(doc["expire_at"]),  # type: ignore[arg-type]
         revoked=bool(doc.get("revoked")),
         revoked_at=_dt(doc.get("revoked_at")),
+        email_sha256=doc.get("email_sha256"),
     )
 
 
@@ -425,6 +431,7 @@ def _login_to_doc(login: LoginDoc) -> dict[str, Any]:
         "csrf_sha256": login.csrf_sha256,
         "email": login.email,
         "choices": [{"team": c.team, "member": c.member} for c in login.choices],
+        "sub": login.sub,
     }
 
 
@@ -443,6 +450,7 @@ def _login_from_doc(key: str, doc: dict[str, Any]) -> LoginDoc:
         csrf_sha256=doc.get("csrf_sha256"),
         email=doc.get("email"),
         choices=[LoginChoice(team=c["team"], member=c["member"]) for c in doc.get("choices") or []],
+        sub=doc.get("sub"),
     )
 
 
@@ -457,6 +465,7 @@ def _code_to_doc(code: LoginCode) -> dict[str, Any]:
         "expire_at": code.expire_at,
         "used": code.used,
         "credential_key": code.credential_key,
+        "email": code.email,
     }
 
 
@@ -472,6 +481,7 @@ def _code_from_doc(key: str, doc: dict[str, Any]) -> LoginCode:
         expire_at=_dt(doc["expire_at"]),  # type: ignore[arg-type]
         used=bool(doc.get("used")),
         credential_key=doc.get("credential_key"),
+        email=doc.get("email"),
     )
 
 
@@ -958,8 +968,11 @@ class FirestoreStore:
             if not change.changed:
                 return RosterOutcome(result=change.result, version=state.version, revoked=[])
             counts = await self._read_quotas(txn, team, quotas)  # raising writes nothing
-            to_revoke: list[str] = []
-            for member in change.remove:
+            to_revoke: set[str] = set()
+            by_email: dict[str, list[str]] = {}
+            for member, email_sha256 in change.revoke_email:
+                by_email.setdefault(member, []).append(email_sha256)
+            for member in sorted(set(change.remove) | set(by_email)):
                 query = (
                     self._team(team)
                     .collection("credentials")
@@ -967,8 +980,12 @@ class FirestoreStore:
                 )
                 async for snap in query.stream(transaction=txn):
                     record = _credential_from_doc(snap.id, snap.to_dict() or {})
-                    if record.live(now):
-                        to_revoke.append(record.key)
+                    if not record.live(now):
+                        continue
+                    if member in change.remove or any(
+                        revocable_by_email(record, member, h) for h in by_email.get(member, ())
+                    ):
+                        to_revoke.add(record.key)
             # All reads are done; writes from here on.
             self._write_quotas(txn, team, quotas, counts)
             for key in sorted(to_revoke):

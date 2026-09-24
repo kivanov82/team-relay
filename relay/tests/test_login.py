@@ -120,9 +120,11 @@ async def test_the_whole_flow_yields_a_working_credential(api: Api, capsys):
     assert r.status_code == 200, r.text
     assert r.headers["cache-control"] == "no-store"
     body = r.json()
-    assert set(body) == {"credential", "team", "member", "relay_url", "expires_at"}
+    assert set(body) == {"credential", "team", "member", "email", "relay_url", "expires_at"}
     assert re.fullmatch(r"trc_[A-Za-z0-9_-]{43}", body["credential"])
     assert (body["team"], body["member"], body["relay_url"]) == (api.team, "alice", PUBLIC_URL)
+    # M5-SPEC §9.3: who the member became, by the Google account they signed in with.
+    assert body["email"] == "alice@example.com"
     assert body["expires_at"] == "2026-12-22T12:00:00.000Z"  # 90 days
 
     # The credential is alice on this team.

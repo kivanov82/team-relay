@@ -20,7 +20,7 @@ import pytest
 from fastapi import FastAPI
 
 from relay.app import create_app
-from relay.auth import StaticVerifier, Unauthenticated
+from relay.auth import StaticVerifier, Unauthenticated, Verified
 from relay.config import Settings, load_schema, parse_team_config
 from relay.store import Store
 from relay.store_memory import MemoryStore
@@ -73,18 +73,39 @@ def principal(token: str) -> str:
     return "token:sha256:" + hashlib.sha256(token.encode()).hexdigest()
 
 
+# Google ID tokens as the Google verifier would read them (a gcloud user's): token ->
+# (principal, sub). Tests register throwaway tokens of their own (unique per test).
+ID_TOKENS: dict[str, tuple[str, str]] = {}
+
+
+def id_token(email: str, sub: str) -> str:
+    """A throwaway bearer token the test verifier reads as ``google:<email>`` with ``sub``."""
+    token = "id-token-" + uuid.uuid4().hex
+    ID_TOKENS[token] = (f"google:{email}", sub)
+    return token
+
+
 class DelegateVerifier:
     """The static verifier, except that a delegate's token yields its Google principal (in
-    production the Google verifier does that from the service account's ID token)."""
+    production the Google verifier does that from the service account's ID token), and a
+    token made by :func:`id_token` a Google principal with its ``sub``."""
 
     def __init__(self) -> None:
         self._static = StaticVerifier()
         self._delegates = {DELEGATE_TOKENS[t]: DELEGATES[t] for t in DELEGATE_TOKENS}
 
     async def principal(self, token: str) -> str:
+        return (await self.verify(token)).principal
+
+    async def verify(self, token: str) -> Verified:
         if not token:
             raise Unauthenticated("empty_token")
-        return self._delegates.get(token) or await self._static.principal(token)
+        if token in ID_TOKENS:
+            principal, sub = ID_TOKENS[token]
+            return Verified(principal, sub)
+        if token in self._delegates:
+            return Verified(self._delegates[token], "delegate-sub-" + token[-4:])
+        return await self._static.verify(token)
 
 
 def team_config_data(**limits: int) -> dict[str, Any]:

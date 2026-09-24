@@ -15,13 +15,19 @@
   its messages can live: while retired, it can be given again only to someone holding one of
   the emails it had (the same person coming back). Otherwise a new person under an old id
   would read that id's inbox and requests.
+- No identity handover by email (M6-SPEC §7.1): an owner adds an email only to their own
+  entry; taking an email off anyone revokes, in the same transaction, every credential
+  minted through it.
+- Accounts are bound by Google ``sub`` (M6-SPEC §7.2): :func:`plan_bind` records, per roster
+  email, the ``sub`` of the first account that signs in with it; a later sign-in with that
+  email from another account is refused. Removing the email drops its binding.
 """
 
 from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -77,6 +83,11 @@ class TeamRoster:
     def role(self, member: str) -> str | None:
         entry = self.entries.get(member)
         return entry.role if entry is not None else None
+
+    def sub_for(self, member: str, email: str) -> str | None:
+        """The ``sub`` the member's ``email`` is bound to, or None while unbound."""
+        entry = self.entries.get(member)
+        return entry.subs.get(email) if entry is not None else None
 
 
 @dataclass
@@ -140,6 +151,20 @@ class Roster:
         if team not in self._config.teams:
             return None
         return (await self.snapshot(team)).member_for_email(email)
+
+    async def bind(self, team: str, member: str, email: str, sub: str, retention: timedelta) -> str:
+        """Bind ``member``'s ``email`` to ``sub`` unless it is bound already, in one roster
+        transaction (M6-SPEC §7.2). Returns ``"bound"`` (recorded now), ``"same"`` (already
+        bound to ``sub``), ``"other"`` (bound to another account: refuse) or ``"gone"``
+        (the member no longer holds the email)."""
+        now = self._now()
+        outcome = await self._store.mutate_roster(
+            team, plan_bind(team, member, email, sub, now, retention), now
+        )
+        if outcome.result == "bound":
+            self._cache.pop(team, None)
+            log_event("roster_bound", team=team, member=member)
+        return outcome.result
 
     async def teams_for_email(self, email: str, *, fresh: bool = False) -> list[tuple[str, str]]:
         """Every ``(team, member)`` whose roster holds ``email``, in the file's team order."""
@@ -218,6 +243,35 @@ def entry_json(entry: RosterEntry, *, show_emails: bool) -> dict[str, Any]:
         "added_by": entry.added_by,
         "added_at": format_time(entry.added_at),
     }
+
+
+def plan_bind(
+    team: str, member: str, email: str, sub: str, now: datetime, retention: timedelta
+) -> Callable[[RosterState], RosterChange[str]]:
+    """Record ``sub`` on ``member``'s ``email`` when it has none (see :meth:`Roster.bind`)."""
+
+    def fn(state: RosterState) -> RosterChange[str]:
+        current = state.entries.get(member)
+        if current is None or email not in current.emails:
+            return RosterChange(result="gone")
+        bound = current.subs.get(email)
+        if bound is not None:
+            return RosterChange(result="same" if bound == sub else "other")
+        entry = replace(current, subs={**current.subs, email: sub}, updated_at=now)
+        audit = _audit(
+            team,
+            member,
+            "roster.bind",
+            "bound",
+            now,
+            retention,
+            member=member,
+            email_sha256=[email_hash(email)],
+            detail="google account bound",
+        )
+        return RosterChange(result="bound", put=[entry], audit=[audit])
+
+    return fn
 
 
 def _require_owner(state: RosterState, actor: str) -> None:
@@ -363,10 +417,21 @@ def plan_update(
 ) -> Callable[[RosterState], RosterChange[RosterEntry]]:
     def fn(state: RosterState) -> RosterChange[RosterEntry]:
         _require_owner(state, actor)
+        if body.add_email is not None and member != actor:
+            # M6-SPEC §7.1: an email added to someone else's entry would let its holder sign
+            # in as them. An owner adds only their own second account.
+            raise ApiError(
+                403,
+                "forbidden",
+                "An email can be added only to your own entry; "
+                "to change someone's account, remove and re-add the member.",
+            )
         current = state.entries.get(member)
         if current is None:
             raise ApiError(404, "not_found")
         emails = list(current.emails)
+        subs = dict(current.subs)
+        revoke: list[tuple[str, str]] = []
         audit: list[AuditEntry] = []
 
         def note(action: str, detail: str, hashes: Sequence[str] = ()) -> None:
@@ -390,6 +455,8 @@ def plan_update(
             if len(emails) == 1 and body.add_email is None:
                 raise ApiError(409, "last_email", "A member keeps at least one email.")
             emails.remove(body.remove_email)
+            subs.pop(body.remove_email, None)  # §7.2: its binding goes with it
+            revoke.append((member, email_hash(body.remove_email)))  # §7.1
             note("roster.email_remove", "email removed", [email_hash(body.remove_email)])
         if body.add_email is not None:
             holder = _email_holder(state, body.add_email)
@@ -416,8 +483,9 @@ def plan_update(
             added_by=current.added_by,
             added_at=current.added_at,
             updated_at=now,
+            subs=subs,
         )
-        return RosterChange(result=entry, put=[entry], audit=audit)
+        return RosterChange(result=entry, put=[entry], audit=audit, revoke_email=revoke)
 
     return fn
 

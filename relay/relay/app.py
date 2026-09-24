@@ -9,12 +9,17 @@ and validated by hand, after authentication, so the order of refusals is always
 Who the caller is (M5-SPEC §3, §4; M6-SPEC §1):
 - ``Bearer trc_…``: a device credential; its team and member, while the member is on that
   team's roster (and was added no later than the credential was minted).
+  A credential that records the email it was minted through stops working as soon as the
+  entry no longer holds that email (M6-SPEC §7.1; the removal also revokes it).
 - any other bearer token: the verifier's principal. A delegate's principal (M3-SPEC §2)
   names the member it acts for in ``X-Relay-On-Behalf-Of``; a ``google:`` principal is the
-  member of the URL's team whose roster entry holds the email; a ``token:sha256:`` principal
+  member of the URL's team whose roster entry holds the email, and when that email is bound
+  to a Google ``sub`` (M6-SPEC §7.2) the ID token's ``sub`` must be it (an unbound email is
+  bound to it on the first call to its own team); a ``token:sha256:`` principal
   (development) the member the team file names for the URL's team, while on the roster. A
   principal that is a member of another team but not this one gets ``404``; one that is a
-  member of no team ``401``.
+  member of no team ``401`` (M6-SPEC §7.4). A delegate's token names the console's service
+  account, not the member, so the delegate path has no ``sub`` to check.
 
 A delegate may reach only the GET routes in DELEGATE_ROUTES, and with ``manage-roster`` the
 roster mutations in ROSTER_MUTATIONS (the service then requires the member it names to be an
@@ -28,6 +33,7 @@ from __future__ import annotations
 import os
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
+from datetime import timedelta
 from typing import Any
 
 from fastapi import Depends, FastAPI, Request
@@ -35,7 +41,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from .auth import Unauthenticated, Verifier, bearer_token, build_verifier
+from .auth import Unauthenticated, Verified, Verifier, bearer_token, build_verifier
 from .clock import Clock, utc_now
 from .config import Delegate, Identity, Settings, normalise_email
 from .credentials import looks_like_credential
@@ -46,6 +52,7 @@ from .login import LoginService
 from .manifest import ManifestValidator
 from .oauth import GoogleOAuthProvider, OAuthProvider
 from .pages import stylesheet_response
+from .roster import email_hash
 from .service import Caller, RelayService
 from .store import Store
 
@@ -237,24 +244,50 @@ def create_app(
             raise NotAMember("not_a_member")
         return Identity(team=delegate.team, member=member)
 
-    async def member_in(principal: str, team: str) -> str | None:
+    retention = timedelta(days=config.audit_retention_days)
+
+    async def member_in(verified: Verified, team: str) -> tuple[str | None, bool]:
+        """The principal's member in ``team`` and whether its email still needs binding;
+        ``(None, True)`` when the email is bound to another Google account."""
+        principal = verified.principal
         if principal.startswith("google:"):
-            return await roster.member_for_email(team, principal.removeprefix("google:"))
+            email = principal.removeprefix("google:")
+            snapshot = await roster.snapshot(team)
+            member = snapshot.member_for_email(email)
+            if member is None or verified.sub is None:
+                return member, False
+            bound = snapshot.sub_for(member, email)
+            if bound is None:
+                return member, True
+            return (member, False) if bound == verified.sub else (None, True)
         member = config.token_member(principal, team)
         if member is None or member not in (await roster.snapshot(team)).entries:
-            return None
-        return member
+            return None, False
+        return member, False
 
-    async def resolve(principal: str, team: str) -> Identity:
+    async def resolve(verified: Verified, team: str) -> Identity:
         """The principal's membership in ``team``, else in the first other team that has
-        one (for the 404), else 401 (M5-SPEC §4)."""
+        one (for the 404), else 401 (M5-SPEC §4, M6-SPEC §7.4). A Google account whose
+        email is bound to another ``sub`` is not that member (M6-SPEC §7.2)."""
         order = [team] if team in config.teams else []
         order += [t for t in config.team_ids() if t != team]
+        rebound = False
         for candidate in order:
-            member = await member_in(principal, candidate)
-            if member is not None:
-                return Identity(team=candidate, member=member)
-        raise Unauthenticated("unknown_principal")
+            member, flag = await member_in(verified, candidate)
+            if member is None:
+                rebound = rebound or flag
+                continue
+            if flag and candidate == team:
+                # The email's first use by a Google ID token on its own team binds it.
+                assert verified.sub is not None
+                email = verified.principal.removeprefix("google:")
+                outcome = await roster.bind(team, member, email, verified.sub, retention)
+                if outcome == "other":
+                    raise Unauthenticated("sub_mismatch")
+                if outcome == "gone":
+                    raise Unauthenticated("not_on_roster")
+            return Identity(team=candidate, member=member)
+        raise Unauthenticated("sub_mismatch" if rebound else "unknown_principal")
 
     async def from_credential(token: str) -> tuple[Identity, str]:
         record = await service.credentials.authenticate(token)
@@ -264,6 +297,12 @@ def create_app(
         # Removed (M5-SPEC §3), or removed and added again since this credential was minted.
         if entry is None or record.created_at < entry.added_at:
             raise Unauthenticated("not_on_roster")
+        # Minted through an email the entry no longer holds (M6-SPEC §7.1): the removal
+        # revoked it; this holds on an instance whose credential cache has not seen that yet.
+        if record.email_sha256 is not None and record.email_sha256 not in {
+            email_hash(e) for e in entry.emails
+        }:
+            raise Unauthenticated("email_removed")
         return Identity(team=record.team, member=record.member), record.key
 
     async def authenticate(request: Request, team: str) -> Caller:
@@ -276,13 +315,13 @@ def create_app(
             if looks_like_credential(token):
                 identity, credential = await from_credential(token)
             else:
-                principal = await verifier.principal(token)
+                verified = await verifier.verify(token)
                 # A delegate is never a member (M3-SPEC §2): checked first.
-                delegate = config.delegate(principal)
+                delegate = config.delegate(verified.principal)
                 if delegate is not None:
                     identity = await on_behalf_of(request, delegate)
                 else:
-                    identity = await resolve(principal, team)
+                    identity = await resolve(verified, team)
         except Unauthenticated as exc:
             # Structured, and never the token (§2) or the on-behalf value.
             log_event(

@@ -31,6 +31,8 @@ from .errors import ApiError
 GOOGLE_ISSUERS = frozenset({"accounts.google.com", "https://accounts.google.com"})
 GOOGLE_CERTS_URL = "https://www.googleapis.com/oauth2/v1/certs"
 
+# Google's ``sub``: an opaque ASCII identifier of the account, at most 255 characters.
+SUB_SHAPE = re.compile(r"[\x21-\x7e]{1,255}")
 # Google ID tokens are about 1 KiB; anything much longer is not one.
 MAX_TOKEN_LENGTH = 4096
 JWT_SHAPE = re.compile(r"[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+")
@@ -56,9 +58,22 @@ class Unauthenticated(Exception):
         self.reason = reason
 
 
+@dataclass(frozen=True)
+class Verified:
+    """What a verified token says: the principal, and for a Google ID token the account's
+    ``sub`` (M6-SPEC §7.2), which the relay checks against the roster's binding."""
+
+    principal: str
+    sub: str | None = None
+
+
 class Verifier(Protocol):
     async def principal(self, token: str) -> str:
         """Return the principal for ``token`` or raise :class:`Unauthenticated`."""
+        ...
+
+    async def verify(self, token: str) -> Verified:
+        """:meth:`principal` with the ``sub`` when the token carries one."""
         ...
 
 
@@ -72,6 +87,9 @@ class StaticVerifier:
         if not token:
             raise Unauthenticated("empty_token")
         return "token:sha256:" + hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+    async def verify(self, token: str) -> Verified:
+        return Verified(await self.principal(token))
 
 
 def certs_lifetime(cache_control: str | None) -> int:
@@ -136,8 +154,8 @@ class GoogleVerifier:
     - A verified token's principal is cached under the SHA-256 of the accepted audience set
       and the token until the token's ``exp`` (a bounded LRU), so a long-poll loop does not
       re-verify every second.
-      Issuer, audience, signature, expiry and ``email_verified is True`` are all checked
-      before anything is cached.
+      Issuer, audience, signature, expiry, ``email_verified is True`` and a ``sub`` are all
+      checked before anything is cached.
     """
 
     def __init__(
@@ -162,7 +180,7 @@ class GoogleVerifier:
         self._cache_size = cache_size
         self._certs: _CachedCerts | None = None
         self._certs_lock = asyncio.Lock()
-        self._verified: OrderedDict[str, tuple[str, int]] = OrderedDict()
+        self._verified: OrderedDict[str, tuple[Verified, int]] = OrderedDict()
 
     # Certificates -----------------------------------------------------------------------
     def _fetch_certs(self) -> tuple[dict[str, str], int]:
@@ -214,7 +232,7 @@ class GoogleVerifier:
             raise Unauthenticated(type(exc).__name__) from None
 
     @staticmethod
-    def _principal_from(claims: Any) -> tuple[str, int]:
+    def _principal_from(claims: Any) -> tuple[Verified, int]:
         if not isinstance(claims, Mapping):
             raise Unauthenticated("no_claims")
         if claims.get("iss") not in GOOGLE_ISSUERS:
@@ -224,12 +242,18 @@ class GoogleVerifier:
         email = claims.get("email")
         if not isinstance(email, str) or "@" not in email:
             raise Unauthenticated("no_email")
+        sub = claims.get("sub")
+        if not isinstance(sub, str) or SUB_SHAPE.fullmatch(sub) is None:
+            raise Unauthenticated("no_sub")
         exp = claims.get("exp")
         if isinstance(exp, bool) or not isinstance(exp, int):
             raise Unauthenticated("bad_exp")
-        return "google:" + email.lower(), exp
+        return Verified("google:" + email.lower(), sub), exp
 
     async def principal(self, token: str) -> str:
+        return (await self.verify(token)).principal
+
+    async def verify(self, token: str) -> Verified:
         if not token:
             raise Unauthenticated("empty_token")
         if len(token) > MAX_TOKEN_LENGTH or JWT_SHAPE.fullmatch(token) is None:
@@ -248,13 +272,13 @@ class GoogleVerifier:
         except google.auth.exceptions.TransportError:
             raise ApiError(503, "auth_unavailable", "Cannot verify credentials now.") from None
         claims = await anyio.to_thread.run_sync(self._decode, token, certs)
-        principal, exp = self._principal_from(claims)
+        verified, exp = self._principal_from(claims)
         if self._clock() < exp:
-            self._verified[key] = (principal, exp)
+            self._verified[key] = (verified, exp)
             self._verified.move_to_end(key)
             while len(self._verified) > self._cache_size:
                 self._verified.popitem(last=False)
-        return principal
+        return verified
 
 
 def build_verifier(settings: Settings) -> Verifier:

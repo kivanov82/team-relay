@@ -16,6 +16,13 @@
   lives 2 minutes, and is useless without the plugin's PKCE verifier. A code presented twice
   revokes the credential it minted.
 - Every endpoint is rate limited per client IP, counted in the store (:func:`client_ip`).
+  Each start logs how many ``X-Forwarded-For`` hops it saw (never the addresses), so the
+  derivation can be checked on the live service (M6-SPEC §7.7).
+- Accounts are bound by Google ``sub`` (M6-SPEC §7.2): the callback refuses an account whose
+  email is bound, on any of its teams, to another ``sub``; the chosen team's binding is
+  recorded (first sign-in) or checked again, in a roster transaction, before a code is
+  minted. The credential records the SHA-256 of the email it was minted through (§7.1), and
+  the token response names the email (M5-SPEC §9.3).
 """
 
 from __future__ import annotations
@@ -53,7 +60,7 @@ from .pages import (
     html_response,
     message_page,
 )
-from .roster import Roster
+from .roster import Roster, email_hash
 from .store import (
     AuditEntry,
     CredentialRecord,
@@ -81,6 +88,7 @@ VERIFIER_RE = re.compile(r"^[A-Za-z0-9._~-]{43,128}$")  # RFC 7636 §4.1
 DEVICE_RE = re.compile(r"^[A-Za-z0-9 ._()-]{1,64}$")
 TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{43}$")  # login ids, CSRF tokens, one-time codes
 GOOGLE_CODE_RE = re.compile(r"^[\x21-\x7e]{1,1024}$")
+SUB_RE = re.compile(r"^[\x21-\x7e]{1,255}$")  # Google's: an opaque ASCII string, <= 255
 
 STEP_GOOGLE = "google"
 STEP_EXCHANGING = "exchanging"
@@ -89,6 +97,18 @@ STEP_DONE = "done"
 STEP_CLOSED = "closed"
 
 AGAIN = "Run /team-relay:login in Claude Code to start again."
+REBOUND_TITLE = "This email now belongs to a different Google account"
+REBOUND_LINE = "Ask the owner."
+
+
+def forwarded_hops(request: Request) -> int:
+    """How many ``X-Forwarded-For`` entries the request carried, over every such header."""
+    return sum(
+        1
+        for value in request.headers.getlist("x-forwarded-for")
+        for part in value.split(",")
+        if part.strip()
+    )
 
 
 def client_ip(request: Request, on_cloud_run: bool) -> str:
@@ -159,7 +179,7 @@ class LoginService:
         self._retention = timedelta(days=settings.team_config.audit_retention_days)
 
     # Helpers --------------------------------------------------------------------------------
-    async def _allow(self, request: Request, kind: str, limit: int) -> bool:
+    async def _allow(self, request: Request, kind: str, limit: int, **log: Any) -> bool:
         now = self._now()
         start = int(now.timestamp()) // LOGIN_WINDOW_SECONDS * LOGIN_WINDOW_SECONDS
         # The address itself is never stored: only a hash of it, in the counter's key.
@@ -171,7 +191,7 @@ class LoginService:
         )
         if await self._store.count_login_quota(quota):
             return True
-        log_event("login_rate_limited", severity="WARNING", endpoint=kind)
+        log_event("login_rate_limited", severity="WARNING", endpoint=kind, **log)
         return False
 
     @staticmethod
@@ -205,7 +225,9 @@ class LoginService:
 
     # GET /v1/login/start ----------------------------------------------------------------------
     async def start(self, request: Request) -> Response:
-        if not await self._allow(request, "start", self._limits.login_starts_per_minute):
+        # Logged once per start, with whichever event ends it (M6-SPEC §7.7).
+        hops = {"x_forwarded_for_hops": forwarded_hops(request)}
+        if not await self._allow(request, "start", self._limits.login_starts_per_minute, **hops):
             return self._busy()
         q = request.query_params
         port, state = _single(q, "port"), _single(q, "state")
@@ -224,7 +246,7 @@ class LoginService:
             and DEVICE_RE.fullmatch(device) is not None
         )
         if not valid:
-            self._refused("bad_start")
+            self._refused("bad_start", **hops)
             return self._page(400, "This sign-in link is not valid", AGAIN)
         assert port and state and challenge and device
         now = self._now()
@@ -259,7 +281,7 @@ class LoginService:
             httponly=True,
             samesite="lax",
         )
-        log_event("login_started", login=login.key[:12])
+        log_event("login_started", login=login.key[:12], **hops)
         return response
 
     # GET /v1/login/callback -------------------------------------------------------------------
@@ -322,6 +344,9 @@ class LoginService:
         email = normalise_email(claims.get("email"))
         if email is None:
             return await fail(400, "no_email", "Sign-in with Google did not complete", AGAIN)
+        sub = claims.get("sub")
+        if not isinstance(sub, str) or SUB_RE.fullmatch(sub) is None:
+            return await fail(400, "no_sub", "Sign-in with Google did not complete", AGAIN)
         memberships = await self._roster.teams_for_email(email, fresh=True)
         if not memberships:
             return await fail(
@@ -330,6 +355,10 @@ class LoginService:
                 "This Google account is not on any team",
                 f"Ask the team owner to add {email}.",
             )
+        for team, member in memberships:
+            bound = (await self._roster.snapshot(team)).sub_for(member, email)
+            if bound is not None and not _same(bound, sub):
+                return await fail(403, "sub_mismatch", REBOUND_TITLE, REBOUND_LINE)
         csrf = b64url(secrets.token_bytes(32))
         choices = [LoginChoice(team=t, member=m) for t, m in memberships]
         now = self._now()
@@ -339,6 +368,7 @@ class LoginService:
                 return LoginChange(result=None)
             doc.step = STEP_CHOOSE
             doc.email = email
+            doc.sub = sub
             doc.choices = choices
             doc.csrf_sha256 = _key(csrf)
             return LoginChange(result=doc, login=doc)
@@ -407,8 +437,7 @@ class LoginService:
             return self._page(400, "This form could not be read", AGAIN)
         now = self._now()
 
-        # Read first (a transaction that writes nothing), so a membership that ended since
-        # the chooser was shown is checked before a code is minted.
+        # Read first (a transaction that writes nothing).
         current = await self._store.mutate_login(key, lambda doc: LoginChange(result=doc))
         if current is None or current.step != STEP_CHOOSE or now >= current.expire_at:
             self._refused("login_not_choosing", login=key[:12])
@@ -426,12 +455,26 @@ class LoginService:
             await self._close(key)
             log_event("login_cancelled", login=key[:12])
             return self._loopback(current, {"error": "access_denied", "state": current.state})
+        if current.email is None or current.sub is None:  # a login from before §7.2
+            await self._close(key)
+            self._refused("login_without_sub", login=key[:12])
+            return self._page(400, "This sign-in has expired", AGAIN, clear=True)
         choice = next((c for c in current.choices if team is not None and c.team == team), None)
-        if choice is None or current.email is None:
+        if choice is None:
             self._refused("team_not_offered", login=key[:12])
             return self._page(400, "Choose one of your teams", AGAIN)
-        still = await self._roster.member_for_email(choice.team, current.email)
-        if still != choice.member:
+        # Checked again here, in one roster transaction, so a membership that ended since the
+        # chooser was shown mints nothing. §7.2: the first sign-in with this email binds it to
+        # this Google account; a later one must be the same account, and two first sign-ins
+        # cannot both win.
+        bound = await self._roster.bind(
+            choice.team, choice.member, current.email, current.sub, self._retention
+        )
+        if bound == "other":
+            await self._close(key)
+            self._refused("sub_mismatch", login=key[:12])
+            return self._page(403, REBOUND_TITLE, REBOUND_LINE, clear=True)
+        if bound == "gone":
             await self._close(key)
             self._refused("membership_changed", login=key[:12])
             return self._page(
@@ -459,6 +502,7 @@ class LoginService:
                 challenge=doc.challenge,
                 created_at=now,
                 expire_at=now + CODE_LIFETIME,
+                email=doc.email,
             )
             return LoginChange(result=doc, login=doc, code=minted)
 
@@ -530,6 +574,7 @@ class LoginService:
                 created_at=now,
                 last_used_at=now,
                 expire_at=now + CREDENTIAL_LIFETIME,
+                email_sha256=email_hash(doc.email) if doc.email else None,
             )
             audit = AuditEntry(
                 time=now,
@@ -539,6 +584,7 @@ class LoginService:
                 outcome="created",
                 expire_at=now + retention,
                 member=doc.member,
+                email_sha256=[email_hash(doc.email)] if doc.email else [],
                 detail=f"credential {public_id(ckey)}",
             )
             return Redemption(result=("ok", doc), code=doc, credential=record, audit=[audit])
@@ -572,6 +618,7 @@ class LoginService:
                 "credential": credential,
                 "team": doc.team,
                 "member": doc.member,
+                "email": doc.email,
                 "relay_url": self.public_url,
                 "expires_at": format_time(now + CREDENTIAL_LIFETIME),
             },

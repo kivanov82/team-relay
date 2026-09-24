@@ -68,6 +68,7 @@ def make_token(
         "aud": AUDIENCE,
         "email": "alice@example.com",
         "email_verified": True,
+        "sub": "104593728194712345678",
         "iat": now - 10,
         "exp": now + lifetime,
         **claims,
@@ -154,6 +155,15 @@ async def test_valid_token_resolves_the_lowercased_email(verifier):
     )
 
 
+async def test_verify_returns_the_principal_and_the_sub(verifier, decodes):
+    token = make_token(email="Bob@Example.com", sub="118000000000000000001")
+    verified = await verifier.verify(token)
+    assert (verified.principal, verified.sub) == ("google:bob@example.com", "118000000000000000001")
+    assert await verifier.verify(token) == verified  # from the cache, sub included
+    assert await verifier.principal(token) == "google:bob@example.com"
+    assert len(decodes) == 1
+
+
 @pytest.mark.parametrize(
     "token, reason",
     [
@@ -162,6 +172,11 @@ async def test_valid_token_resolves_the_lowercased_email(verifier):
         (lambda: make_token(email_verified=None), "email_not_verified"),
         (lambda: make_token(iss="https://evil.example"), "wrong_issuer"),
         (lambda: make_token(email=None), "no_email"),
+        # M6-SPEC §7.2: the account's sub is what a roster email is bound to.
+        (lambda: make_token(sub=None), "no_sub"),
+        (lambda: make_token(sub=""), "no_sub"),
+        (lambda: make_token(sub=12345), "no_sub"),
+        (lambda: make_token(sub="x" * 256), "no_sub"),
         (lambda: make_token(aud="https://other.example"), "InvalidValue"),
         (lambda: make_token(lifetime=-100), "InvalidValue"),  # expired
         (lambda: make_token(private=STRANGER_PRIVATE), "MalformedError"),  # bad signature

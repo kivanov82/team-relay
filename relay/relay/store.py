@@ -20,7 +20,8 @@ that need a transaction live in exactly one primitive each:
   limit, atomically (the read budget, M2-SPEC §7.3).
 - :meth:`Store.mutate_roster`: read a team's roster version and every roster entry, run a
   *pure* function over them, count the quotas, and write the entries it changed, delete the
-  members it removed (revoking every live device credential of theirs) and bump the
+  members it removed (revoking every live device credential of theirs), revoke the
+  credentials minted through an email it took off a member (M6-SPEC §7.1) and bump the
   version, in one transaction (M6-SPEC §1). Seeding and the owner endpoints are all this
   primitive with a different function.
 - :meth:`Store.mutate_login`: read one login, run a pure function, write its new version and
@@ -197,6 +198,9 @@ class RosterEntry:
     added_by: str
     added_at: datetime
     updated_at: datetime
+    # M6-SPEC §7.2: email -> the Google ``sub`` of the account that first signed in with it.
+    # An email without an entry here is not bound yet. Removing an email drops its binding.
+    subs: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -236,17 +240,20 @@ class RosterChange[T]:
     # Written with a removal; kept (not deleted) when the id is given back, so the next
     # removal merges every email the id had. The TTL policy deletes them.
     retire: list[RetiredId] = field(default_factory=list)
+    # M6-SPEC §7.1: ``(member, email_sha256)`` of an email taken off a member: every live
+    # credential of that member minted through it (or recording no email) is revoked.
+    revoke_email: list[tuple[str, str]] = field(default_factory=list)
 
     @property
     def changed(self) -> bool:
-        return bool(self.put or self.remove or self.retire)
+        return bool(self.put or self.remove or self.retire or self.revoke_email)
 
 
 @dataclass
 class RosterOutcome[T]:
     result: T
     version: int
-    revoked: list[str]  # credential keys revoked with a removal
+    revoked: list[str]  # credential keys revoked with a removal or an email's removal
 
 
 # Device credentials (M5-SPEC §3) ---------------------------------------------------------
@@ -271,6 +278,9 @@ class CredentialRecord:
     expire_at: datetime
     revoked: bool = False
     revoked_at: datetime | None = None
+    # M6-SPEC §7.1: the SHA-256 of the roster email the credential was minted through. None
+    # only on credentials minted before it was recorded.
+    email_sha256: str | None = None
 
     def live(self, now: datetime) -> bool:
         return not self.revoked and now < self.expire_at
@@ -316,6 +326,7 @@ class LoginDoc:
     csrf_sha256: str | None = None
     email: str | None = None
     choices: list[LoginChoice] = field(default_factory=list)
+    sub: str | None = None  # the Google account's ``sub`` (M6-SPEC §7.2)
 
 
 @dataclass
@@ -332,6 +343,16 @@ class LoginCode:
     expire_at: datetime
     used: bool = False
     credential_key: str | None = None
+    # The Google email the login signed in with: the token response names it (M5-SPEC §9.3)
+    # and the credential records its hash (M6-SPEC §7.1).
+    email: str | None = None
+
+
+def revocable_by_email(record: CredentialRecord, member: str, email_sha256: str) -> bool:
+    """Whether taking ``email_sha256`` off ``member`` revokes ``record`` (M6-SPEC §7.1): a
+    credential of that member minted through that email, or one that does not record its
+    email (it may have been). Liveness is the caller's check."""
+    return record.member == member and record.email_sha256 in (email_sha256, None)
 
 
 @dataclass
@@ -616,7 +637,8 @@ class Store(Protocol):
         When it changed something: every quota must be under its limit (else
         :class:`QuotaExceeded`, nothing written) and is counted; ``put`` entries are
         written, ``remove`` members deleted with every live credential of theirs revoked
-        (``revoked_at = now``), ``retire`` ids written, ``roster_version`` incremented,
+        (``revoked_at = now``), every live credential :func:`revocable_by_email` by a
+        ``revoke_email`` pair revoked, ``retire`` ids written, ``roster_version`` incremented,
         the audit written; all in one transaction."""
         ...
 

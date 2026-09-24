@@ -39,6 +39,7 @@ from .store import (
     StreamPage,
     credentials_over_cap,
     monotonic_updated_at,
+    revocable_by_email,
     stamp_deliveries,
 )
 
@@ -340,6 +341,16 @@ class MemoryStore:
                         record.revoked = True
                         record.revoked_at = now
                         revoked.append(key)
+            for member, email_sha256 in change.revoke_email:
+                for (t, key), record in sorted(self._credentials.items()):
+                    if (
+                        t == team
+                        and record.live(now)
+                        and revocable_by_email(record, member, email_sha256)
+                    ):
+                        record.revoked = True
+                        record.revoked_at = now
+                        revoked.append(key)
             for entry in change.put:
                 entries[entry.member] = copy.deepcopy(entry)
             retired = self._retired.setdefault(team, {})
@@ -347,7 +358,9 @@ class MemoryStore:
                 retired[tomb.member] = copy.deepcopy(tomb)
             self._roster_version[team] = version + 1
             self._audit.extend(copy.deepcopy(change.audit))
-            return RosterOutcome(result=change.result, version=version + 1, revoked=revoked)
+            return RosterOutcome(
+                result=change.result, version=version + 1, revoked=sorted(set(revoked))
+            )
 
     # Device credentials ---------------------------------------------------------------
     async def find_credential(self, teams: Sequence[str], key: str) -> CredentialRecord | None:
