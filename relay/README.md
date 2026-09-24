@@ -3,8 +3,9 @@
 The team relay of `docs/M1-SPEC.md` (sections 1 to 7, with its §11 corrections) and
 `docs/M2-SPEC.md` §1 to §3 (with the relay's part of its §7 corrections), the read-only
 delegates of `docs/M3-SPEC.md` §2, the sign-in and device credentials of `docs/M5-SPEC.md`
-§2 to §5 and the roster of `docs/M6-SPEC.md` §1 to §3: FastAPI, stateless, with Firestore as
-the per-member mailbox and the roster. No background workers: deadlines fire lazily when the
+§2 to §5, the roster of `docs/M6-SPEC.md` §1 to §3 and the teams anyone can create of
+`docs/M9-SPEC.md` §1 to §5 (the relay's part): FastAPI, stateless, with Firestore as the
+per-member mailbox, the roster and the teams. No background workers: deadlines fire lazily when the
 asker polls `replies` or anyone reads a request.
 
 ## Layout
@@ -13,19 +14,20 @@ asker polls `replies` or anyone reads a request.
 |---|---|
 | `relay/config.py` | team config (`RELAY_TEAM_CONFIG`): teams and their seed members, limits, `audit_retention_days`, `delegates` (M3 §2, M6 §3); settings from env, the OAuth client file and `RELAY_PUBLIC_URL` (M5 §5) |
 | `relay/roster.py` | the roster (M6 §1): the per-team cache validated by `roster_version`, the seed upsert, and the pure change functions with every invariant |
+| `relay/teams.py` | teams (M9): which teams exist (the file's, and the created ones by their record), creating one, `/v1/me/teams`, the admin listing, deletion and its batched removal |
 | `relay/credentials.py` | device credentials (M5 §3): minting, hashing, the 60 s cache, the rolling expiry |
 | `relay/oauth.py` | the relay's own Google sign-in (M5 §2): fixed endpoints, the code exchange, RS256 ID token verification over Google's JWKS |
-| `relay/login.py` | the login flow (M5 §2): start, callback, chooser POST, token; per-IP rate limits |
+| `relay/login.py` | the login flow (M5 §2): start, callback, chooser POST, token, and creating a team from it (M9 §3); per-IP rate limits |
 | `relay/pages.py` | the login pages and their stylesheet: escaped, no scripts, strict CSP |
 | `relay/auth.py` | the `google` verifier (§2, §11.8, M2 §2: a list of audiences) and the `static` one, which refuses to start under `K_SERVICE` |
 | `relay/jsonutil.py` | the strict body parser (§11.9), canonical JSON and hashing |
 | `relay/models.py` | request bodies, strict, `extra="forbid"` |
 | `relay/manifest.py` | schema validation, the §3.3 checks, RE2 patterns (§11.1), param validation with defaults (§3.5, §11.2) |
-| `relay/store.py` | the store protocol: `create_request`, `mutate_request`, `set_cursor`, `count_quota`, `mutate_roster`, `mutate_login`, `redeem_code` and reads; `stamp_deliveries`, the one delivery-time rule both stores run (M2 §3.2); `monotonic_updated_at` (M2 §7.1) |
+| `relay/store.py` | the store protocol: `create_request`, `mutate_request`, `set_cursor`, `count_quota`, `mutate_roster`, `mutate_login`, `redeem_code`, `create_team`, `delete_team`, `purge_team` and reads; `stamp_deliveries`, the one delivery-time rule both stores run (M2 §3.2); `monotonic_updated_at` (M2 §7.1) |
 | `relay/store_memory.py`, `relay/store_firestore.py` | the two stores; one contract suite covers both |
 | `relay/service.py` | the state machine, the sweep (§4), audit (§7), tool events, the activity feed and the directory's stats (M2 §3); store-agnostic |
-| `relay/app.py` | `create_app(settings, store, oauth=…)`; `relay.app:app` builds one from env; authentication (device credentials, Google ID tokens, static tokens, delegates with `X-Relay-On-Behalf-Of`), the delegate routes (M3 §2, M6 §3), the login pages (M5 §2) |
-| `firestore.indexes.json` | the one composite index, for the sweep (`asker ASC, next_deadline ASC`); the feed, the stats, the roster and the credentials need none |
+| `relay/app.py` | `create_app(settings, store, oauth=…)`; `relay.app:app` builds one from env; authentication (device credentials, Google ID tokens, static tokens, delegates with `X-Relay-On-Behalf-Of`, the any-team delegate), the delegate routes (M3 §2, M6 §3, M9 §5), the account and admin routes (M9 §2, §4), the login pages (M5 §2) |
+| `firestore.indexes.json` | the one composite index, for the sweep (`asker ASC, next_deadline ASC`); the feed, the stats, the roster, the credentials and the teams need none |
 | `tests/fake_google.py`, `tests/fake_oauth_app.py` | a fake Google for the tests, and a launcher that serves the relay with it for the plugin's e2e (below) |
 | `Dockerfile` | the Cloud Run image |
 
@@ -91,6 +93,13 @@ block, all optional:
 | `login_pages_per_minute` | 30 | `GET /v1/login/callback` and `POST /v1/login/choose` together, per client IP and minute |
 | `login_tokens_per_minute` | 20 | `POST /v1/login/token` per client IP and minute |
 | `roster_mutations_per_hour` | 30 | roster changes (add, patch, remove) per owner and calendar hour (M6-SPEC §2); refusals do not count |
+| `teams_per_account` | 3 | teams one Google account has created and not deleted (M9-SPEC §2); deleting one frees the slot |
+| `members_per_team` | 50 | members per team, at most 50 (a broadcast writes one envelope per member in one transaction); the seed obeys it too |
+| `team_creations_per_account_per_day` | 10 | team creations per Google account and calendar day (UTC); refusals do not count |
+| `team_creations_per_ip_per_hour` | 30 | team creations per client IP and calendar hour (not counted for a delegate, whose address is the console's) |
+
+`reads_per_minute` is also the budget of the account routes (`/v1/me/teams`, `POST
+/v1/teams`, `/v1/admin/teams`), per Google account and minute (M9).
 
 ## The team file and the roster (M6-SPEC §1, 24 Sep 2026)
 
@@ -244,14 +253,17 @@ authenticates as before.
    Google's JWKS, cached for its `Cache-Control`; `iss` Google; `aud` and `azp` the client id;
    `exp` in the future; `iat` at most 60 s ahead), then the nonce (constant time) and
    `email_verified is True`, and a `sub` (1..255 printable ASCII). Any failure closes the
-   login. An account on no team: `403` and "Ask the team owner to add <email>." An email
-   bound, on any of its teams, to another Google account: `403`, "This email now belongs to a
-   different Google account" (M6-SPEC §7.2). Otherwise step `choose` (the email and the `sub`
-   kept on the login) and the chooser.
+   login. An email bound, on any of its teams, to another Google account: `403`, "This email
+   now belongs to a different Google account" (M6-SPEC §7.2). Otherwise step `choose` (the
+   email and the `sub` kept on the login) and the chooser, or, for an account on no team
+   (M9-SPEC §3), `200` "You're not on a team yet. Ask a team owner to add <email>, or create
+   one." with the create form (below).
 3. The chooser: the account, the device, the warning, one radio per team (team id and
    member id; preselected only when there is exactly one team, M6-SPEC §7.5; with several
-   the radios are required and nothing is chosen for the member), Continue / Cancel. A fresh
-   CSRF token (only its hash is stored).
+   the radios are required and nothing is chosen for the member), Continue / Cancel, and a
+   closed "Create a new team" (`<details>`, no script) with the create form. A team's display
+   name is shown beside its id when it has one. A fresh CSRF token (only its hash is stored),
+   the same in both forms.
 4. `POST /v1/login/choose` (`application/x-www-form-urlencoded`: `csrf`, `team`, `action`;
    nothing else, each once, at most 4 KiB): the cookie, step `choose`, the CSRF token, an
    `Origin` (when sent) equal to `RELAY_PUBLIC_URL`, a team from the chooser, and the account
@@ -263,6 +275,17 @@ authenticates as before.
    **Cancel** closes the login and redirects to `http://127.0.0.1:<port>/callback?
    error=access_denied&state=…` so the plugin's listener can stop waiting. Nothing but
    `http://127.0.0.1:<port>/callback` is ever a redirect target.
+   **Create a team** (M9-SPEC §3): `POST /v1/login/create` (form: `csrf`, `name`, `team`,
+   `member`, `action` = `create` or `cancel`; nothing else, each once) with the same cookie,
+   `Origin`, CSRF and step (`choose`, unexpired) checks. It creates the team (as `POST
+   /v1/teams` below, with the signed-in account as owner, its email bound to the login's
+   `sub`, the per-IP limit counted against the browser's address), adds it to the login's
+   choices and answers the chooser with the new team preselected (even among several).
+   `team` left empty is made from the name (lower case, `-` for anything else, `team-` in
+   front when needed). A refused creation answers the page again with the refusal's status
+   (`422`, `409`, `429`), its message and the member's own input (escaped; a left-empty id
+   shows the one made from the name, to edit). `cancel` ends the login like the chooser's
+   Cancel. The created team is kept even if the login then expires.
 5. `POST /v1/login/token` `{"code", "code_verifier"}` (verifier 43..128 RFC 7636 characters):
    the code unused, unexpired and `BASE64URL(SHA256(verifier)) == challenge` → the code is
    marked used and a device credential minted (recording the SHA-256 of the email signed in
@@ -270,7 +293,9 @@ authenticates as before.
    "expires_at"}` (`Cache-Control: no-store`); `email` is the Google account's email,
    lower-cased, so the plugin can say who the member became (M5-SPEC §9.3). Unknown, expired or wrong verifier
    (which burns the code): `400 {"error": "invalid_grant"}`. A code presented a second time
-   also revokes the credential it minted. A malformed body: `400 invalid_request`.
+   also revokes the credential it minted. A malformed body: `400 invalid_request`. A code
+   for a team deleted since the choice: `400 invalid_grant`, nothing minted (the
+   redemption's transaction reads the team).
 
 - **The pages** are server-rendered with every value escaped, one same-origin stylesheet
   (`/v1/login/style.css`), no scripts, no images, and `Content-Security-Policy: default-src
@@ -312,7 +337,11 @@ authenticates as before.
   instance whose credential cache has not seen the revocation yet: within that instance's
   30 s roster cache instead of its 60 s credential cache.
 - It is its member on its team only: another team in the URL is `404` (audited on a
-  mutation, like any member's). It stops working when the member leaves the roster (within
+  mutation, like any member's). Since M9 every credential also writes a pointer
+  (`credential_teams/{sha256}`: team, `expire_at` rolling with the credential's), so a
+  credential of a team the API created is found whatever team the URL names; lookups read
+  the URL's team, the file's teams and the pointer in one batch. A credential of a deleted
+  team is `401` at once, on every instance (its team's record is read on each request). It stops working when the member leaves the roster (within
   30 s on other instances, at once here), and a member removed and added again does not
   revive credentials minted before the re-add (a credential is valid only if minted no
   earlier than the roster entry was added).
@@ -331,6 +360,134 @@ authenticates as before.
 - Google ID tokens, static tokens and delegates keep working (ID tokens now also carry the
   `sub` check above).
 
+## Teams anyone can create (M9-SPEC, 24 Sep 2026)
+
+Anyone who signs in with Google can create a team and becomes its first owner; relay admins
+list and delete teams. The team file's teams (**seed teams**) are seeded as before and are
+ordinary teams otherwise, except that the API never deletes them.
+
+### What is stored
+
+- `teams/{team}`: `{id, name, status ("active" | "deleted"), seed, created_at,
+  created_by_member, created_by_email_sha256, roster_version, members, owners, deleted_at,
+  deleted_by_email_sha256, reserved_until, purge_complete}`. `members`/`owners` are the
+  roster's counts, written by every roster change. A seed team's record is filled at startup
+  (and before the admin listing); a document with only `roster_version` (before M9) reads as
+  an active seed team. A seed record the file no longer lists is not a team, as before M9.
+  Team documents never expire.
+- `accounts/{sha256(email)}`: `{memberships: [{team, member}], created: [team ids]}`, for the
+  teams the API created only (the file's teams are found from the file). Kept exact in the
+  same transactions: every roster change that moves an email's membership rewrites its
+  account document; creating and deleting keep `created`; the removal takes a deleted team's
+  memberships off. "Which teams is this email on" is one read, then each named team's roster
+  decides.
+- `admin_audit/{auto}`: `{time, actor_email_sha256, action, team, outcome, detail,
+  expire_at}` (kept 400 days): `team.create` (`created`, the creator's hash) and
+  `team.delete` (`deleted`, or `resumed` for a follow-up call; the admin's hash). Never an
+  email, never content. It outlives the team; the team's own audit (`team.create`, actor the
+  owner, the email's hash) goes with the team.
+- `credential_teams/{sha256}`: `{team, expire_at}`, every credential's pointer (below).
+
+### Creating a team
+
+`POST /v1/teams` `{"id"?, "name", "owner_member_id"}` → `201`:
+
+```json
+{"team": "platform", "name": "Platform", "status": "active",
+ "created_at": "2026-09-24T12:00:00.000Z", "member": "alice", "role": "owner"}
+```
+
+- **Who:** a Google identity only: a Google ID token (the caller's email; their `sub` is bound
+  on the owner entry at once), the any-team delegate with `manage-teams` on behalf of an email
+  (`X-Relay-On-Behalf-Of`; bound at the owner's first own sign-in), or the login flow's form
+  (above). A device credential (bound to its team) or a static token: `403
+  google_identity_required`; a bad or missing bearer `401`; a delegate without
+  `manage-teams` `403 forbidden`; the on-behalf header from a non-delegate `400`.
+- **Validation (`422 invalid_body`):** `id` `^[a-z][a-z0-9-]{2,31}$` (made from the name when
+  absent); `name` 1..60 characters after trimming, none of them a control, format (bidi
+  overrides, zero-width), private-use, unassigned or line/paragraph separator character;
+  `owner_member_id` `^[a-z][a-z0-9_]{1,31}$`; nothing else. The owner's email may not be a
+  delegate's.
+- **Refusals:** `409 team_id_reserved` for `admin api login v1 health static www team teams
+  relay console demo test`, every id in the team file, and an id deleted less than 31 days
+  ago; `409 team_exists` for a live team (a former file team still in the store included);
+  `409 team_limit` at `teams_per_account` teams created and not deleted; `429 rate_limited`
+  over `team_creations_per_account_per_day` or `team_creations_per_ip_per_hour`.
+- **One transaction** reads the team and the creator's account, then writes the team, its
+  owner entry, the account (`created` and the membership), the counters and both audits. Two
+  creations of one id: one wins, the other is `409 team_exists`; concurrent creations by one
+  account never pass its limit.
+
+### `GET /v1/me/teams`
+
+A Google ID token, or a delegate on behalf of an email (a per-team delegate sees its own team
+only):
+
+```json
+{"teams": [{"team": "demo", "name": "Demo", "member": "alice", "role": "owner"}],
+ "admin": false, "teams_created": 1, "max_teams_created": 3, "suggested_member": "alice"}
+```
+
+The file's teams first (file order), then the created ones by id, each roster validated
+against its version. With an ID token, a team where that email is bound to another Google
+account is left out. `GET /v1/teams/{team}/me` also returns the team's `name`.
+
+### Admins (M9-SPEC §4)
+
+`admins: ["google:<email>", ...]` in the team file (at most 20; never a delegate). Admin is
+relay-wide and not a team role: it reads no team's data. By a Google ID token, or through the
+any-team delegate with `manage-teams` on behalf of an admin's email; anyone else `403
+forbidden`.
+
+- `GET /v1/admin/teams?after=<team id>&limit=<1..1000, default 200>` → `{"teams": [row, ...],
+  "next": <team id> | null}`. The file's teams first (on the first page only), then the
+  created ones by id after `after`, `limit` of them; `next` is the `after` of the following
+  page. A row: `{id, name, status, seed, created_at, created_by_member, members, owners,
+  last_activity_at}` (`last_activity_at`: the latest change of any of the team's requests, or
+  null), plus `removal` (`complete` | `pending`), `deleted_at` and `reserved_until` for a
+  deleted team, listed while its id is reserved or its removal pending. No email, no content.
+- `DELETE /v1/admin/teams/{team}` with the body `{"confirm": "<team id>"}` → `200 {"team",
+  "status": "deleted", "removal": "complete" | "pending", "deleted_at", "reserved_until"}`.
+  `422 confirm_mismatch` unless the body is exactly that; `409 seed_team` for a team of the
+  file; `404` for no such team.
+  1. One transaction marks the team deleted (`reserved_until` 31 days on), frees its creator's
+     slot and writes the admin audit. From then on every request naming the team is refused,
+     on every instance at once: a created team's record is read on each request that names it
+     (a seed team needs no read). Its device credentials are `401`; a member's Google ID token
+     `404` or `401` (by their other teams); the any-team delegate `404`. A roster change, a
+     sign-in's binding or a credential mint for it fails inside its own transaction.
+  2. The same request removes the team's documents in transactions of at most 400, each
+     first checking the team is still deleted: the roster (its emails leave the account
+     index), the credentials with their pointers, then everything else under `teams/{team}`
+     (requests and progress, streams and messages, members, idempotency, audit, counters,
+     retired ids), at most 2000 documents a call. `"removal": "pending"` means that budget ran
+     out: the same `DELETE` again resumes (audited `resumed`). The record stays, marked
+     `purge_complete` when nothing is left.
+  3. Before a deleted id is created again (31 days on), a removal pass runs again (so anything
+     a request racing the deletion wrote goes too), and the new team's `roster_version`
+     continues the old one's, so no instance's cached roster of the old team can pass for the
+     new one's.
+
+### The any-team delegate (M9-SPEC §5)
+
+```yaml
+admins:
+  - "google:admin@example.com"
+delegates:
+  - principal: "google:team-relay-console@<project>.iam.gserviceaccount.com"
+    team: "*"
+    scope: [read, manage-roster, manage-teams]
+```
+
+With `team: "*"` the delegate acts in the team the URL names, for the member of that team its
+`X-Relay-On-Behalf-Of` email is: `403 not_a_member` when the email is not on that team, `404`
+when the team is not a team (or not any more). Everything else is as for a per-team delegate:
+only the delegate routes, and the roster mutations only with `manage-roster` and only when
+that member is an owner of that team. `manage-teams` (only with `team: "*"`, a startup error
+otherwise) adds `POST /v1/teams` and the admin routes (for an admin's email). A per-team
+delegate keeps working as before. A team in the file may carry an optional `name` (1..60
+characters, as above; its id otherwise).
+
 ## The fake OAuth relay for end-to-end tests
 
 `tests/fake_oauth_app.py` serves the relay with a fake Google, so the plugin's e2e can run the
@@ -340,6 +497,13 @@ whole login headlessly. It lives under `tests/` and is not in the image.
 cd relay
 RELAY_TEAM_CONFIG=/path/to/team.yaml .venv/bin/python -m tests.fake_oauth_app --port 8090 --email alice@example.com
 ```
+
+Google identities for the account, admin and delegate routes (M9): `GET
+/__fake_google/id_token?email=<email>` answers `{"id_token": "…"}` signed by the fake's key
+(verified email; the `sub` the login flow gives the same email). The launcher accepts such a
+token as a Google ID token (the relay's own RS256 checks against the fake's JWKS); a
+delegate's is one for its service account's email as the team file names it. Any other
+bearer is a static token, as before.
 
 | Setting | Default | Meaning |
 |---|---|---|
@@ -393,7 +557,8 @@ delegates:
 ```
 
 - **Startup errors:** a principal that is not `google:<email>` (lower-cased like members'),
-  a team that is not in the file, a `scope` other than `read`, a principal that is also a
+  a team that is not in the file (or `"*"`, M9), a `scope` other than `read` (M6, M9: or a
+  list with `read` and `manage-roster` and, only for `"*"`, `manage-teams`), a principal that is also a
   member's, the same principal twice (for one team or two), any other key, more than 10.
 - **Authentication:** a delegate must send exactly one `X-Relay-On-Behalf-Of: <email>`; the
   relay resolves `google:<email lowercased>` to a member of the delegate's own team. Missing,
@@ -572,8 +737,9 @@ A question sent while its recipient's answering session is not running waits in 
   activity feed and the stats use only single-field indexes on `updated_at`, which Firestore
   creates automatically (do not add a single-field exemption for `updated_at`).
 - Switch on TTL for the `expire_at` field on every collection group that carries it:
-  `messages`, `requests`, `progress`, `idempotency`, `audit`, `counters`, and (M5, M6)
-  `credentials`, `logins`, `login_codes`, `login_limits`, `retired`, for example
+  `messages`, `requests`, `progress`, `idempotency`, `audit`, `counters`, (M5, M6)
+  `credentials`, `logins`, `login_codes`, `login_limits`, `retired`, and (M9)
+  `credential_teams`, `admin_audit`, for example
   `gcloud firestore fields ttls update expire_at --collection-group=messages --enable-ttl`.
   Reads already ignore expired documents, because TTL deletion lags (a day or more).
 - `max-instances` is not a correctness requirement: every invariant is a Firestore
@@ -585,6 +751,10 @@ A question sent while its recipient's answering session is not running waits in 
   `team-relay-oauth-client` (JSON `client_id`, `client_secret`); the OAuth client's
   authorised redirect URI is `{RELAY_PUBLIC_URL}/v1/login/callback`. Smoke:
   `GET /v1/login/start` without parameters is `400`; an unauthenticated API call is `401`.
+- M9: no new index (the team listing orders by document id; the removal's queries have no
+  filter). `teams`, `accounts` and roster documents never expire (a deleted team's record is
+  kept, the id reserved 31 days, then given again only after a fresh removal pass; an
+  account document is deleted when it holds nothing). Team creations count in `login_limits`.
 
 ## Deliberately not done
 
@@ -601,8 +771,8 @@ A question sent while its recipient's answering session is not running waits in 
 - No `RELAY_STORE=memory` switch: the process built from env always uses Firestore; the
   memory store exists for tests through `create_app(settings, store)`.
 - Unauthenticated attempts go to the stdout log only (no team to file them under), as §7 says.
-- An unknown `trc_` credential costs one batched Firestore read (one document per configured
-  team) before its `401`; unknown credentials are not cached (random ones would miss a cache
+- An unknown `trc_` credential costs one batched Firestore read (the URL's team, one document
+  per configured team and the pointer) before its `401`; unknown credentials are not cached (random ones would miss a cache
   anyway). With the relay open to the internet (M5-SPEC §5) this is a cost, not an access,
   exposure; Cloud Armor or a per-IP limit on `401`s would be the next step if it ever
   matters.
@@ -611,3 +781,10 @@ A question sent while its recipient's answering session is not running waits in 
   bounded by the roster cap.
 - The console's "not on this team" page (M6-SPEC §4) sees the M3 contract: a delegated call
   for an email on no roster is `401 unauthenticated`, as before.
+- A request that authenticated just before its team was deleted may still write (a
+  message, presence) after the batched removal has passed; nobody can read it (the team is
+  refused), and it is removed by the removal pass that runs before the id is given again.
+  Roster changes and credential mints check the team inside their own transaction, so none
+  of them lands after the deletion.
+- The admin listing reads one small query per team for `last_activity_at` (16 at a time);
+  a page is at most 1000 teams.

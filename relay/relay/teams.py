@@ -82,6 +82,7 @@ ADMIN_LIST_MAX = 1000
 # The relay-wide admin audit keeps entries this long.
 ADMIN_AUDIT_RETENTION = timedelta(days=400)
 NAME_CACHE_SIZE = 4096
+ACTIVITY_CONCURRENCY = 16
 DAY_SECONDS = 86400
 HOUR_SECONDS = 3600
 CREATOR_ACTOR = "relay"
@@ -473,7 +474,14 @@ class Teams:
             ):
                 continue
             records.append(record)
-        activity = await asyncio.gather(*(self._last_activity(r) for r in records))
+        # One small query per team, a few at a time.
+        gate = asyncio.Semaphore(ACTIVITY_CONCURRENCY)
+
+        async def last_activity(record: TeamRecord) -> datetime | None:
+            async with gate:
+                return await self._last_activity(record)
+
+        activity = await asyncio.gather(*(last_activity(r) for r in records))
         for record, last in zip(records, activity, strict=True):
             seed = record.id in self._config.teams
             row: dict[str, Any] = {
