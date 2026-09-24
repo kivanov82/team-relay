@@ -147,10 +147,13 @@ describe.skipIf(!ENABLED)('M8 end to end: answers ship on their own, within the 
     const invoked = await alice.ok('invoke_capability', { member: 'bob', capability: 'service_health', params: { service: 'api' } });
     const rid = invoked.request_id as string;
     await until(() => bob.waiting().length === before + 1, DELIVERY_MS, 'the approval notice');
-    expect(bob.waiting().at(-1)!.content).toContain('alice asked: "run service_health {"service":"api"}"');
+    // M8-SPEC §7 item 5: within 5 minutes of a push that quoted a teammate, pushes carry counts
+    // only; the dialog shows what is asked.
+    expect(bob.waiting().at(-1)!.content).toMatch(/waiting for your approval \(1 pending\)\. Run \/team-relay:approvals\.$/);
     await sleep(1000);
     expect(alice.forRequest(rid).filter((n) => n.meta.type === 'answer')).toHaveLength(0);
     await bob.review('allow');
+    expect(bob.elicited.at(-1)).toContain('alice asked you to run service_health with these params (teammate data):');
     await until(() => bob.waiting().length === before + 2, DELIVERY_MS, 'the draft notice');
     await bob.review('send');
     const answer = await answerAt(rid);
