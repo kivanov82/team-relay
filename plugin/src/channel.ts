@@ -43,6 +43,7 @@ import { defaultManifestPath, discoveryPayload, exposedCapabilities, sharesFromE
 import { makeLogger } from './log.js';
 import { answeringCommand, answersAppearNote, detectChannelSession, notChannelNote } from './channel-mode.js';
 import { checkIntervalMs, readSummary, waitingSentence, watchInbox, whoamiFields } from './waiting.js';
+import { invitationFields } from './invitations.js';
 import { ActiveRequests, AnswerDeadlines, deadlineOf } from './active.js';
 import { AnswerHost, type HostConnection } from './answer-host.js';
 import { heldBy, lockPath, tryAcquire, type Acquired } from './answering-lock.js';
@@ -924,6 +925,8 @@ class AskerConnection {
         ...(expires ? { credential_expires_at: expires } : {}),
         ...(this.changed ? { changed: this.changed } : {}),
         ...(await whoamiFields(this.live.client, answeringCommand(this.env))),
+        // M9-SPEC §7.2: open invitations, when the sign-in can read them (a Google identity).
+        ...(await invitationFields(this.live.client)),
         ...(this.host ? this.host.whoamiFields() : {}),
       });
     }
