@@ -18,6 +18,8 @@ export const MAX_DURATION_MS = 3_600_000;
 
 /** The relay channel's own tools: bookkeeping of the exchange, not tools used to answer. */
 const RELAY_OWN_TOOLS = new Set(['ack_question', 'reply']);
+/** The automatic answerer's host tools (M8-SPEC §2): bookkeeping too. */
+const HOST_OWN_TOOLS = new Set(['reply', 'request_approval', 'permission']);
 
 /**
  * `mcp__<server>__<tool>` → `{server, tool}`; a built-in tool has no server. Plugin servers
@@ -44,6 +46,7 @@ export function toolEventFromPayload(payload: unknown): ToolEventBody | null {
   if (typeof p.tool_name !== 'string') return null;
   const { server, tool } = splitToolName(p.tool_name);
   if (RELAY_OWN_TOOLS.has(tool) && isRelayServer(server)) return null;
+  if (HOST_OWN_TOOLS.has(tool) && server === 'host') return null;
   if (!TOOL_NAME_RE.test(tool)) return null;
   let duration: number | null = null;
   // A permission request has not run yet: it has no duration, whatever the payload says.
