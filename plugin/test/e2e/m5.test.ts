@@ -7,8 +7,9 @@
 //      modes; both streams working with it; /team-relay:logout (dist/logout.js) revoking it;
 //      the login tool taking no arguments (M5-SPEC §9 item 1), the status naming the Google
 //      account when the relay reports it (§9 item 3);
-//   B. the owner (alice) adding a member through the console server's roster proxy; the new
-//      member signing in with the M5 flow and appearing in the directory;
+//   B. the owner (alice) adding a member through the console server's roster proxy (an
+//      invitation, M9-SPEC §7.2); the new member accepting it on the chooser, signing in with
+//      the M5 flow and appearing in the directory;
 //   C. the owner removing that member, and the relay refusing them within 30 s.
 //
 // Run through ../scripts/e2e.sh, which sets E2E_M5=1 only when the relay serves the login flow.
@@ -21,7 +22,7 @@ import { lstatSync, mkdtempSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DIST, FIXTURES } from '../helpers/mcp.js';
-import { ENABLED, Party, api, channelEnv, relayUrl, teamPath, tokenOf, until } from './harness.js';
+import { ENABLED, Party, api, channelEnv, googleIdToken, relayUrl, teamPath, tokenOf, until } from './harness.js';
 
 const M5 = ENABLED && process.env.E2E_M5 === '1';
 const DELIVERY_MS = 15_000;
@@ -38,7 +39,7 @@ afterAll(async () => {
 type Signed = { party: Party; xdg: string; file: string; log: string };
 
 /** A working session with no stored sign-in, whose browser is the headless stub. */
-async function freshAsker(label: string, email: string): Promise<Signed> {
+async function freshAsker(label: string, email: string, browser: Record<string, string> = {}): Promise<Signed> {
   const xdg = mkdtempSync(join(tmpdir(), `team-relay-e2e-${label}-`));
   const log = join(xdg, 'browser.log');
   const party = await Party.start(`${label}-asker`, 'channel.js', {
@@ -52,6 +53,7 @@ async function freshAsker(label: string, email: string): Promise<Signed> {
     FAKE_BROWSER_EMAIL: email,
     // A working session started with the channel: it reads the replies stream.
     TEAM_RELAY_CHANNEL: '1',
+    ...browser,
   });
   open.push(party);
   return { party, xdg, file: join(xdg, 'team-relay', 'credentials.json'), log };
@@ -261,14 +263,23 @@ describe.skipIf(!M5)('M6: the owner manages members in the console', () => {
     const roster = (await (await fetch(console_.base + '/api/roster', { headers: { 'X-Console-Key': console_.key } })).json()) as {
       members: Array<{ member: string; role: string; emails: string[] }>;
     };
-    expect(roster.members.find((m) => m.member === 'dave')).toMatchObject({ role: 'member', emails: ['dave@example.com'] });
+    // M9-SPEC §7.2: an invitation until dave accepts it.
+    expect(roster.members.find((m) => m.member === 'dave')).toMatchObject({ role: 'member', emails: ['dave@example.com'], status: 'invited' });
+    // An invitation grants nothing: dave's Google identity is on no team, invited to demo.
+    const daveId = await googleIdToken('dave@example.com');
+    const mine = await api(daveId, 'GET', '/v1/me/teams');
+    expect(mine.status).toBe(200);
+    expect(mine.body.teams).toEqual([]);
+    expect(mine.body.invitations).toEqual([expect.objectContaining({ team: 'demo', member: 'dave', invited_by_member: 'alice' })]);
+    expect((await api(daveId, 'GET', teamPath('me'))).status).toBe(401);
     // The same email again is a conflict, passed on with the relay's status.
     const again = await change(console_, 'POST', '/api/roster', { member: 'dave_two', email: 'dave@example.com' });
     expect(again.status).toBe(502);
     expect(((await again.json()) as { relay_status: number }).relay_status).toBe(409);
 
-    // dave signs in with the M5 flow (within the roster cache's 30 s of being added).
-    dave = await freshAsker('dave', 'dave@example.com');
+    // dave signs in with the M5 flow, accepting the invitation on the chooser first (within
+    // the roster cache's 30 s of being added).
+    dave = await freshAsker('dave', 'dave@example.com', { FAKE_BROWSER_ACCEPT: 'demo' });
     daveCredential = await until(
       async () => {
         try {
@@ -281,6 +292,12 @@ describe.skipIf(!M5)('M6: the owner manages members in the console', () => {
       'dave signing in',
     );
     await connected(dave.party);
+    const entry = JSON.parse(readFileSync(dave.log, 'utf8').trim().split('\n').at(-1)!) as { steps: Array<{ url: string; pressed?: string }> };
+    expect(entry.steps.map((x) => new URL(x.url).pathname)).toEqual(expect.arrayContaining(['/v1/login/invitation', '/v1/login/choose']));
+    const accepted = (await (await fetch(console_.base + '/api/roster', { headers: { 'X-Console-Key': console_.key } })).json()) as {
+      members: Array<{ member: string; status?: string }>;
+    };
+    expect(accepted.members.find((m) => m.member === 'dave')).toMatchObject({ status: 'active' });
     // He is in alice's directory and her teammates.
     await until(
       async () => {

@@ -87,6 +87,18 @@ export async function api(
 
 export const teamPath = (...parts: string[]) => `/v1/teams/${TEAM}/${parts.join('/')}`;
 
+/**
+ * A Google ID token for `email` from the fake Google of relay/tests/fake_oauth_app.py (M9: the
+ * account and admin routes and the delegates take a Google identity). Never logged.
+ */
+export async function googleIdToken(email: string): Promise<string> {
+  const res = await fetch(new URL(`/__fake_google/id_token?email=${encodeURIComponent(email)}`, relayUrl()), { signal: AbortSignal.timeout(10_000) });
+  if (res.status !== 200) throw new Error(`the fake Google gave no ID token (${res.status})`);
+  const token = ((await res.json()) as { id_token?: unknown }).id_token;
+  if (typeof token !== 'string') throw new Error('the fake Google gave no ID token');
+  return token;
+}
+
 /** A member's stream position at the relay, read without moving the cursor. */
 export async function streamPosition(member: Member, stream: 'inbox' | 'replies'): Promise<{ cursor: number; head: number }> {
   const path = teamPath('streams', stream) + '?wait=0&limit=1';

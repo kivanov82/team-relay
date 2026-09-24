@@ -38,6 +38,16 @@
 # test's client); a lapse sends nothing. Each member runs with a config directory of its own (a
 # computer of its own: the answering lock is per computer), and the other scenarios' working
 # sessions do not answer automatically (TEAM_RELAY_AUTO_ANSWER=0).
+#
+# M9 (docs/M9-SPEC.md §6, §7): with the fake OAuth launcher the team file also names a relay
+# admin (admin@example.com) and an any-team console delegate (a synthetic service account with
+# read, manage-roster and manage-teams), and test/e2e/m9.test.ts runs when the relay serves GET
+# /v1/me/teams: a new account creates a team on the sign-in page, invites a member through the
+# console server (hosted mode in the test process, the delegate's ID token from the fake
+# Google), the member accepts on the chooser and signs in, they exchange a question; the owner
+# creates and deletes a second team through the console; an admin deletes the first team
+# through the console and both members are refused. Every "owner adds a member, the member
+# signs in" step accepts the invitation first (M9-SPEC §7.2). The files run in name order.
 # Extra arguments are passed to vitest. The tokens are never printed.
 set -euo pipefail
 
@@ -110,6 +120,12 @@ teams:
         principals: ["token:sha256:$(sha256 "$TOKEN_BOB")", "google:bob@example.com"]
       - id: carol
         principals: ["token:sha256:$(sha256 "$TOKEN_CAROL")", "google:carol@example.com"]
+# M9: a relay admin and the hosted console's any-team delegate (synthetic identities).
+admins: ["google:admin@example.com"]
+delegates:
+  - principal: "google:team-relay-console@e2e-project.iam.gserviceaccount.com"
+    team: "*"
+    scope: [read, manage-roster, manage-teams]
 limits:
   min_ack_timeout_seconds: 2
   min_answer_timeout_seconds: 2
@@ -204,6 +220,17 @@ else
   echo "e2e: SKIPPING the M5 and M6 scenarios (fake OAuth launcher: $FAKE_OAUTH, GET /v1/login/start: $login_start)" >&2
 fi
 
+# Does the relay serve M9 (docs/M9-SPEC.md §2: GET /v1/me/teams needs a Google identity, so
+# without one it is 401, not 404)?
+E2E_M9=0
+me_teams="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$RELAY_URL/v1/me/teams" || true)"
+if [[ "$E2E_M5" -eq 1 && "$me_teams" == "401" ]]; then
+  E2E_M9=1
+  echo "e2e: the relay serves teams anyone can create: running the M9 scenario" >&2
+else
+  echo "e2e: SKIPPING the M9 scenario (fake OAuth: $E2E_M5, GET /v1/me/teams: $me_teams)" >&2
+fi
+
 E2E_M7=0
 if [[ "$inbox_summary" == "200" ]]; then
   E2E_M7=1
@@ -214,6 +241,6 @@ fi
 
 pnpm -C "$ROOT/plugin" build
 
-export RELAY_URL E2E=1 E2E_M2 E2E_M5 E2E_M7
+export RELAY_URL E2E=1 E2E_M2 E2E_M5 E2E_M7 E2E_M9
 export E2E_TOKEN_ALICE="$TOKEN_ALICE" E2E_TOKEN_BOB="$TOKEN_BOB" E2E_TOKEN_CAROL="$TOKEN_CAROL"
 pnpm -C "$ROOT/plugin" test:e2e "$@"
