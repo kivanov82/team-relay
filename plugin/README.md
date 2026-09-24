@@ -7,7 +7,8 @@ answer is pushed into the asker's session over a Claude Code channel. The contra
 §2 and §4 (Google identity, tool events, the console), `../docs/M4-SPEC.md` (what the
 answering session may read, and how a member grants more), `../docs/M5-SPEC.md` (install
 with no questions, sign in with `/team-relay:login`, and its §9 corrections after the security
-review) and `../docs/M6-SPEC.md` (owners manage members in the console).
+review), `../docs/M6-SPEC.md` (owners manage members in the console) and
+`../docs/M7-SPEC.md` §2 (say when questions are waiting).
 
 Each member runs two sessions:
 
@@ -57,6 +58,26 @@ claude --dangerously-load-development-channels plugin:team-relay@team-relay-dev
 
 A SessionStart hook adds one line of context: who you are on the relay and who your
 teammates are, or `Not connected: run /team-relay:login`.
+
+### Questions waiting for you (M7-SPEC §2)
+
+A question sent to you while your answering session is not running waits, safely, in your
+inbox until one starts. The working session says so, from the relay's inbox summary
+(`GET /inbox/summary`, a peek that moves no cursor and writes no presence, so any session may
+read it; it never reads your inbox stream):
+
+- **In a channel session**, at connect (so right after every sign-in) and every 60 s: when
+  questions wait and your answering session is not online (it has not polled for 45 s), one
+  status event: `team-relay: 2 questions from alice and bob waiting for you. Start your
+  answering session: "<plugin root>/bin/answerer"` (the command `/team-relay:answering` prints;
+  at most five names, `50+` past fifty). It is repeated only when the count or the senders
+  change, or once an hour while they stay the same; nothing while the answering session is
+  online, and an empty inbox forgets the last notice. `TEAM_RELAY_INBOX_CHECK_SECONDS` (1..60)
+  shortens the interval, for tests.
+- **`whoami`** (any session) adds `inbox_waiting` (the count) and, when it applies,
+  `inbox_notice` (the same sentence).
+- **The SessionStart line** adds the sentence (the summary is read beside `/me`, with 3 s of
+  its own; nothing on failure), and **`login_wait`**'s success message appends it.
 
 ### Sessions without the channel
 
@@ -337,6 +358,7 @@ is no longer open, so tool calls after it are not reported.
 | `RELAY_GCLOUD_ACCOUNT` | both servers, `bin/answerer`, `bin/console` | Optional, with `google`: `--account=` for gcloud (an email address). |
 | `RELAY_TOKEN_FILE` / `RELAY_TOKEN` | both servers, `bin/answerer`, `bin/console` | Only with `token`: bearer token; the file wins, trailing newline stripped, re-read on every request. |
 | `RELAY_ROLE` | channel | `asker` or `answerer`. |
+| `TEAM_RELAY_INBOX_CHECK_SECONDS` | asker channel | Optional, 1..60 (default 60): how often a channel session checks for questions waiting for your answering session (tests shorten it). |
 | `MANIFEST_PATH` | answerer channel, capability server | Defaults to this plugin's `manifest.yaml`. |
 | `ALLOW_PRODUCTION` | answerer channel, capability server | Only the exact value `true` allows production capabilities. |
 | `CAP_<NAME>_ENABLED` | answerer channel, capability server | Only `true` enables `<name>` (`NAME` is the capability name uppercased). |
@@ -390,8 +412,11 @@ it back as `X-Console-Key` on every API call. The server:
 - refuses any request whose `Host` is not `127.0.0.1:<port>` or `localhost:<port>` (DNS
   rebinding), any `/api/*` call without the key (401) or with a wrong one (403, compared in
   constant time), and any call the browser marks cross-site; it sends no CORS headers;
-- proxies five GETs to the relay with your own credentials: `/api/me`, `/api/directory`,
-  `/api/activity` (`since`, `limit`), `/api/requests/{id}` and `/api/roster` (M6-SPEC §2);
+- proxies six GETs to the relay with your own credentials: `/api/me`, `/api/directory`,
+  `/api/activity` (`since`, `limit`), `/api/requests/{id}`, `/api/roster` (M6-SPEC §2) and
+  `/api/inbox/summary` (M7-SPEC §3: the header's "2 questions waiting for you"; agent cards
+  show "<n> waiting" from the directory's `inbox_waiting`, both only while that answering
+  session is not online);
 - proxies an owner's roster changes and nothing else (M6-SPEC §3): `POST /api/roster`
   `{member, email, role?}`, `PATCH /api/roster/{member}` `{add_email?, remove_email?, role?}`
   and `DELETE /api/roster/{member}`. Each needs `Content-Type: application/json` (else 415)

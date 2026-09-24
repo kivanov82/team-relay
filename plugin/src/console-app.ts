@@ -6,8 +6,8 @@
 //   refused (DNS rebinding).
 // - /api/* needs X-Console-Key equal to the per-launch key (compared in constant time):
 //   missing is 401, wrong is 403. No CORS headers, ever; a cross-site fetch is refused.
-// - A read-only proxy of exactly five GETs: /api/me, /api/directory, /api/activity,
-//   /api/requests/{id} and /api/roster (M6-SPEC §3). The only writes are the owner's roster
+// - A read-only proxy of exactly six GETs: /api/me, /api/directory, /api/activity,
+//   /api/requests/{id}, /api/roster (M6-SPEC §3) and /api/inbox/summary (M7-SPEC §3). The only writes are the owner's roster
 //   changes: POST /api/roster, PATCH and DELETE /api/roster/{member}, each with
 //   Content-Type: application/json and Sec-Fetch-Site: same-origin, and a body checked here
 //   before it is sent on. Nothing else is proxied, so there is no way to send, ack or reply
@@ -102,6 +102,8 @@ export type ConsoleBackend = {
   request(id: string, ctx?: ReadContext): Promise<unknown>;
   /** M6-SPEC §2, §3: the roster, and the owner's changes to it. */
   roster(ctx?: ReadContext): Promise<unknown>;
+  /** M7-SPEC §1, §3: what waits for the viewer's answering session. */
+  inboxSummary(ctx?: ReadContext): Promise<unknown>;
   addMember(body: AddMemberBody, ctx?: ReadContext): Promise<unknown>;
   updateMember(member: string, body: UpdateMemberBody, ctx?: ReadContext): Promise<unknown>;
   removeMember(member: string, ctx?: ReadContext): Promise<unknown>;
@@ -119,6 +121,7 @@ export function relayBackend(client: RelayClient): ConsoleBackend {
     activity: (q, ctx) => client.activity(q, opts(ctx)),
     request: (id, ctx) => client.getRequest(id, opts(ctx)),
     roster: (ctx) => client.roster(opts(ctx)),
+    inboxSummary: (ctx) => client.inboxSummary(opts(ctx)),
     addMember: (body, ctx) => client.addMember(body, opts(ctx)),
     updateMember: (member, body, ctx) => client.updateMember(member, body, opts(ctx)),
     removeMember: (member, ctx) => client.removeMember(member, opts(ctx)),
@@ -132,6 +135,7 @@ export function demoBackend(team: DemoTeam): ConsoleBackend {
     activity: async (q) => team.activity(q),
     request: async (id) => team.request(id),
     roster: async () => team.roster(),
+    inboxSummary: async () => team.inboxSummary(),
     addMember: async (body) => team.addMember(body),
     updateMember: async (member, body) => team.updateMember(member, body),
     removeMember: async (member) => team.removeMember(member),
@@ -291,7 +295,7 @@ const PLACEHOLDER = `<!doctype html>
 <p>The console has not been built yet: <code>dist/console/</code> is missing. Build it from
 <code>console/</code> (it builds into <code>plugin/dist/console/</code>), then reload this page.</p>
 <p>The API is running: <code>/api/me</code>, <code>/api/directory</code>, <code>/api/activity</code>,
-<code>/api/requests/{id}</code>, <code>/api/roster</code> and <code>/api/join</code>, with the key from this page's
+<code>/api/requests/{id}</code>, <code>/api/roster</code>, <code>/api/inbox/summary</code> and <code>/api/join</code>, with the key from this page's
 address in an <code>X-Console-Key</code> header.</p>
 </body>
 </html>
@@ -542,7 +546,7 @@ export function createConsoleServer(opts: ConsoleServerOptions): ConsoleServer {
       return sendJson(res, 200, opts.join);
     }
     let call: () => Promise<unknown>;
-    if (path === '/api/me' || path === '/api/directory' || path === '/api/roster') {
+    if (path === '/api/me' || path === '/api/directory' || path === '/api/roster' || path === '/api/inbox/summary') {
       if (query.length > 0) return sendJson(res, 400, { error: 'bad_request', detail: 'no query parameters here' });
       // Hosted, the viewer's own IAP-verified email rides along on /api/me so the join panel can
       // fill in their commands; it is theirs, and nobody else's is ever added.
@@ -556,7 +560,9 @@ export function createConsoleServer(opts: ConsoleServerOptions): ConsoleServer {
             }
           : path === '/api/directory'
             ? () => opts.backend.directory(ctx)
-            : () => opts.backend.roster(ctx);
+            : path === '/api/inbox/summary'
+              ? () => opts.backend.inboxSummary(ctx)
+              : () => opts.backend.roster(ctx);
     } else if (path === '/api/activity') {
       const q: { since?: string; limit?: number } = {};
       for (const k of query) {

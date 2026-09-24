@@ -25677,6 +25677,13 @@ var RelayClient = class {
   directory(opts) {
     return this.call("GET", this.teamPath("directory"), void 0, opts);
   }
+  /**
+   * M7-SPEC §1: what waits in this member's inbox for their answering session. A peek: it moves
+   * no cursor and writes no presence, so a session without the channel may read it too.
+   */
+  inboxSummary(opts) {
+    return this.call("GET", this.teamPath("inbox", "summary"), void 0, opts);
+  }
   /** Safe to retry: the idempotency key makes a repeated POST return the original request. */
   createRequest(body, opts) {
     return this.call("POST", this.teamPath("requests"), body, opts);
@@ -33126,11 +33133,154 @@ function channelCommand(env) {
   const { plugin, marketplace } = pluginRef(env);
   return `claude --dangerously-load-development-channels plugin:${plugin}@${marketplace}`;
 }
+function answeringCommand(env, bundleRoot = ownRoot()) {
+  const root = (env.CLAUDE_PLUGIN_ROOT || bundleRoot || "").replace(/[\r\n]/g, "").replace(/[\\/]+$/, "");
+  const path = `${root}/bin/answerer`;
+  return /["$`\\!]/.test(path) ? `'${path.replace(/'/g, `'\\''`)}'` : `"${path}"`;
+}
 function notChannelNote(env) {
   return `This session was not started with the team-relay channel, so teammates' answers are not shown here. Start one with: ${channelCommand(env)}`;
 }
 function answersAppearNote(env) {
   return `The answer is not shown in this session. It is delivered to a session started with the team-relay channel: one running now, or the next one you start with: ${channelCommand(env)}. Here, request_status with this request_id shows who has acknowledged and answered.`;
+}
+
+// src/tool-util.ts
+function toolJson(value) {
+  return { content: [{ type: "text", text: JSON.stringify(value) }] };
+}
+function toolError(message) {
+  return { content: [{ type: "text", text: message }], isError: true };
+}
+function describeError(err) {
+  if (err instanceof RelayError) {
+    return `relay refused (${err.status} ${err.code})${err.detail ? `: ${err.detail}` : ""}`;
+  }
+  if (err instanceof RelayNetworkError) return err.message;
+  if (err instanceof Error) return err.message;
+  return "unexpected error";
+}
+function isPlainObject4(v) {
+  return typeof v === "object" && v !== null && !Array.isArray(v);
+}
+function unknownKey(args, allowed) {
+  for (const k of Object.keys(args)) if (!allowed.includes(k)) return k;
+  return null;
+}
+function optionalInt(args, key, min, max) {
+  const v = args[key];
+  if (v === void 0 || v === null) return void 0;
+  if (typeof v !== "number" || !Number.isInteger(v) || v < min || v > max) {
+    throw new Error(`${key} must be an integer between ${min} and ${max}`);
+  }
+  return v;
+}
+
+// src/waiting.ts
+var ANSWERING_ONLINE_MS = 45e3;
+var CHECK_INTERVAL_MS = 6e4;
+var REPEAT_MS = 36e5;
+var SUMMARY_CAP = 50;
+function parseSummary(raw) {
+  if (!isPlainObject4(raw)) return null;
+  const { pending, more, oldest_at, from, answering } = raw;
+  if (typeof pending !== "number" || !Number.isInteger(pending) || pending < 0 || pending > SUMMARY_CAP) return null;
+  const seen = isPlainObject4(answering) ? answering.last_seen : null;
+  const time3 = (v) => typeof v === "string" && Number.isFinite(Date.parse(v)) ? v : null;
+  return {
+    pending,
+    more: more === true,
+    oldest_at: time3(oldest_at),
+    from: Array.isArray(from) ? from.filter((m) => typeof m === "string" && MEMBER_RE.test(m)).slice(0, 5) : [],
+    answering: { last_seen: time3(seen) }
+  };
+}
+function answeringOnline(s, now) {
+  if (s.answering.last_seen === null) return false;
+  return now - Date.parse(s.answering.last_seen) < ANSWERING_ONLINE_MS;
+}
+function joinNames(names) {
+  if (names.length <= 1) return names.join("");
+  return `${names.slice(0, -1).join(", ")} and ${names.at(-1)}`;
+}
+function waitingSentence(s, now, command) {
+  if (s.pending === 0 || answeringOnline(s, now)) return null;
+  const count = s.more ? `${s.pending}+` : String(s.pending);
+  const noun = s.pending === 1 && !s.more ? "question" : "questions";
+  const from = s.from.length > 0 ? ` from ${joinNames(s.from)}` : "";
+  return `${count} ${noun}${from} waiting for you. Start your answering session: ${command}`;
+}
+var NoticeRule = class {
+  constructor(repeatMs = REPEAT_MS) {
+    this.repeatMs = repeatMs;
+  }
+  repeatMs;
+  lastKey = null;
+  lastAt = 0;
+  decide(s, now, command) {
+    if (s.pending === 0) {
+      this.lastKey = null;
+      return null;
+    }
+    const sentence = waitingSentence(s, now, command);
+    if (sentence === null) return null;
+    const key = `${s.pending}|${s.more}|${s.from.join(",")}`;
+    if (key === this.lastKey && now - this.lastAt < this.repeatMs) return null;
+    this.lastKey = key;
+    this.lastAt = now;
+    return sentence;
+  }
+};
+async function readSummary(client, timeoutMs = 3e3, signal) {
+  try {
+    return parseSummary(await client.inboxSummary({ attempts: 1, timeoutMs, ...signal ? { signal } : {} }));
+  } catch {
+    return null;
+  }
+}
+async function whoamiFields(client, command) {
+  const s = await readSummary(client);
+  if (!s) return {};
+  const sentence = waitingSentence(s, Date.now(), command);
+  return { inbox_waiting: s.pending, ...s.more ? { inbox_waiting_more: true } : {}, ...sentence ? { inbox_notice: sentence } : {} };
+}
+function checkIntervalMs(env) {
+  const v = Number(env.TEAM_RELAY_INBOX_CHECK_SECONDS);
+  return Number.isInteger(v) && v >= 1 && v * 1e3 <= CHECK_INTERVAL_MS ? v * 1e3 : CHECK_INTERVAL_MS;
+}
+async function watchInbox(opts) {
+  const rule = opts.rule ?? new NoticeRule();
+  const interval = opts.intervalMs ?? CHECK_INTERVAL_MS;
+  let failing = false;
+  while (!opts.signal.aborted) {
+    try {
+      const raw = await opts.client.inboxSummary({ attempts: 1, timeoutMs: 15e3, signal: opts.signal });
+      failing = false;
+      const s = parseSummary(raw);
+      const sentence = s ? rule.decide(s, Date.now(), opts.command) : null;
+      if (sentence && !opts.signal.aborted) await opts.push(`team-relay: ${sentence}`);
+    } catch (err) {
+      if (opts.signal.aborted) return;
+      if (!failing) {
+        const why = err instanceof RelayError ? `${err.status} ${err.code}` : "unreachable";
+        opts.log?.(`inbox summary not read (${why}); checking again later`);
+      }
+      failing = true;
+    }
+    await sleep(interval, opts.signal);
+  }
+}
+function sleep(ms, signal) {
+  return new Promise((resolve) => {
+    if (signal.aborted) return resolve();
+    const t = setTimeout(done, ms);
+    function done() {
+      clearTimeout(t);
+      signal.removeEventListener("abort", done);
+      resolve();
+    }
+    signal.addEventListener("abort", done);
+  });
 }
 
 // src/active.ts
@@ -33239,37 +33389,6 @@ var AnswerDeadlines = class {
     return this.map.get(requestId) ?? null;
   }
 };
-
-// src/tool-util.ts
-function toolJson(value) {
-  return { content: [{ type: "text", text: JSON.stringify(value) }] };
-}
-function toolError(message) {
-  return { content: [{ type: "text", text: message }], isError: true };
-}
-function describeError(err) {
-  if (err instanceof RelayError) {
-    return `relay refused (${err.status} ${err.code})${err.detail ? `: ${err.detail}` : ""}`;
-  }
-  if (err instanceof RelayNetworkError) return err.message;
-  if (err instanceof Error) return err.message;
-  return "unexpected error";
-}
-function isPlainObject4(v) {
-  return typeof v === "object" && v !== null && !Array.isArray(v);
-}
-function unknownKey(args, allowed) {
-  for (const k of Object.keys(args)) if (!allowed.includes(k)) return k;
-  return null;
-}
-function optionalInt(args, key, min, max) {
-  const v = args[key];
-  if (v === void 0 || v === null) return void 0;
-  if (typeof v !== "number" || !Number.isInteger(v) || v < min || v > max) {
-    throw new Error(`${key} must be an integer between ${min} and ${max}`);
-  }
-  return v;
-}
 
 // src/channel.ts
 var log = makeLogger("channel");
@@ -33625,7 +33744,7 @@ var SESSION_TOOLS = [
     inputSchema: { type: "object", properties: {}, additionalProperties: false }
   }
 ];
-var STATUS_NOTE = 'type="status" events come from this plugin itself (never from a teammate) and say whether you are signed in.';
+var STATUS_NOTE = 'type="status" events come from this plugin itself (never from a teammate) and say whether you are signed in, and when questions from teammates are waiting for your answering session.';
 var AskerConnection = class {
   constructor(env, server, channel) {
     this.env = env;
@@ -33783,6 +33902,14 @@ var AskerConnection = class {
       void streamLoop(this.server, client, me, "replies", stopper, void 0, onUnauthorized).catch(
         (err) => log(`stream loop ended: ${describeError(err)}`)
       );
+      void watchInbox({
+        client,
+        push: (content) => this.status(content),
+        command: answeringCommand(this.env),
+        signal: stopper.signal,
+        intervalMs: checkIntervalMs(this.env),
+        log
+      }).catch((err) => log(`inbox check ended: ${describeError(err)}`));
     }
     return 2e3;
   }
@@ -33900,9 +34027,19 @@ var AskerConnection = class {
     while (Date.now() < until && !(this.live && this.live.me.member === o.member && this.live.me.team === o.team)) {
       await new Promise((r) => setTimeout(r, 100));
     }
+    let waiting = null;
+    let count = null;
+    if (this.live && this.live.me.member === o.member && this.live.me.team === o.team) {
+      const summary = await readSummary(this.live.client);
+      if (summary) {
+        count = summary.pending;
+        waiting = waitingSentence(summary, Date.now(), answeringCommand(this.env));
+      }
+    }
     return toolJson({
       connected: true,
-      message: connectedAs(o),
+      message: waiting ? `${connectedAs(o)}. ${waiting}` : connectedAs(o),
+      ...count !== null ? { inbox_waiting: count } : {},
       member: o.member,
       team: o.team,
       ...o.email ? { email: o.email } : {},
@@ -33934,7 +34071,8 @@ var AskerConnection = class {
         teammates: this.live.me.teammates.filter((m) => MEMBER_RE.test(m)),
         signed_in_with: SIGNED_IN_WITH[this.live.mode],
         ...expires ? { credential_expires_at: expires } : {},
-        ...this.changed ? { changed: this.changed } : {}
+        ...this.changed ? { changed: this.changed } : {},
+        ...await whoamiFields(this.live.client, answeringCommand(this.env))
       });
     }
     return toolJson({

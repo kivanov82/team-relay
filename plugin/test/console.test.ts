@@ -135,7 +135,7 @@ const DIRECTORY_SCHEMA = {
       items: {
         type: 'object',
         additionalProperties: false,
-        required: ['member', 'last_seen', 'manifest', 'published_at', 'sessions', 'stats'],
+        required: ['member', 'last_seen', 'manifest', 'published_at', 'sessions', 'stats', 'inbox_waiting'],
         properties: {
           member: MEMBER,
           last_seen: TIME_OR_NULL,
@@ -161,9 +161,22 @@ const DIRECTORY_SCHEMA = {
               median_answer_seconds: { anyOf: [{ type: 'number', minimum: 0 }, { type: 'null' }] },
             },
           },
+          inbox_waiting: { type: 'integer', minimum: 0, maximum: 50 },
         },
       },
     },
+  },
+};
+const SUMMARY_SCHEMA = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['pending', 'more', 'oldest_at', 'from', 'answering'],
+  properties: {
+    pending: { type: 'integer', minimum: 0, maximum: 50 },
+    more: { type: 'boolean' },
+    oldest_at: TIME_OR_NULL,
+    from: { type: 'array', maxItems: 5, items: MEMBER },
+    answering: { type: 'object', additionalProperties: false, required: ['last_seen'], properties: { last_seen: TIME_OR_NULL } },
   },
 };
 const ME_SCHEMA = {
@@ -180,6 +193,7 @@ const ajv = new Ajv({ allErrors: true, strict: false });
 const validActivity = ajv.compile(ACTIVITY_SCHEMA);
 const validDirectory = ajv.compile(DIRECTORY_SCHEMA);
 const validMe = ajv.compile(ME_SCHEMA);
+const validSummary = ajv.compile(SUMMARY_SCHEMA);
 
 function expectValid(validate: ReturnType<typeof ajv.compile>, value: unknown) {
   const ok = validate(value);
@@ -235,17 +249,23 @@ describe('console server: the gate', () => {
     expect(keyMatches('', KEY)).toBe(false);
   });
 
-  it('proxies exactly the four GETs, to the right relay paths', async () => {
+  it('proxies exactly the read GETs, to the right relay paths', async () => {
     const id = relay.addRequest({ kind: 'question', asker: 'alice', question: 'q' });
+    relay.enqueue('alice', 'inbox', { from: 'bob' });
     expect((await api(port, '/api/me')).json()).toEqual({ team: 'demo', member: 'alice', teammates: ['bob', 'carol'] });
     expect((await api(port, '/api/directory')).status).toBe(200);
     expect((await api(port, '/api/activity?since=2026-09-23T10:00:00Z&limit=50')).status).toBe(200);
     expect((await api(port, `/api/requests/${id}`)).json().request_id).toBe(id);
+    // M7-SPEC §3: the viewer's own inbox summary, a peek that moves nothing.
+    const summary = (await api(port, '/api/inbox/summary')).json();
+    expect(summary).toMatchObject({ pending: 1, more: false, from: ['bob'], answering: { last_seen: null } });
+    expect(relay.stream('alice', 'inbox').cursor).toBe(0);
     expect(relay.requests.map((r) => `${r.method} ${r.path}`)).toEqual([
       'GET /v1/teams/demo/me',
       'GET /v1/teams/demo/directory',
       'GET /v1/teams/demo/activity',
       `GET /v1/teams/demo/requests/${id}`,
+      'GET /v1/teams/demo/inbox/summary',
     ]);
     expect(Object.fromEntries(relay.requests[2]!.query)).toEqual({ since: '2026-09-23T10:00:00Z', limit: '50' });
     expect(relay.requests.every((r) => r.headers.authorization === `Bearer ${TOKEN_OF.alice}`)).toBe(true);
@@ -267,11 +287,14 @@ describe('console server: the gate', () => {
       '/api/members/alice/manifest',
       '/api/healthz',
       '/api/v1/teams/demo/me',
+      '/api/inbox',
+      '/api/inbox/summary/x',
+      '/api/streams/inbox/cursor',
     ]) {
       expect([400, 404], path).toContain((await api(port, path)).status);
     }
     for (const method of ['POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS', 'HEAD']) {
-      for (const path of ['/api/me', `/api/requests/${id}`, `/api/requests/${id}/reply`, '/api/requests']) {
+      for (const path of ['/api/me', `/api/requests/${id}`, `/api/requests/${id}/reply`, '/api/requests', '/api/inbox/summary']) {
         const r = await api(port, path, { method, headers: { 'Content-Type': 'application/json' }, body: method === 'HEAD' || method === 'OPTIONS' ? undefined : '{"text":"hi"}' }).catch((e: Error) => {
           throw new Error(`${method} ${path}: ${e.message}`);
         });
@@ -288,6 +311,7 @@ describe('console server: the gate', () => {
       expect((await api(port, '/api/activity' + q)).status, q).toBe(400);
     }
     expect((await api(port, '/api/me?x=1')).status).toBe(400);
+    expect((await api(port, '/api/inbox/summary?member=bob')).status).toBe(400);
     expect(relay.requests).toHaveLength(0);
   });
 
@@ -670,6 +694,7 @@ describe('console --demo backend', () => {
       expectValid(validActivity, (await api(port, '/api/activity')).json());
       expectValid(validDirectory, (await api(port, '/api/directory')).json());
       expectValid(validMe, (await api(port, '/api/me')).json());
+      expectValid(validSummary, (await api(port, '/api/inbox/summary')).json());
       expect((await api(port, `/api/requests/rq_${'0'.repeat(32)}`)).status).toBe(404);
       expect((await api(port, '/api/activity?since=2026-01-01T00:00:00Z')).status).toBe(200);
     } finally {

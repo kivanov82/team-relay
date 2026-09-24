@@ -225,6 +225,17 @@ export function channelCommand(env: NodeJS.ProcessEnv): string {
   return `claude --dangerously-load-development-channels plugin:${plugin}@${marketplace}`;
 }
 
+/**
+ * The command /team-relay:answering prints: the answering session's launcher in this plugin's
+ * install (CLAUDE_PLUGIN_ROOT, else where this bundle lives), quoted for a shell.
+ */
+export function answeringCommand(env: NodeJS.ProcessEnv, bundleRoot: string | null = ownRoot()): string {
+  const root = (env.CLAUDE_PLUGIN_ROOT || bundleRoot || '').replace(/[\r\n]/g, '').replace(/[\\/]+$/, '');
+  const path = `${root}/bin/answerer`;
+  // Double quotes as the command file shows it, unless the path holds what they would expand.
+  return /["$`\\!]/.test(path) ? `'${path.replace(/'/g, `'\\''`)}'` : `"${path}"`;
+}
+
 /** Said plainly, in tool results and the SessionStart line, by a session without the channel. */
 export function notChannelNote(env: NodeJS.ProcessEnv): string {
   return (

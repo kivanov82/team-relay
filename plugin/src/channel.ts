@@ -41,7 +41,8 @@ import { envelopeToNotification, neutraliseDeep, RecentIds } from './notify.js';
 import { findCapability, loadManifest, validateManifest, validateParams, codePointLength, hasLoneSurrogate } from './manifest.js';
 import { defaultManifestPath, discoveryPayload, exposedCapabilities, sharesFromEnv } from './exposed.js';
 import { makeLogger } from './log.js';
-import { answersAppearNote, detectChannelSession, notChannelNote } from './channel-mode.js';
+import { answeringCommand, answersAppearNote, detectChannelSession, notChannelNote } from './channel-mode.js';
+import { checkIntervalMs, readSummary, waitingSentence, watchInbox, whoamiFields } from './waiting.js';
 import { ActiveRequests, AnswerDeadlines, deadlineOf } from './active.js';
 import {
   describeError,
@@ -506,7 +507,8 @@ const SESSION_TOOLS = [
 ] as const;
 
 const STATUS_NOTE =
-  'type="status" events come from this plugin itself (never from a teammate) and say whether you are signed in.';
+  'type="status" events come from this plugin itself (never from a teammate) and say whether you are signed in, ' +
+  'and when questions from teammates are waiting for your answering session.';
 
 type Live = { client: RelayClient; me: Me };
 
@@ -691,6 +693,15 @@ class AskerConnection {
       void streamLoop(this.server, client, me, 'replies', stopper, undefined, onUnauthorized).catch((err) =>
         log(`stream loop ended: ${describeError(err)}`),
       );
+      // M7-SPEC §2: at connect (so right after every sign-in) and every 60 s.
+      void watchInbox({
+        client,
+        push: (content) => this.status(content),
+        command: answeringCommand(this.env),
+        signal: stopper.signal,
+        intervalMs: checkIntervalMs(this.env),
+        log,
+      }).catch((err) => log(`inbox check ended: ${describeError(err)}`));
     }
     return 2000;
   }
@@ -824,9 +835,20 @@ class AskerConnection {
     while (Date.now() < until && !(this.live && this.live.me.member === o.member && this.live.me.team === o.team)) {
       await new Promise((r) => setTimeout(r, 100));
     }
+    // M7-SPEC §2: questions that waited while this member was signed out are news now.
+    let waiting: string | null = null;
+    let count: number | null = null;
+    if (this.live && this.live.me.member === o.member && this.live.me.team === o.team) {
+      const summary = await readSummary(this.live.client);
+      if (summary) {
+        count = summary.pending;
+        waiting = waitingSentence(summary, Date.now(), answeringCommand(this.env));
+      }
+    }
     return toolJson({
       connected: true,
-      message: connectedAs(o),
+      message: waiting ? `${connectedAs(o)}. ${waiting}` : connectedAs(o),
+      ...(count !== null ? { inbox_waiting: count } : {}),
       member: o.member,
       team: o.team,
       ...(o.email ? { email: o.email } : {}),
@@ -861,6 +883,7 @@ class AskerConnection {
         signed_in_with: SIGNED_IN_WITH[this.live.mode],
         ...(expires ? { credential_expires_at: expires } : {}),
         ...(this.changed ? { changed: this.changed } : {}),
+        ...(await whoamiFields(this.live.client, answeringCommand(this.env))),
       });
     }
     return toolJson({

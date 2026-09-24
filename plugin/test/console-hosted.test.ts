@@ -166,6 +166,7 @@ class FakeDelegateRelay {
     if (path === '/v1/teams/demo/me') return json(200, { team: 'demo', member: viewer === 'alice@example.com' ? 'alice' : 'someone', teammates: ['bob'] });
     if (path === '/v1/teams/demo/directory') return json(200, { members: [], stats_complete: true });
     if (path === '/v1/teams/demo/activity') return json(200, { requests: [], next_since: null, server_time: new Date().toISOString() });
+    if (path === '/v1/teams/demo/inbox/summary') return json(200, { pending: 2, more: false, oldest_at: null, from: ['bob'], answering: { last_seen: null } });
     return json(404, { error: 'not_found' });
   });
   async start() {
@@ -271,9 +272,13 @@ describe('hosted console server (M3-SPEC §3)', () => {
     expect(res.headers['content-security-policy']).toContain("default-src 'self'");
     expect(res.headers['access-control-allow-origin']).toBeUndefined();
 
-    for (const path of ['/api/directory', '/api/activity?limit=5']) {
+    for (const path of ['/api/directory', '/api/activity?limit=5', '/api/inbox/summary']) {
       expect((await get(port, path, { assertion: await sign(signer) })).status).toBe(200);
     }
+    // M7-SPEC §3: the viewer's own summary, read on their behalf.
+    const summary = await get(port, '/api/inbox/summary', { assertion: await sign(signer) });
+    expect(JSON.parse(summary.body)).toMatchObject({ pending: 2, from: ['bob'] });
+    expect(relay.seen.filter((s) => s.path === '/v1/teams/demo/inbox/summary')).toHaveLength(2);
     expect(relay.seen.every((s) => s.headers['x-relay-on-behalf-of'] === 'alice@example.com')).toBe(true);
     // A key, if a browser sent one, is irrelevant.
     expect((await get(port, '/api/me', { assertion: await sign(signer), headers: { 'X-Console-Key': 'nonsense' } })).status).toBe(200);

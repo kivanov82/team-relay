@@ -529,6 +529,13 @@ var RelayClient = class {
   directory(opts) {
     return this.call("GET", this.teamPath("directory"), void 0, opts);
   }
+  /**
+   * M7-SPEC §1: what waits in this member's inbox for their answering session. A peek: it moves
+   * no cursor and writes no presence, so a session without the channel may read it too.
+   */
+  inboxSummary(opts) {
+    return this.call("GET", this.teamPath("inbox", "summary"), void 0, opts);
+  }
   /** Safe to retry: the idempotency key makes a repeated POST return the original request. */
   createRequest(body, opts) {
     return this.call("POST", this.teamPath("requests"), body, opts);
@@ -754,8 +761,58 @@ function channelCommand(env) {
   const { plugin, marketplace } = pluginRef(env);
   return `claude --dangerously-load-development-channels plugin:${plugin}@${marketplace}`;
 }
+function answeringCommand(env, bundleRoot = ownRoot()) {
+  const root = (env.CLAUDE_PLUGIN_ROOT || bundleRoot || "").replace(/[\r\n]/g, "").replace(/[\\/]+$/, "");
+  const path = `${root}/bin/answerer`;
+  return /["$`\\!]/.test(path) ? `'${path.replace(/'/g, `'\\''`)}'` : `"${path}"`;
+}
 function notChannelNote(env) {
   return `This session was not started with the team-relay channel, so teammates' answers are not shown here. Start one with: ${channelCommand(env)}`;
+}
+
+// src/tool-util.ts
+function isPlainObject(v) {
+  return typeof v === "object" && v !== null && !Array.isArray(v);
+}
+
+// src/waiting.ts
+var ANSWERING_ONLINE_MS = 45e3;
+var SUMMARY_CAP = 50;
+function parseSummary(raw) {
+  if (!isPlainObject(raw)) return null;
+  const { pending, more, oldest_at, from, answering } = raw;
+  if (typeof pending !== "number" || !Number.isInteger(pending) || pending < 0 || pending > SUMMARY_CAP) return null;
+  const seen = isPlainObject(answering) ? answering.last_seen : null;
+  const time = (v) => typeof v === "string" && Number.isFinite(Date.parse(v)) ? v : null;
+  return {
+    pending,
+    more: more === true,
+    oldest_at: time(oldest_at),
+    from: Array.isArray(from) ? from.filter((m) => typeof m === "string" && MEMBER_RE.test(m)).slice(0, 5) : [],
+    answering: { last_seen: time(seen) }
+  };
+}
+function answeringOnline(s, now) {
+  if (s.answering.last_seen === null) return false;
+  return now - Date.parse(s.answering.last_seen) < ANSWERING_ONLINE_MS;
+}
+function joinNames(names) {
+  if (names.length <= 1) return names.join("");
+  return `${names.slice(0, -1).join(", ")} and ${names.at(-1)}`;
+}
+function waitingSentence(s, now, command) {
+  if (s.pending === 0 || answeringOnline(s, now)) return null;
+  const count = s.more ? `${s.pending}+` : String(s.pending);
+  const noun = s.pending === 1 && !s.more ? "question" : "questions";
+  const from = s.from.length > 0 ? ` from ${joinNames(s.from)}` : "";
+  return `${count} ${noun}${from} waiting for you. Start your answering session: ${command}`;
+}
+async function readSummary(client, timeoutMs = 3e3, signal) {
+  try {
+    return parseSummary(await client.inboxSummary({ attempts: 1, timeoutMs, ...signal ? { signal } : {} }));
+  } catch {
+    return null;
+  }
 }
 
 // src/session-start.ts
@@ -777,11 +834,12 @@ async function relayStatusLine(env) {
   }
   try {
     const client = new RelayClient({ url: conn.url, team: conn.team, token: conn.token, attempts: 1, timeoutMs: 3e3 });
-    const me = await client.me();
+    const [me, summary] = await Promise.all([client.me(), readSummary(client, 3e3)]);
     if (!MEMBER_RE.test(me.member) || !TEAM_RE.test(me.team)) throw new Error("unexpected answer from the relay");
     const teammates = Array.isArray(me.teammates) ? me.teammates.filter((m) => typeof m === "string" && MEMBER_RE.test(m)) : [];
     const mates = teammates.length ? teammates.join(", ") : "none yet";
-    return `team-relay: you are ${me.member} in team ${me.team}; teammates: ${mates}. Use list_teammates, ask_question and invoke_capability to reach them. ${TRUST}`;
+    const waiting = summary ? waitingSentence(summary, Date.now(), answeringCommand(env)) : null;
+    return `team-relay: you are ${me.member} in team ${me.team}; teammates: ${mates}. Use list_teammates, ask_question and invoke_capability to reach them.${waiting ? ` ${waiting}` : ""} ${TRUST}`;
   } catch (err) {
     if (err instanceof RelayError && err.status === 401 && conn.mode === "credential") {
       return "team-relay: Not connected: the relay refused your sign-in (signed out, expired, or no longer on the team); run /team-relay:login again.";

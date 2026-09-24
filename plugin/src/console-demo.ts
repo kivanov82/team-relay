@@ -582,6 +582,15 @@ export class DemoTeam {
   }
 
   /**
+   * M7-SPEC §1 as alice reads it. Her answering session polls through the demo, so it takes
+   * what arrives at once and nothing waits.
+   */
+  inboxSummary() {
+    const p = this.presence(DEMO_ME, this.now());
+    return { pending: 0, more: false, oldest_at: null, from: [], answering: { last_seen: p.answering } };
+  }
+
+  /**
    * M2-SPEC §3.1, §3.6 as the relay computes them: one read of the most recently updated
    * requests of the last 24 h (at most STATS_READ_CAP, `stats_complete` false when the cap was
    * reached), expired ones left out; `asked` by creation in the window, `answered` and the
@@ -606,6 +615,8 @@ export class DemoTeam {
         published_at: manifest ? this.publishedAt : null,
         sessions: { working: { last_seen: p.working }, answering: { last_seen: p.answering } },
         stats: memberStats(read, member, start, now),
+        // M7-SPEC §1: every demo answering session is polling, so nothing waits.
+        inbox_waiting: 0,
       };
     });
     return { members, stats_complete: read.length < STATS_READ_CAP };

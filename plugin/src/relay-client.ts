@@ -619,6 +619,14 @@ export class RelayClient {
     return this.call<{ members: DirectoryEntry[] }>('GET', this.teamPath('directory'), undefined, opts);
   }
 
+  /**
+   * M7-SPEC §1: what waits in this member's inbox for their answering session. A peek: it moves
+   * no cursor and writes no presence, so a session without the channel may read it too.
+   */
+  inboxSummary(opts?: CallOptions) {
+    return this.call<unknown>('GET', this.teamPath('inbox', 'summary'), undefined, opts);
+  }
+
   /** Safe to retry: the idempotency key makes a repeated POST return the original request. */
   createRequest(body: CreateRequestBody, opts?: CallOptions) {
     return this.call<CreateRequestResult>('POST', this.teamPath('requests'), body, opts);

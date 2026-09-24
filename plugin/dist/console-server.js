@@ -21891,6 +21891,14 @@ var DemoTeam = class {
     }
   }
   /**
+   * M7-SPEC §1 as alice reads it. Her answering session polls through the demo, so it takes
+   * what arrives at once and nothing waits.
+   */
+  inboxSummary() {
+    const p = this.presence(DEMO_ME, this.now());
+    return { pending: 0, more: false, oldest_at: null, from: [], answering: { last_seen: p.answering } };
+  }
+  /**
    * M2-SPEC §3.1, §3.6 as the relay computes them: one read of the most recently updated
    * requests of the last 24 h (at most STATS_READ_CAP, `stats_complete` false when the cap was
    * reached), expired ones left out; `asked` by creation in the window, `answered` and the
@@ -21910,7 +21918,9 @@ var DemoTeam = class {
         manifest,
         published_at: manifest ? this.publishedAt : null,
         sessions: { working: { last_seen: p.working }, answering: { last_seen: p.answering } },
-        stats: memberStats(read, member, start, now)
+        stats: memberStats(read, member, start, now),
+        // M7-SPEC §1: every demo answering session is polling, so nothing waits.
+        inbox_waiting: 0
       };
     });
     return { members, stats_complete: read.length < STATS_READ_CAP };
@@ -23363,6 +23373,13 @@ var RelayClient = class {
   directory(opts) {
     return this.call("GET", this.teamPath("directory"), void 0, opts);
   }
+  /**
+   * M7-SPEC §1: what waits in this member's inbox for their answering session. A peek: it moves
+   * no cursor and writes no presence, so a session without the channel may read it too.
+   */
+  inboxSummary(opts) {
+    return this.call("GET", this.teamPath("inbox", "summary"), void 0, opts);
+  }
   /** Safe to retry: the idempotency key makes a repeated POST return the original request. */
   createRequest(body, opts) {
     return this.call("POST", this.teamPath("requests"), body, opts);
@@ -23506,6 +23523,7 @@ function relayBackend(client) {
     activity: (q, ctx) => client.activity(q, opts(ctx)),
     request: (id, ctx) => client.getRequest(id, opts(ctx)),
     roster: (ctx) => client.roster(opts(ctx)),
+    inboxSummary: (ctx) => client.inboxSummary(opts(ctx)),
     addMember: (body, ctx) => client.addMember(body, opts(ctx)),
     updateMember: (member, body, ctx) => client.updateMember(member, body, opts(ctx)),
     removeMember: (member, ctx) => client.removeMember(member, opts(ctx))
@@ -23518,6 +23536,7 @@ function demoBackend(team) {
     activity: async (q) => team.activity(q),
     request: async (id) => team.request(id),
     roster: async () => team.roster(),
+    inboxSummary: async () => team.inboxSummary(),
     addMember: async (body) => team.addMember(body),
     updateMember: async (member, body) => team.updateMember(member, body),
     removeMember: async (member) => team.removeMember(member)
@@ -23625,7 +23644,7 @@ var PLACEHOLDER = `<!doctype html>
 <p>The console has not been built yet: <code>dist/console/</code> is missing. Build it from
 <code>console/</code> (it builds into <code>plugin/dist/console/</code>), then reload this page.</p>
 <p>The API is running: <code>/api/me</code>, <code>/api/directory</code>, <code>/api/activity</code>,
-<code>/api/requests/{id}</code>, <code>/api/roster</code> and <code>/api/join</code>, with the key from this page's
+<code>/api/requests/{id}</code>, <code>/api/roster</code>, <code>/api/inbox/summary</code> and <code>/api/join</code>, with the key from this page's
 address in an <code>X-Console-Key</code> header.</p>
 </body>
 </html>
@@ -23818,12 +23837,12 @@ function createConsoleServer(opts) {
       return sendJson(res, 200, opts.join);
     }
     let call;
-    if (path === "/api/me" || path === "/api/directory" || path === "/api/roster") {
+    if (path === "/api/me" || path === "/api/directory" || path === "/api/roster" || path === "/api/inbox/summary") {
       if (query.length > 0) return sendJson(res, 400, { error: "bad_request", detail: "no query parameters here" });
       call = path === "/api/me" ? async () => {
         const me = await opts.backend.me(ctx);
         return ctx.viewer !== void 0 && me !== null && typeof me === "object" && !Array.isArray(me) ? { ...me, email: ctx.viewer } : me;
-      } : path === "/api/directory" ? () => opts.backend.directory(ctx) : () => opts.backend.roster(ctx);
+      } : path === "/api/directory" ? () => opts.backend.directory(ctx) : path === "/api/inbox/summary" ? () => opts.backend.inboxSummary(ctx) : () => opts.backend.roster(ctx);
     } else if (path === "/api/activity") {
       const q = {};
       for (const k of query) {

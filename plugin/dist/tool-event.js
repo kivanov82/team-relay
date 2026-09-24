@@ -403,6 +403,13 @@ var RelayClient = class {
   directory(opts) {
     return this.call("GET", this.teamPath("directory"), void 0, opts);
   }
+  /**
+   * M7-SPEC §1: what waits in this member's inbox for their answering session. A peek: it moves
+   * no cursor and writes no presence, so a session without the channel may read it too.
+   */
+  inboxSummary(opts) {
+    return this.call("GET", this.teamPath("inbox", "summary"), void 0, opts);
+  }
   /** Safe to retry: the idempotency key makes a repeated POST return the original request. */
   createRequest(body, opts) {
     return this.call("POST", this.teamPath("requests"), body, opts);

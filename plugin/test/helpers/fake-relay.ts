@@ -69,6 +69,8 @@ export class FakeRelay {
   private readonly streams = new Map<string, StreamState>();
   private readonly idem = new Map<string, { request_id: string; body: string }>();
   private faults: Fault[] = [];
+  /** M7-SPEC §1: when each member's answering session last polled (null: never). */
+  readonly answeringSeen = new Map<string, string | null>();
   /** Called when a cursor POST arrives, before it is answered. */
   onCursor: ((member: string, stream: string, seq: number) => Promise<void> | void) | null = null;
   private server: Server | null = null;
@@ -250,6 +252,20 @@ export class FakeRelay {
       this.manifests.set(member, rec.body);
       const caps = ((rec.body as { capabilities?: Array<{ name: string }> })?.capabilities ?? []).map((c) => c.name);
       return this.send(res, 200, { published_at: iso(), capabilities: caps });
+    }
+    if (m === 'GET' && rest.length === 2 && rest[0] === 'inbox' && rest[1] === 'summary') {
+      // M7-SPEC §1, reduced: unexpired inbox messages past the cursor, at most 50; a peek.
+      const s = this.stream(member, 'inbox');
+      const now = Date.now();
+      const waiting = s.messages.filter((e) => e.seq > s.cursor && Date.parse(String(e.expire_at)) > now);
+      const read = waiting.slice(0, 50);
+      return this.send(res, 200, {
+        pending: read.length,
+        more: waiting.length > 50,
+        oldest_at: read[0] ? read[0].time : null,
+        from: [...new Set(read.map((e) => String(e.from)))].slice(0, 5),
+        answering: { last_seen: this.answeringSeen.get(member) ?? null },
+      });
     }
     if (m === 'GET' && rest.length === 1 && rest[0] === 'activity') {
       // M2-SPEC §3.5, reduced: no request documents, the envelope of the answer only.
