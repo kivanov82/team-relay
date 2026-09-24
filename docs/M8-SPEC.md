@@ -110,3 +110,46 @@ tool events. e2e: with a stub `claude` executable standing in for the headless a
 (it reads the prompt and calls the host tools as scripted), a question inside scope is answered
 automatically; one needing a read outside scope waits until approved; a flagged draft waits;
 a capability call waits; a lapse sends nothing.
+
+## 7. Corrections
+
+### 24 Sep 2026: after the M8 security review
+
+1. **Secret screen:** add `pass`, `pwd`, `pw` keys, prose forms ("the password / secret / token /
+   key is|was X"), hex strings of 32+ characters, secrets split across lines or spaced out, and
+   URLs with credentials in any form. **And a deterministic read trail:** the host learns which
+   files the answerer read (a hook into the host socket); a draft waits for approval when any
+   read file matches a sensitive-name list (`*.tfstate`, `secrets.*`, `*.properties`,
+   `docker-compose*`, `kubeconfig`, `*service-account*.json`, `.npmrc`, `.netrc`,
+   `.git-credentials`, `.dev.vars`, `id_ecdsa*`, `id_dsa*`, `*.ppk`, `*.pem`, `*.key`, `*.p12`).
+2. **Deny list at any depth** adds `.npmrc`, `.netrc`, `.pypirc`, `.git-credentials`,
+   `id_ecdsa*`, `id_dsa*`, `*.ppk`, `*.tfstate`, `.aws/**`, `.kube/**` (both copies; parity test).
+3. **Scope folder qualifies only if** it is inside a git work tree (a `.git` in it or an
+   ancestor below `$HOME`), is not `$HOME`, not a direct child of `$HOME`, not under
+   `~/Library` or any `~/.*`, and does not contain `~/Library` or any `~/.*`. Otherwise: no
+   automatic reads.
+4. **Taking over answering is announced:** a status event (and a desktop notification) when a
+   session becomes the host: "This session now answers teammates automatically from <folder>;
+   reads inside it are automatic."
+5. **Volume limits:** at most 3 queued questions per asker and 20 automatic runs per hour per
+   member; beyond that, questions wait for approval to run. Notifications and status pushes are
+   grouped: at most one desktop notification per 5 minutes; after the first push, later ones
+   carry counts only (no teammate text).
+6. **Permission prompts show the real target** when a path resolves elsewhere
+   ("…/proj/link → /elsewhere/x").
+7. **Glob/Grep patterns** with an absolute fixed prefix are checked against the deny list before
+   asking; a hit is denied without asking.
+8. **Drafts in the dialog:** measure and clip the same string that is shown; offer Send only
+   when the whole draft is shown, and show the exact text that will be sent.
+9. **Answerer-written reasons** are labelled as the answerer's words in approvals.
+10. **Documented limit:** approvals rely on no `Elicitation`/`ElicitationResult` hooks and no
+    auto-allowed Bash in the working session; the README says so.
+11. **Lock breaking** renames the lock to a unique name and verifies its content before
+    removing, so a suspended breaker cannot remove a live lock.
+12. **Nothing lost on stop:** the host advances the inbox cursor for a question only after it is
+    fully handled (answered, declined or lapsed); a question in flight when the session closes
+    is received again by the next host (skipped if the relay says it is already answered).
+    The shared folder is withdrawn (re-published without it) when the host stops.
+13. The spec now lists `--tools Read,Glob,Grep` and `--no-session-persistence` in the child
+    command line, and the time limit excludes time waiting for the member (hard stop at the
+    answer deadline plus 60 s).
