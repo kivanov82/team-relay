@@ -6,11 +6,14 @@ var NOTICE_TITLE = "Team relay";
 var NOTICE_TEXT = "Team relay: your answering session is waiting for your permission";
 var CAP_MS = 3e3;
 var STDIN_LIMIT = 1024 * 1024;
-function notifyCommand(platform) {
+var APPROVAL_TEXT = "Team relay: an answer is waiting for your approval";
+var TEXTS = [NOTICE_TEXT, APPROVAL_TEXT];
+function notifyCommand(platform, text = NOTICE_TEXT) {
+  if (!TEXTS.includes(text)) return null;
   if (platform === "darwin") {
-    return { file: "osascript", args: ["-e", `display notification "${NOTICE_TEXT}" with title "${NOTICE_TITLE}"`] };
+    return { file: "osascript", args: ["-e", `display notification "${text}" with title "${NOTICE_TITLE}"`] };
   }
-  if (platform === "linux") return { file: "notify-send", args: [NOTICE_TITLE, NOTICE_TEXT] };
+  if (platform === "linux") return { file: "notify-send", args: [NOTICE_TITLE, text] };
   return null;
 }
 function isPermissionPrompt(payload) {
@@ -57,6 +60,7 @@ if (process.argv[1] && /notify-desktop\.(js|ts)$/.test(process.argv[1])) {
   }).finally(() => process.exit(0));
 }
 export {
+  APPROVAL_TEXT,
   NOTICE_TEXT,
   NOTICE_TITLE,
   isPermissionPrompt,

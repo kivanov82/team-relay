@@ -291,6 +291,7 @@ describe('channel server: asker tools', () => {
       'login',
       'login_wait',
       'request_status',
+      'review_approvals',
       'whoami',
     ]);
   });

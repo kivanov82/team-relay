@@ -31,6 +31,10 @@ export function baseEnv(env: Record<string, string>): Record<string, string> {
     HOME: process.env.HOME ?? '/tmp',
     RELAY_AUTH: 'token',
     TEAM_RELAY_CHANNEL: '1',
+    // M8: a channel working session answers on its own; the suites that are not about that
+    // turn it off (test/answer-host*.test.ts turn it on), and nothing pops a real notification.
+    TEAM_RELAY_AUTO_ANSWER: '0',
+    TEAM_RELAY_DESKTOP_NOTIFY: '0',
     // test/helpers/isolate.ts: never the developer's own stored sign-in.
     ...(process.env.XDG_CONFIG_HOME ? { XDG_CONFIG_HOME: process.env.XDG_CONFIG_HOME } : {}),
   };

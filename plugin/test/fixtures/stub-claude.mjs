@@ -1,0 +1,133 @@
+#!/usr/bin/env node
+// Stands in for the headless `claude -p` the automatic answerer runs (M8-SPEC §6). It is
+// started with the host's exact command line (TEAM_RELAY_CLAUDE_BIN points here). Like Claude
+// Code it reads the prompt from stdin, starts the MCP servers of --mcp-config with their env,
+// and calls the host's tools; it plays Claude Code's permission flow too, calling the
+// --permission-prompt-tool for a tool use no rule covers and honouring its answer.
+//
+// What to do comes from the prompt: a question whose text holds `STUB:{"steps":[...]}` runs
+// those steps; a capability call runs the capability (after asking permission) and replies
+// with its result. Steps:
+//   {"permission": {"tool_name": "Read", "input": {...}}}   ask, as Claude Code would
+//   {"capability": "name"}                                   ask for mcp__capabilities__<name> with
+//                                                            the call's params, run it if allowed
+//   {"request_approval": "reason"}
+//   {"reply": {"text": "...", "needs_approval": true, ...}}  "{{decision}}" in text is replaced by
+//                                                            the last permission's behavior
+//   {"sleep": ms}   {"exit": code}
+// Every run is recorded (argv, cwd, stdin, the environment's keys, settings, mcp config with the
+// token replaced, and each tool call's result) in $TMPDIR/stub-claude/<request_id>.json.
+
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
+
+const argv = process.argv.slice(2);
+const flag = (name) => {
+  const i = argv.indexOf(name);
+  return i >= 0 ? argv[i + 1] : undefined;
+};
+
+const stdin = await new Promise((resolve) => {
+  let buf = '';
+  process.stdin.setEncoding('utf8');
+  process.stdin.on('data', (c) => (buf += c));
+  process.stdin.on('end', () => resolve(buf));
+});
+
+const requestId = /\b(rq_[0-9a-f]{32})\b/.exec(stdin)?.[1] ?? 'unknown';
+const mcp = JSON.parse(readFileSync(flag('--mcp-config'), 'utf8'));
+const settings = JSON.parse(readFileSync(flag('--settings'), 'utf8'));
+const record = {
+  argv,
+  cwd: process.cwd(),
+  stdin,
+  env: Object.keys(process.env).sort(),
+  envValues: {
+    CLAUDE_CODE_DISABLE_AUTO_MEMORY: process.env.CLAUDE_CODE_DISABLE_AUTO_MEMORY,
+    MCP_TOOL_TIMEOUT: process.env.MCP_TOOL_TIMEOUT,
+    TEAM_RELAY_CHANNEL: process.env.TEAM_RELAY_CHANNEL,
+    TEAM_RELAY_AUTO_ANSWER: process.env.TEAM_RELAY_AUTO_ANSWER,
+  },
+  settings,
+  mcp: JSON.parse(JSON.stringify(mcp).replace(/"TEAM_RELAY_HOST_TOKEN":"[^"]*"/, '"TEAM_RELAY_HOST_TOKEN":"<token>"')),
+  hostTokenLength: (mcp.mcpServers?.host?.env?.TEAM_RELAY_HOST_TOKEN ?? '').length,
+  calls: [],
+};
+const dir = join(tmpdir(), 'stub-claude');
+mkdirSync(dir, { recursive: true });
+const save = () => writeFileSync(join(dir, `${requestId}.json`), JSON.stringify(record, null, 2));
+save();
+
+async function connect(name) {
+  const cfg = mcp.mcpServers[name];
+  if (!cfg) return null;
+  const transport = new StdioClientTransport({ command: cfg.command, args: cfg.args, env: { ...process.env, ...cfg.env }, stderr: 'pipe' });
+  const client = new Client({ name: 'stub-claude', version: '0.0.0' }, { capabilities: {} });
+  await client.connect(transport);
+  return client;
+}
+const host = await connect('host');
+const capabilities = await connect('capabilities');
+const text = (res) => (res.content ?? []).map((c) => c.text ?? '').join('');
+
+async function call(client, name, args) {
+  const res = await client.callTool({ name, arguments: args }, undefined, { timeout: 3_600_000 });
+  const out = { tool: name, args, isError: res.isError === true, text: text(res) };
+  record.calls.push(out);
+  save();
+  return out;
+}
+
+let decision = 'none';
+async function permission(toolName, input) {
+  const r = await call(host, 'permission', { tool_name: toolName, input, tool_use_id: 'toolu_stub' });
+  const parsed = JSON.parse(r.text);
+  decision = parsed.behavior;
+  return parsed;
+}
+
+let steps = [];
+const script = /STUB:(\{.*\})/.exec(stdin)?.[1];
+if (script) steps = JSON.parse(script).steps;
+const cap = /run the capability ([a-z][a-z0-9_]*) for request (rq_[0-9a-f]{32})/.exec(stdin);
+let params = {};
+if (cap) {
+  const m = /<<<teammate-text-[0-9a-f]+\n([\s\S]*?)\nteammate-text-[0-9a-f]+>>>/.exec(stdin);
+  params = m ? JSON.parse(m[1]) : {};
+  if (!script) steps = [{ capability: cap[1] }];
+}
+
+let capResult = null;
+for (const step of steps) {
+  if (step.permission) await permission(step.permission.tool_name, step.permission.input);
+  if (step.capability) {
+    const input = { ...params, request_id: requestId };
+    const p = await permission(`mcp__capabilities__${step.capability}`, input);
+    if (p.behavior === 'allow' && capabilities) {
+      const r = await call(capabilities, step.capability, p.updatedInput);
+      capResult = r.isError ? { error: r.text } : JSON.parse(r.text);
+    }
+    await call(host, 'reply', {
+      text: p.behavior === 'allow' ? `ran ${step.capability}` : `could not run ${step.capability}: ${p.message}`,
+      ...(capResult ? { data: capResult } : {}),
+    });
+  }
+  if (step.request_approval) await call(host, 'request_approval', { reason: step.request_approval });
+  if (step.reply) {
+    const args = { ...step.reply, text: step.reply.text.replace('{{decision}}', decision) };
+    await call(host, 'reply', args);
+  }
+  if (step.sleep) await new Promise((r) => setTimeout(r, step.sleep));
+  if (step.exit !== undefined) {
+    process.stdout.write(JSON.stringify({ type: 'result', subtype: 'error_during_execution', is_error: true, result: 'stub exit' }));
+    process.exit(step.exit);
+  }
+}
+
+process.stdout.write(JSON.stringify({ type: 'result', subtype: 'success', is_error: false, result: 'stub done' }));
+await host?.close();
+await capabilities?.close();
+process.exit(0);

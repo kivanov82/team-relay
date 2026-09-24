@@ -542,6 +542,7 @@ function makeLogger(component) {
 var TOOL_NAME_RE = /^[A-Za-z0-9_.:-]{1,64}$/;
 var MAX_DURATION_MS = 36e5;
 var RELAY_OWN_TOOLS = /* @__PURE__ */ new Set(["ack_question", "reply"]);
+var HOST_OWN_TOOLS = /* @__PURE__ */ new Set(["reply", "request_approval", "permission"]);
 function splitToolName(name) {
   const m = /^mcp__(.+?)__(.+)$/.exec(name);
   return m ? { server: m[1], tool: m[2] } : { server: null, tool: name };
@@ -560,6 +561,7 @@ function toolEventFromPayload(payload) {
   if (typeof p.tool_name !== "string") return null;
   const { server, tool } = splitToolName(p.tool_name);
   if (RELAY_OWN_TOOLS.has(tool) && isRelayServer(server)) return null;
+  if (HOST_OWN_TOOLS.has(tool) && server === "host") return null;
   if (!TOOL_NAME_RE.test(tool)) return null;
   let duration = null;
   if (status !== "waiting" && typeof p.duration_ms === "number" && Number.isFinite(p.duration_ms) && p.duration_ms >= 0) {
