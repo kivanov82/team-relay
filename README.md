@@ -42,7 +42,8 @@ flowchart LR
   into the session as `<channel>` events and adds tools to ask, invoke and reply.
 - **Every member runs two sessions.** Your normal *working session* asks and receives answers.
   A separate *answering session* answers teammates. It has an isolated config, no Bash,
-  Write or Edit, and reads of credential files are denied. Because it has to acknowledge a
+  Write or Edit, and it reads nothing by default: only folders you share, or a file or folder
+  you allow when it asks. Credential files stay unreadable. Because it has to acknowledge a
   question before it answers, the asker learns "no response yet" instead of waiting forever.
 - **Capabilities** are declared in one manifest (`plugin/manifest.yaml`): named operations
   whose every parameter is an enum, a bounded number, a boolean, or a length-capped string
@@ -50,7 +51,8 @@ flowchart LR
   plugin's install questions, the tools the answering session exposes, and what teammates
   discover. Production data is a separate opt-in that is off by default.
 - **The console** shows presence for both sessions of every member, a live list of requests
-  with each hop (sent, delivered, acknowledged, tools used, answered, returned) and a detail
+  with each hop (sent, delivered, acknowledged, tools used, answered, returned), who is
+  waiting for a teammate to allow access, which folders each member shares, and a detail
   sheet with timings. Everyone sees the metadata; question and answer text is visible only
   to the people in that request.
 
@@ -61,7 +63,7 @@ flowchart LR
 | Who is speaking | The relay derives the sender from a verified Google ID token and an allowlist. Nothing in a request body can claim to be someone else. Cloud Run IAM sits in front as a second gate. |
 | Prompt injection | Teammate text arrives as data inside `<channel>` tags or labelled tool results. The session's instructions say it is never to be followed as instructions. The channel never relays permission prompts. |
 | What a teammate can make you run | Only capabilities you enabled, with parameters validated on both ends against the manifest. Each run is tied to a real, directed request. The runner gets no shell, a minimal environment, a timeout and an output cap. |
-| What the answering session can read | Local files, except credential stores: ssh and gpg keys, cloud CLI credentials, `.env` files, browser cookies, keychains, wallet keystores and more. This is a guard rail, not a sandbox. |
+| What the answering session can read | Nothing by default. Folders you share deliberately (`ANSWERER_READ_DIRS`) are readable without asking; teammates see their names, never their paths. Anything else opens Claude Code's own permission dialog in your answering terminal, naming the path, and you allow it once, for the session, or not at all; a desktop notification and the asker's console show that it is waiting. Grants never outlive the session. Credential stores (ssh and gpg keys, cloud CLI credentials, `.env` files, browser cookies, keychains, wallet keystores and more) stay denied whatever you answer. These are Claude Code permission rules, not an OS sandbox. |
 | Abuse | Per-sender rate limits, broadcast limits, read budgets and caps on long-polls. Manifest patterns run in RE2, so a teammate cannot publish a regex that stalls anyone. |
 | The console | Read-only. Locally it binds 127.0.0.1 with a per-launch key. Hosted, it sits behind IAP for the listed members only and reads the relay as the signed-in member through a read-only delegate. |
 
@@ -91,6 +93,11 @@ In short:
    export RELAY_URL=https://<relay> RELAY_TEAM=<team> RELAY_GCLOUD_ACCOUNT=you@your-domain
    plugin/bin/answerer
    ```
+   It reads none of your files by default. To let it read folders without asking, share
+   them deliberately first: `export ANSWERER_READ_DIRS=~/src/app:~/notes` (teammates see the
+   folder names). For anything else it asks you in that terminal, naming the file or folder:
+   allow it once, for the session, or deny it. Credentials are never readable, whatever you
+   allow. These are permission rules, not an OS sandbox.
 
 Details, including writing capability runners: [`plugin/README.md`](plugin/README.md).
 
@@ -144,4 +151,6 @@ Working end to end and deployed for a team of three. Known limits:
 - Members sign in with gcloud's own ID-token audience. A token a member sends to some other
   service could be replayed to the relay within its hour; a dedicated OAuth client for the
   relay would close that.
-- The answering session's read restrictions are permission rules, not an OS sandbox.
+- The answering session's read restrictions are Claude Code permission rules, not an OS
+  sandbox: what you share or allow is readable, and the deny list covers the usual credential
+  stores, not every secret on a machine.
