@@ -33,7 +33,7 @@ export type Envelope = {
   data: Record<string, unknown>;
 };
 
-export type Me = { team: string; member: string; teammates: string[] };
+export type Me = { team: string; member: string; teammates: string[]; role?: RosterRole; name?: string };
 export type DirectoryEntry = {
   member: string;
   last_seen: string | null;
@@ -52,6 +52,8 @@ export type RosterMember = {
   role: RosterRole;
   added_by?: string | null;
   added_at?: string | null;
+  /** M9-SPEC §7.2: an entry an owner added is `invited` until its person accepts. */
+  status?: 'active' | 'invited';
 };
 export type RosterPage = { members: RosterMember[] };
 export type AddMemberBody = { member: string; email: string; role?: RosterRole };
@@ -137,11 +139,21 @@ export function configValue(v: string | undefined): string | undefined {
   return t;
 }
 
+/**
+ * A static development token (RELAY_AUTH=token). Like a device credential it is bound to its
+ * member's team: the relay's account routes (M9-SPEC §2) refuse it.
+ */
+export type StaticTokenProvider = (() => string) & { kind: 'static' };
+
+export function staticTokenProvider(read: string | (() => string)): StaticTokenProvider {
+  return Object.assign(typeof read === 'string' ? () => read : read, { kind: 'static' as const });
+}
+
 /** RELAY_TOKEN_FILE wins over RELAY_TOKEN; trailing newlines are stripped; re-read on each call. */
 export function tokenProviderFromEnv(env: NodeJS.ProcessEnv): TokenProvider {
   const file = configValue(env.RELAY_TOKEN_FILE);
   if (file) {
-    return () => {
+    return staticTokenProvider(() => {
       let raw: string;
       try {
         raw = readFileSync(file, 'utf8');
@@ -151,11 +163,11 @@ export function tokenProviderFromEnv(env: NodeJS.ProcessEnv): TokenProvider {
       const token = raw.replace(/[\r\n]+$/, '');
       if (!token) throw new Error('RELAY_TOKEN_FILE is empty');
       return token;
-    };
+    });
   }
   const token = configValue(env.RELAY_TOKEN);
   if (!token) throw new Error('RELAY_AUTH is "token", so RELAY_TOKEN or RELAY_TOKEN_FILE must be set');
-  return () => token;
+  return staticTokenProvider(token);
 }
 
 // ---------------------------------------------------------------------------------------
@@ -481,7 +493,29 @@ type CallOptions = {
   signal?: AbortSignal;
   /** M3-SPEC §2: the member a delegate (the hosted console) reads as, by email. */
   onBehalfOf?: string;
+  /**
+   * M9-SPEC §7.6: the hosted console's salted SHA-256 of its viewer's address (64 lower-case
+   * hex), sent as X-Relay-Client-IP-Hash on a team creation so the relay's per-address limit
+   * holds through the console.
+   */
+  clientIpHash?: string;
 };
+
+/** M9-SPEC §2: GET /v1/me/teams. */
+export type MyTeam = { team: string; name?: string; member: string; role: RosterRole };
+export type MyInvitation = { team: string; name?: string; member: string; role?: RosterRole; invited_by_member?: string };
+export type MyTeams = {
+  teams: MyTeam[];
+  invitations?: MyInvitation[];
+  admin?: boolean;
+  teams_created?: number;
+  max_teams_created?: number;
+  suggested_member?: string;
+};
+/** M9-SPEC §2: POST /v1/teams. `id` is made from the name when absent. */
+export type CreateTeamBody = { id?: string; name: string; owner_member_id: string };
+
+export const CLIENT_IP_HASH_RE = /^[0-9a-f]{64}$/;
 
 const ON_BEHALF_OF_RE = /^[a-z0-9._%+-]{1,64}@[a-z0-9.-]{1,253}$/;
 
@@ -489,6 +523,7 @@ const defaultSleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms))
 
 export class RelayClient {
   readonly team: string;
+  private readonly opts: RelayClientOptions;
   private readonly base: URL;
   private readonly token: TokenProvider;
   private readonly backoff: Backoff;
@@ -500,6 +535,7 @@ export class RelayClient {
 
   constructor(opts: RelayClientOptions) {
     if (!TEAM_RE.test(opts.team)) throw new Error('RELAY_TEAM is not a valid team id');
+    this.opts = opts;
     this.team = opts.team;
     const base = parseRelayUrl(opts.url);
     if (!base.pathname.endsWith('/')) base.pathname += '/';
@@ -513,6 +549,23 @@ export class RelayClient {
     this.userAgent = opts.userAgent ?? 'team-relay-plugin/0.1.0';
   }
 
+  /**
+   * The same relay, sign-in and settings for another team (M9-SPEC §5: the hosted console's
+   * delegate reads any team its viewer is on). The team id is checked like RELAY_TEAM.
+   */
+  withTeam(team: string): RelayClient {
+    if (team === this.team) return this;
+    return new RelayClient({ ...this.opts, team });
+  }
+
+  /**
+   * True when this client signs in with a stored device credential or a static token, which
+   * are bound to one team (no Google identity for the account routes).
+   */
+  get boundToTeam(): boolean {
+    return isCredentialProvider(this.token) || (this.token as { kind?: unknown }).kind === 'static';
+  }
+
   /** The relay's base URL (without a trailing slash). */
   get url(): string {
     return this.base.toString().replace(/\/$/, '');
@@ -522,7 +575,15 @@ export class RelayClient {
     return ['v1', 'teams', this.team, ...parts].map(encodeURIComponent).join('/');
   }
 
-  private async once<T>(method: string, path: string, body: unknown, timeoutMs: number, signal?: AbortSignal, onBehalfOf?: string): Promise<T> {
+  private async once<T>(
+    method: string,
+    path: string,
+    body: unknown,
+    timeoutMs: number,
+    signal?: AbortSignal,
+    onBehalfOf?: string,
+    clientIpHash?: string,
+  ): Promise<T> {
     const url = new URL(path, this.base);
     const headers: Record<string, string> = {
       Accept: 'application/json',
@@ -532,6 +593,10 @@ export class RelayClient {
     if (onBehalfOf !== undefined) {
       if (!ON_BEHALF_OF_RE.test(onBehalfOf)) throw new Error('X-Relay-On-Behalf-Of must be a lower-case email address');
       headers['X-Relay-On-Behalf-Of'] = onBehalfOf;
+    }
+    if (clientIpHash !== undefined) {
+      if (!CLIENT_IP_HASH_RE.test(clientIpHash)) throw new Error('X-Relay-Client-IP-Hash must be 64 lower-case hex characters');
+      headers['X-Relay-Client-IP-Hash'] = clientIpHash;
     }
     let payload: string | undefined;
     if (body !== undefined) {
@@ -582,7 +647,7 @@ export class RelayClient {
     let refreshed = false;
     for (let attempt = 0; ; ) {
       try {
-        return await this.once<T>(method, path, body, timeoutMs, opts.signal, opts.onBehalfOf);
+        return await this.once<T>(method, path, body, timeoutMs, opts.signal, opts.onBehalfOf, opts.clientIpHash);
       } catch (err) {
         if (opts.signal?.aborted) throw err;
         if (err instanceof RelayError && err.status === 401 && !refreshed && this.token.invalidate) {
@@ -716,6 +781,55 @@ export class RelayClient {
   /** M5-SPEC §3: revoke the credential this client signs in with (logout). */
   revokeSelf(opts?: CallOptions) {
     return this.call<Record<string, unknown>>('DELETE', this.teamPath('credentials', 'self'), undefined, { attempts: 1, ...opts });
+  }
+
+  // M9-SPEC §2, §4, §7: the account routes. They take a Google identity (a Google ID token,
+  // or a delegate on behalf of an email); a device credential or a static token is refused
+  // with 403 google_identity_required. The mutations are sent once.
+
+  /** The teams (and invitations) of the signed-in Google account. */
+  myTeams(opts?: CallOptions) {
+    return this.call<MyTeams>('GET', 'v1/me/teams', undefined, opts);
+  }
+
+  /** Create a team; the caller becomes its first owner. */
+  createTeam(body: CreateTeamBody, opts?: CallOptions) {
+    return this.call<Record<string, unknown>>('POST', 'v1/teams', body, { attempts: 1, ...opts });
+  }
+
+  /** Accept or decline an invitation to `team`. */
+  answerInvitation(team: string, accept: boolean, opts?: CallOptions) {
+    if (!TEAM_RE.test(team)) throw new Error('invalid team id');
+    return this.call<Record<string, unknown>>('POST', ['v1', 'me', 'invitations', team].map(encodeURIComponent).join('/'), { accept }, {
+      attempts: 1,
+      ...opts,
+    });
+  }
+
+  /** An owner deletes this client's team (M9-SPEC §7.7); `confirm` is the team id typed again. */
+  deleteTeam(confirm: string, opts?: CallOptions) {
+    return this.call<Record<string, unknown>>('DELETE', ['v1', 'teams', this.team].map(encodeURIComponent).join('/'), { confirm }, {
+      attempts: 1,
+      ...opts,
+    });
+  }
+
+  /** Relay admins (M9-SPEC §4): every team, a page at a time. */
+  adminTeams(q: { after?: string; limit?: number } = {}, opts?: CallOptions) {
+    const params = new URLSearchParams();
+    if (q.after !== undefined) params.set('after', q.after);
+    if (q.limit !== undefined) params.set('limit', String(q.limit));
+    const qs = params.toString();
+    return this.call<Record<string, unknown>>('GET', 'v1/admin/teams' + (qs ? `?${qs}` : ''), undefined, opts);
+  }
+
+  /** Relay admins (M9-SPEC §4): delete a team; `confirm` is its id typed again. */
+  adminDeleteTeam(team: string, confirm: string, opts?: CallOptions) {
+    if (!TEAM_RE.test(team)) throw new Error('invalid team id');
+    return this.call<Record<string, unknown>>('DELETE', ['v1', 'admin', 'teams', team].map(encodeURIComponent).join('/'), { confirm }, {
+      attempts: 1,
+      ...opts,
+    });
   }
 
   /** M2-SPEC §3.5: the team's activity feed. */

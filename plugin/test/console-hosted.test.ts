@@ -27,6 +27,7 @@ import { DIST } from './helpers/mcp.js';
 
 const AUDIENCE = '/projects/123456789012/locations/europe-west3/services/team-relay-console';
 const PUBLIC_HOST = 'team-relay-console-abc123-ey.a.run.app';
+const SALT = 'salt-for-tests-only-0123456789abcdef';
 
 // ---------------------------------------------------------------------------------------
 // Fixtures: keys, tokens, servers.
@@ -162,6 +163,12 @@ class FakeDelegateRelay {
       return json(401, { error: 'unauthenticated' });
     }
     const viewer = req.headers['x-relay-on-behalf-of'];
+    if (path === '/v1/me/teams') {
+      // M9-SPEC §2: the viewer's teams (none for a stranger).
+      const on = typeof viewer === 'string' && !this.nonMembers.has(viewer);
+      const member = viewer === 'alice@example.com' ? 'alice' : 'someone';
+      return json(200, { teams: on ? [{ team: 'demo', name: 'Demo', member, role: 'member' }] : [], invitations: [], admin: false, teams_created: 0, max_teams_created: 3 });
+    }
     if (typeof viewer === 'string' && this.nonMembers.has(viewer)) return json(403, { error: 'not_a_member', detail: 'not on this team' });
     if (path === '/v1/teams/demo/me') return json(200, { team: 'demo', member: viewer === 'alice@example.com' ? 'alice' : 'someone', teammates: ['bob'] });
     if (path === '/v1/teams/demo/directory') return json(200, { members: [], stats_complete: true });
@@ -242,7 +249,7 @@ describe('hosted console server (M3-SPEC §3)', () => {
     const keys = new IapKeySet({ url: jwks.url, log });
     app = createConsoleServer({
       backend: relayBackend(client),
-      hosted: { publicHost: PUBLIC_HOST, verify: iapVerifier({ audience: AUDIENCE, keys, log }) },
+      hosted: { publicHost: PUBLIC_HOST, verify: iapVerifier({ audience: AUDIENCE, keys, log }), ipHashSalt: SALT },
       staticDir: staticDir(),
       ...(join ? { join } : {}),
       log,
@@ -261,8 +268,10 @@ describe('hosted console server (M3-SPEC §3)', () => {
     expect(res.status).toBe(200);
     // The viewer's own verified email is added for the join panel; the relay never sent it.
     expect(JSON.parse(res.body)).toEqual({ team: 'demo', member: 'alice', teammates: ['bob'], email: 'alice@example.com' });
-    expect(relay.seen).toHaveLength(1);
-    const sent = relay.seen[0]!;
+    // M9-SPEC §5: the viewer's teams first (then kept for a while), then the read itself.
+    expect(relay.seen.map((x) => `${x.method} ${x.path}`)).toEqual(['GET /v1/me/teams', 'GET /v1/teams/demo/me']);
+    expect(relay.seen[0]!.headers['x-relay-on-behalf-of']).toBe('alice@example.com');
+    const sent = relay.seen[1]!;
     expect(sent.method).toBe('GET');
     expect(sent.path).toBe('/v1/teams/demo/me');
     expect(sent.headers['x-relay-on-behalf-of']).toBe('alice@example.com');
@@ -379,9 +388,9 @@ describe('hosted console server (M3-SPEC §3)', () => {
       plugin: 'team-relay',
       default_relay: false,
     });
-    // The relay was asked only who the viewer is, on the viewer's behalf; the join details
-    // themselves come from the server's own configuration.
-    expect(relay.seen.map((x) => `${x.method} ${x.path}`)).toEqual(['GET /v1/teams/demo/me']);
+    // The relay was asked only which teams the viewer is on, on the viewer's behalf; the join
+    // details themselves come from the server's own configuration.
+    expect(relay.seen.map((x) => `${x.method} ${x.path}`)).toEqual(['GET /v1/me/teams']);
     expect(relay.seen[0]!.headers['x-relay-on-behalf-of']).toBe('alice@example.com');
     expect((await get(port, '/api/join', { assertion: await sign(signer), method: 'POST' })).status).toBe(405);
     expect((await get(port, '/api/join?x=1', { assertion: await sign(signer) })).status).toBe(400);
@@ -395,7 +404,7 @@ describe('hosted console server (M3-SPEC §3)', () => {
     relay.nonMembers.add('mallory@example.com');
     const res = await get(port, '/api/join', { assertion: await sign(signer, baseClaims({ email: 'mallory@example.com' })) });
     expect(res.status).toBe(403);
-    expect(JSON.parse(res.body)).toEqual({ error: 'not_on_team', email: 'mallory@example.com' });
+    expect(JSON.parse(res.body)).toEqual({ error: 'not_on_team', email: 'mallory@example.com', team: 'demo' });
     expect(res.body).not.toContain('team-relay-xyz');
     expect(res.body).not.toContain('multiagent');
     // The relay's own sign-in failing (a plain 401) is passed on as such, still with no details.
@@ -692,6 +701,7 @@ describe('dist/console-server.js with CONSOLE_MODE=hosted', () => {
     RELAY_URL: 'https://team-relay-xyz.a.run.app',
     RELAY_TEAM: 'demo',
     RELAY_AUTH: 'metadata',
+    CONSOLE_IP_HASH_SALT: SALT,
   };
 
   it('starts on $PORT, prints no URL or key, and refuses a request without the IAP header', async () => {
@@ -700,7 +710,7 @@ describe('dist/console-server.js with CONSOLE_MODE=hosted', () => {
     try {
       const deadline = Date.now() + 10_000;
       while (!p.err().includes('hosted: serving') && Date.now() < deadline) await new Promise((r) => setTimeout(r, 25));
-      expect(p.err()).toContain(`hosted: serving team demo for ${PUBLIC_HOST} on 0.0.0.0:${port}`);
+      expect(p.err()).toContain(`hosted: serving the viewer's teams (default demo) for ${PUBLIC_HOST} on 0.0.0.0:${port}`);
       expect(p.out()).toBe('');
       const res = await get(port, '/');
       expect(res.status).toBe(401);
@@ -723,6 +733,9 @@ describe('dist/console-server.js with CONSOLE_MODE=hosted', () => {
       [{ ...GOOD, RELAY_TEAM: '' }, /RELAY_TEAM/],
       [{ ...GOOD, RELAY_URL: 'http://relay.example' }, /RELAY_URL/],
       [{ ...GOOD, PORT: '0' }, /PORT/],
+      // M9-SPEC §7.6: the salt for the viewer's address is required, and long enough.
+      [{ ...GOOD, CONSOLE_IP_HASH_SALT: '' }, /CONSOLE_IP_HASH_SALT/],
+      [{ ...GOOD, CONSOLE_IP_HASH_SALT: 'x'.repeat(31) }, /CONSOLE_IP_HASH_SALT/],
       [{ ...GOOD, JOIN_REPO_URL: 'http://github.com/example/multiagent' }, /JOIN_REPO_URL/],
       [{ ...GOOD, JOIN_REPO_URL: 'git@github.com:example/multiagent.git' }, /JOIN_REPO_URL/],
     ];

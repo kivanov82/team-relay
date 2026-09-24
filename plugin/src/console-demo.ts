@@ -18,6 +18,12 @@
 // its deadline shows for that moment, as it can on the relay. A request's state at any moment
 // is computed from its script, so the feed is consistent however often it is polled. All names
 // and text are synthetic.
+//
+// M9-SPEC: the demo is several teams (DemoAccount): alice's scripted `demo` team (from the
+// team file, so it cannot be deleted), `research`, a quiet team she created, an invitation to
+// `ops`, and, since she is a relay admin in the demo, other people's teams in the admin
+// listing. She can create teams (at most 3), accept or decline, and delete, by the relay's
+// rules and with its refusals; a new team is quiet (no traffic). Nothing leaves the process.
 
 import { createHash } from 'node:crypto';
 import { defaultManifestPath } from './exposed.js';
@@ -439,7 +445,25 @@ export class RosterRefusal extends Error {
   }
 }
 
-export type DemoRosterEntry = { member: string; emails: string[]; role: 'owner' | 'member'; added_by: string; added_at: string };
+export type DemoRosterEntry = {
+  member: string;
+  emails: string[];
+  role: 'owner' | 'member';
+  added_by: string;
+  added_at: string;
+  /** M9-SPEC §7.2: an addition is an invitation until its person accepts. */
+  status: 'active' | 'invited';
+};
+
+/** A demo team other than the scripted one: its id, name, roster and whose view it is. */
+export type DemoTeamOptions = {
+  team?: string;
+  name?: string;
+  /** A quiet team: this roster, no traffic, no presence. */
+  roster?: DemoRosterEntry[];
+  /** The viewer's member id there (alice, unless she chose another when creating it). */
+  viewer?: string;
+};
 
 /** M6-SPEC §1: at most this many members per team. */
 export const ROSTER_MAX = 50;
@@ -452,6 +476,11 @@ export class BadRequest extends Error {
 }
 
 export class DemoTeam {
+  readonly team: string;
+  readonly name: string;
+  /** No scripted traffic: a team created (or joined) in the demo. */
+  readonly quiet: boolean;
+  private readonly viewer: string;
   private readonly epoch: number;
   private readonly manifests: Record<Member, Manifest | null>;
   private readonly environments = new Map<string, string>();
@@ -462,7 +491,12 @@ export class DemoTeam {
   constructor(
     private readonly now: () => number = Date.now,
     manifestPath: string = defaultManifestPath(),
+    options: DemoTeamOptions = {},
   ) {
+    this.team = options.team ?? DEMO_TEAM;
+    this.name = options.name ?? 'Demo';
+    this.quiet = options.roster !== undefined;
+    this.viewer = options.viewer ?? DEMO_ME;
     const start = now();
     // Cycles are aligned to the wall clock, starting a few cycles back.
     this.epoch = Math.floor(start / DEMO_CYCLE_MS) * DEMO_CYCLE_MS - WARMUP_CYCLES * DEMO_CYCLE_MS;
@@ -480,11 +514,30 @@ export class DemoTeam {
     };
     this.publishedAt = iso(this.epoch - 3_600_000);
     const added = iso(this.epoch - 7 * DAY_MS);
-    this.rosterEntries = [
-      { member: 'alice', emails: ['alice@example.com'], role: 'owner', added_by: 'alice', added_at: added },
-      { member: 'bob', emails: ['bob@example.com'], role: 'member', added_by: 'alice', added_at: added },
-      { member: 'carol', emails: ['carol@example.com', 'carol.w@example.org'], role: 'member', added_by: 'alice', added_at: added },
-    ];
+    this.rosterEntries = options.roster
+      ? options.roster.map((e) => ({ ...e, emails: [...e.emails] }))
+      : [
+          { member: 'alice', emails: ['alice@example.com'], role: 'owner', added_by: 'alice', added_at: added, status: 'active' },
+          { member: 'bob', emails: ['bob@example.com'], role: 'member', added_by: 'alice', added_at: added, status: 'active' },
+          { member: 'carol', emails: ['carol@example.com', 'carol.w@example.org'], role: 'member', added_by: 'alice', added_at: added, status: 'active' },
+          // M9-SPEC §7.2: an invitation dana has not answered yet.
+          { member: 'dana', emails: ['dana@example.com'], role: 'member', added_by: 'alice', added_at: iso(this.epoch - DAY_MS), status: 'invited' },
+        ];
+  }
+
+  /** The viewer's role here, by the roster's active entries. */
+  viewerRole(): 'owner' | 'member' {
+    return this.rosterEntries.find((e) => e.member === this.viewer && e.status === 'active')?.role ?? 'member';
+  }
+
+  /** Active members and owners, as the admin listing counts them. */
+  counts(): { members: number; owners: number } {
+    const active = this.rosterEntries.filter((e) => e.status === 'active');
+    return { members: active.length, owners: active.filter((e) => e.role === 'owner').length };
+  }
+
+  private requireOwner(): void {
+    if (this.viewerRole() !== 'owner') throw new RosterRefusal(403, 'forbidden', 'Only owners can change the roster.');
   }
 
   /**
@@ -493,8 +546,20 @@ export class DemoTeam {
    * members, 1 to 5 emails each, and always at least one owner.
    */
   roster() {
+    const owner = this.viewerRole() === 'owner';
+    // M9-SPEC §7.2: an owner sees the open invitations; anyone else the active members only,
+    // and only their own email.
     return {
-      members: this.rosterEntries.map((e) => ({ member: e.member, emails: [...e.emails], role: e.role, added_by: e.added_by, added_at: e.added_at })),
+      members: this.rosterEntries
+        .filter((e) => owner || e.status === 'active')
+        .map((e) => ({
+          member: e.member,
+          emails: owner || e.member === this.viewer ? [...e.emails] : e.emails.map(() => null),
+          role: e.role,
+          added_by: e.added_by,
+          added_at: e.added_at,
+          status: e.status,
+        })),
     };
   }
 
@@ -509,15 +574,24 @@ export class DemoTeam {
   }
 
   addMember(body: { member: string; email: string; role?: 'owner' | 'member' }) {
-    if (this.rosterEntries.some((e) => e.member === body.member)) throw new RosterRefusal(409, 'conflict', 'That member id is already on the team.');
-    if (this.emailTaken(body.email)) throw new RosterRefusal(409, 'conflict', 'That email already belongs to a member of the team.');
-    if (this.rosterEntries.length >= ROSTER_MAX) throw new RosterRefusal(409, 'roster_full', `A team has at most ${ROSTER_MAX} members.`);
-    const entry: DemoRosterEntry = { member: body.member, emails: [body.email], role: body.role ?? 'member', added_by: DEMO_ME, added_at: iso(this.now()) };
+    this.requireOwner();
+    if (this.rosterEntries.some((e) => e.member === body.member)) throw new RosterRefusal(409, 'member_exists', 'That member id is already on the team.');
+    if (this.emailTaken(body.email)) throw new RosterRefusal(409, 'email_taken', 'That email already belongs to a member of the team.');
+    if (this.rosterEntries.length >= ROSTER_MAX) throw new RosterRefusal(409, 'team_full', `A team has at most ${ROSTER_MAX} members, invitations included.`);
+    const entry: DemoRosterEntry = {
+      member: body.member,
+      emails: [body.email],
+      role: body.role ?? 'member',
+      added_by: this.viewer,
+      added_at: iso(this.now()),
+      status: 'invited',
+    };
     this.rosterEntries.push(entry);
     return { ...entry, emails: [...entry.emails] };
   }
 
   updateMember(member: string, body: { add_email?: string; remove_email?: string; role?: 'owner' | 'member' }) {
+    this.requireOwner();
     const e = this.entry(member);
     const emails = [...e.emails];
     if (body.add_email !== undefined) {
@@ -530,17 +604,23 @@ export class DemoTeam {
       if (emails.length === 1) throw new RosterRefusal(409, 'last_email', 'A member needs at least one email.');
       emails.splice(emails.indexOf(body.remove_email), 1);
     }
-    if (body.role === 'member' && e.role === 'owner' && this.rosterEntries.filter((x) => x.role === 'owner').length === 1) {
+    if (body.role === 'member' && e.role === 'owner' && e.status === 'active' && this.activeOwners() === 1) {
       throw new RosterRefusal(409, 'last_owner', 'A team always has at least one owner.');
     }
     e.emails = emails;
     if (body.role !== undefined) e.role = body.role;
-    return { member: e.member, emails: [...e.emails], role: e.role, added_by: e.added_by, added_at: e.added_at };
+    return { member: e.member, emails: [...e.emails], role: e.role, added_by: e.added_by, added_at: e.added_at, status: e.status };
   }
 
+  private activeOwners(): number {
+    return this.rosterEntries.filter((x) => x.role === 'owner' && x.status === 'active').length;
+  }
+
+  /** Remove a member, or withdraw an invitation (which retires nothing, M9-SPEC §7.2). */
   removeMember(member: string) {
+    this.requireOwner();
     const e = this.entry(member);
-    if (e.role === 'owner' && this.rosterEntries.filter((x) => x.role === 'owner').length === 1) {
+    if (e.role === 'owner' && e.status === 'active' && this.activeOwners() === 1) {
       throw new RosterRefusal(409, 'last_owner', 'A team always has at least one owner.');
     }
     this.rosterEntries.splice(this.rosterEntries.indexOf(e), 1);
@@ -550,6 +630,7 @@ export class DemoTeam {
   /** Every request created by `now`; expired ones only when asked for (the feed passes them). */
   private all(now: number, withExpired = false): Materialised[] {
     const out: Materialised[] = [];
+    if (this.quiet) return out;
     const first = Math.max(0, Math.floor((now - DEMO_TTL_MS - this.epoch) / DEMO_CYCLE_MS) - 1);
     const last = Math.floor((now - this.epoch) / DEMO_CYCLE_MS);
     for (let c = first; c <= last; c++) {
@@ -563,7 +644,10 @@ export class DemoTeam {
   }
 
   me() {
-    return { team: DEMO_TEAM, member: DEMO_ME, teammates: DEMO_MEMBERS.filter((m) => m !== DEMO_ME) };
+    const teammates = this.quiet
+      ? this.rosterEntries.filter((e) => e.status === 'active' && e.member !== this.viewer).map((e) => e.member)
+      : DEMO_MEMBERS.filter((m) => m !== DEMO_ME);
+    return { team: this.team, name: this.name, member: this.viewer, role: this.viewerRole(), teammates };
   }
 
   private presence(member: Member, now: number): { working: string | null; answering: string | null } {
@@ -586,6 +670,7 @@ export class DemoTeam {
    * what arrives at once and nothing waits.
    */
   inboxSummary() {
+    if (this.quiet) return { pending: 0, more: false, oldest_at: null, from: [], answering: { last_seen: null } };
     const p = this.presence(DEMO_ME, this.now());
     return { pending: 0, more: false, oldest_at: null, from: [], answering: { last_seen: p.answering } };
   }
@@ -604,6 +689,19 @@ export class DemoTeam {
       .filter((d) => Date.parse(d.updated_at) > start)
       .sort((a, b) => Date.parse(b.updated_at) - Date.parse(a.updated_at) || b.request_id.localeCompare(a.request_id))
       .slice(0, STATS_READ_CAP);
+    if (this.quiet) {
+      // A quiet team: its members, none of them running a session yet.
+      const members = this.me().teammates.map((member) => ({
+        member,
+        last_seen: null,
+        manifest: null,
+        published_at: null,
+        sessions: { working: { last_seen: null }, answering: { last_seen: null } },
+        stats: { asked: 0, answered: 0, open: 0, median_answer_seconds: null },
+        inbox_waiting: 0,
+      }));
+      return { members, stats_complete: true };
+    }
     const members = DEMO_MEMBERS.filter((m) => m !== DEMO_ME).map((member) => {
       const p = this.presence(member, now);
       const seen = [p.working, p.answering].filter((x): x is string => x !== null).sort();
@@ -691,5 +789,227 @@ export class DemoTeam {
             : { seq: p.seq, member: p.member, kind: p.kind, text: null, pct: null, tool: p.tool, status: p.status, duration_ms: p.duration_ms, time: p.time },
         ),
     };
+  }
+}
+
+// ---------------------------------------------------------------------------------------
+// M9-SPEC: the demo account: alice's teams, her invitations, and (she is an admin here) the
+// relay's other teams, with the relay's rules and refusals.
+
+/** M9-SPEC §2: teams one account may have created and not deleted. */
+export const DEMO_MAX_TEAMS_CREATED = 3;
+const RESERVED_TEAM_IDS = new Set(['admin', 'api', 'login', 'v1', 'health', 'static', 'www', 'team', 'teams', 'relay', 'console', 'demo', 'test']);
+const NEW_TEAM_ID = /^[a-z][a-z0-9-]{2,31}$/;
+const RESERVE_MS = 31 * DAY_MS;
+
+/** A team of the demo relay, as the admin listing shows it. */
+type WorldTeam = {
+  id: string;
+  name: string;
+  seed: boolean;
+  status: 'active' | 'deleted';
+  created_at: string;
+  created_by_member: string | null;
+  /** Counts for a team alice is not on (hers come from its roster). */
+  members: number;
+  owners: number;
+  last_activity_at: string | null;
+  deleted_at?: string;
+  reserved_until?: string;
+};
+
+type DemoInvitation = { team: string; name: string; member: string; role: 'owner' | 'member'; invited_by_member: string; roster: DemoRosterEntry[] };
+
+/** M9-SPEC §2 on the relay: the team id made from a name when none is given. */
+export function teamIdFromName(name: string): string {
+  let id = name
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+  if (!/^[a-z]/.test(id)) id = `team-${id}`;
+  id = id.slice(0, 32).replace(/-+$/, '');
+  return id.length >= 3 ? id : `${id}-team`.slice(0, 32);
+}
+
+export class DemoAccount {
+  readonly defaultTeam = DEMO_TEAM;
+  private readonly held = new Map<string, DemoTeam>();
+  /** Teams alice created and has not deleted (M9-SPEC §2's per-account count). */
+  private readonly createdByMe = new Set<string>();
+  private readonly world = new Map<string, WorldTeam>();
+  private invitations: DemoInvitation[];
+
+  constructor(
+    private readonly now: () => number = Date.now,
+    private readonly manifestPath: string = defaultManifestPath(),
+  ) {
+    const t = now();
+    const at = (daysAgo: number) => iso(t - daysAgo * DAY_MS);
+    const entry = (member: string, role: 'owner' | 'member', status: 'active' | 'invited', by: string, daysAgo: number): DemoRosterEntry => ({
+      member,
+      emails: [`${member}@example.com`],
+      role,
+      added_by: by,
+      added_at: at(daysAgo),
+      status,
+    });
+    this.held.set(DEMO_TEAM, new DemoTeam(now, manifestPath));
+    this.world.set(DEMO_TEAM, { id: DEMO_TEAM, name: 'Demo', seed: true, status: 'active', created_at: at(30), created_by_member: null, members: 0, owners: 0, last_activity_at: null });
+    this.held.set(
+      'research',
+      new DemoTeam(now, manifestPath, {
+        team: 'research',
+        name: 'Research',
+        roster: [entry('alice', 'owner', 'active', 'alice', 5), entry('erin', 'member', 'active', 'alice', 4), entry('frank', 'member', 'invited', 'alice', 1)],
+      }),
+    );
+    this.createdByMe.add('research');
+    this.world.set('research', { id: 'research', name: 'Research', seed: false, status: 'active', created_at: at(5), created_by_member: 'alice', members: 0, owners: 0, last_activity_at: at(1) });
+    this.invitations = [
+      {
+        team: 'ops',
+        name: 'Operations',
+        member: 'alice',
+        role: 'member',
+        invited_by_member: 'olga',
+        roster: [entry('olga', 'owner', 'active', 'olga', 12), entry('pat', 'member', 'active', 'olga', 9), entry('alice', 'member', 'active', 'olga', 0)],
+      },
+    ];
+    this.world.set('ops', { id: 'ops', name: 'Operations', seed: false, status: 'active', created_at: at(12), created_by_member: 'olga', members: 2, owners: 1, last_activity_at: at(0.2) });
+    this.world.set('design-guild', { id: 'design-guild', name: 'Design guild', seed: false, status: 'active', created_at: at(20), created_by_member: 'hana', members: 4, owners: 2, last_activity_at: at(2) });
+    this.world.set('field-notes', { id: 'field-notes', name: 'Field notes', seed: false, status: 'active', created_at: at(8), created_by_member: 'ivo', members: 1, owners: 1, last_activity_at: null });
+    this.world.set('old-pilot', {
+      id: 'old-pilot',
+      name: 'Old pilot',
+      seed: false,
+      status: 'deleted',
+      created_at: at(40),
+      created_by_member: 'jun',
+      members: 0,
+      owners: 0,
+      last_activity_at: at(4),
+      deleted_at: at(3),
+      reserved_until: iso(t - 3 * DAY_MS + RESERVE_MS),
+    });
+  }
+
+  /** One of alice's active teams (the default when none is named), else NotFound. */
+  team(id: string = DEMO_TEAM): DemoTeam {
+    const t = this.held.get(id);
+    if (!t) throw new NotFound();
+    return t;
+  }
+
+  /** GET /v1/me/teams as alice reads it: the file's team first, then the created ones by id. */
+  myTeams() {
+    const ids = [...this.held.keys()].sort((a, b) => (a === DEMO_TEAM ? -1 : b === DEMO_TEAM ? 1 : a.localeCompare(b)));
+    return {
+      teams: ids.map((id) => {
+        const t = this.held.get(id)!;
+        const me = t.me();
+        return { team: id, name: t.name, member: me.member, role: me.role };
+      }),
+      invitations: this.invitations.map((i) => ({ team: i.team, name: i.name, member: i.member, role: i.role, invited_by_member: i.invited_by_member })),
+      admin: true,
+      teams_created: this.createdByMe.size,
+      max_teams_created: DEMO_MAX_TEAMS_CREATED,
+      suggested_member: DEMO_ME,
+    };
+  }
+
+  private taken(id: string): boolean {
+    const w = this.world.get(id);
+    return RESERVED_TEAM_IDS.has(id) || (w !== undefined && (w.status === 'active' || Date.parse(w.reserved_until ?? '') > this.now()));
+  }
+
+  /** POST /v1/teams, with the relay's refusals (M9-SPEC §2, §7.4). */
+  createTeam(body: { id?: string; name: string; owner_member_id: string }) {
+    const name = body.name.trim();
+    const id = body.id ?? teamIdFromName(name);
+    if (!NEW_TEAM_ID.test(id)) throw new RosterRefusal(422, 'invalid_body', 'The team id must be 3 to 32 characters: a lower-case letter, then lower-case letters, digits or -.');
+    if (this.taken(id)) throw new RosterRefusal(409, 'team_id_unavailable', 'That team id is not available. Choose another.');
+    if (name.replace(/\s+/g, ' ').toLowerCase() === 'demo') {
+      throw new RosterRefusal(409, 'team_name_unavailable', "That name belongs to a team in the relay's configuration. Choose another.");
+    }
+    if (this.createdByMe.size >= DEMO_MAX_TEAMS_CREATED) {
+      throw new RosterRefusal(409, 'team_limit', `You have created ${DEMO_MAX_TEAMS_CREATED} teams, the most one account may. Delete one to create another.`);
+    }
+    const created = iso(this.now());
+    const member = body.owner_member_id;
+    const team = new DemoTeam(this.now, this.manifestPath, {
+      team: id,
+      name,
+      viewer: member,
+      roster: [{ member, emails: ['alice@example.com'], role: 'owner', added_by: member, added_at: created, status: 'active' }],
+    });
+    this.held.set(id, team);
+    this.createdByMe.add(id);
+    this.world.set(id, { id, name, seed: false, status: 'active', created_at: created, created_by_member: member, members: 0, owners: 0, last_activity_at: null });
+    return { team: id, name, status: 'active', created_at: created, member, role: 'owner' };
+  }
+
+  /** POST /v1/me/invitations/{team} (M9-SPEC §7.2). */
+  answerInvitation(team: string, accept: boolean) {
+    const inv = this.invitations.find((i) => i.team === team);
+    if (!inv) throw new RosterRefusal(404, 'not_found', 'That invitation is no longer open.');
+    this.invitations = this.invitations.filter((i) => i !== inv);
+    if (!accept) return { team, member: inv.member, status: 'declined' };
+    this.held.set(team, new DemoTeam(this.now, this.manifestPath, { team, name: inv.name, viewer: inv.member, roster: inv.roster }));
+    return { team, name: inv.name, member: inv.member, role: inv.role, status: 'active' };
+  }
+
+  private remove(team: string, confirm: string) {
+    const w = this.world.get(team);
+    if (!w || w.status !== 'active') throw new NotFound();
+    if (w.seed) throw new RosterRefusal(409, 'seed_team', "This team comes from the relay's team file; it cannot be deleted here.");
+    if (confirm !== team) throw new RosterRefusal(422, 'confirm_mismatch', 'Send {"confirm": "<team id>"} to delete the team.');
+    const t = this.now();
+    w.status = 'deleted';
+    w.deleted_at = iso(t);
+    w.reserved_until = iso(t + RESERVE_MS);
+    this.held.delete(team);
+    this.createdByMe.delete(team);
+    this.invitations = this.invitations.filter((i) => i.team !== team);
+    return { team, status: 'deleted', removal: 'complete', deleted_at: w.deleted_at, reserved_until: w.reserved_until };
+  }
+
+  /** DELETE /v1/teams/{team}: an owner deletes a team the API created (M9-SPEC §7.7). */
+  deleteTeam(team: string, confirm: string) {
+    const held = this.team(team);
+    if (held.viewerRole() !== 'owner') throw new RosterRefusal(403, 'forbidden', 'Only an owner can delete the team.');
+    return this.remove(team, confirm);
+  }
+
+  /** GET /v1/admin/teams (M9-SPEC §4): the file's teams first, then the others by id. */
+  adminTeams(q: { after?: string; limit?: number } = {}) {
+    const limit = q.limit ?? 200;
+    const row = (w: WorldTeam) => {
+      const held = this.held.get(w.id);
+      const counts = held ? held.counts() : { members: w.members, owners: w.owners };
+      return {
+        id: w.id,
+        name: w.name,
+        status: w.status,
+        seed: w.seed,
+        created_at: w.created_at,
+        created_by_member: w.created_by_member,
+        ...counts,
+        last_activity_at: w.id === DEMO_TEAM ? iso(this.now() - 20_000) : w.last_activity_at,
+        ...(w.status === 'deleted' ? { removal: 'complete', deleted_at: w.deleted_at, reserved_until: w.reserved_until } : {}),
+      };
+    };
+    const all = [...this.world.values()];
+    const seeds = q.after === undefined ? all.filter((w) => w.seed) : [];
+    const rest = all
+      .filter((w) => !w.seed && (q.after === undefined || w.id > q.after))
+      .filter((w) => w.status === 'active' || Date.parse(w.reserved_until ?? '') > this.now())
+      .sort((a, b) => a.id.localeCompare(b.id));
+    const page = rest.slice(0, limit);
+    return { teams: [...seeds, ...page].map(row), next: rest.length > limit ? page.at(-1)!.id : null };
+  }
+
+  /** DELETE /v1/admin/teams/{team} (M9-SPEC §4). */
+  adminDeleteTeam(team: string, confirm: string) {
+    return this.remove(team, confirm);
   }
 }

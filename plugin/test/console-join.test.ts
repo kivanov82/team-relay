@@ -19,8 +19,8 @@ import {
   relayBackend,
   type ConsoleServer,
 } from '../src/console-app.js';
-import { DemoTeam } from '../src/console-demo.js';
-import { RelayClient } from '../src/relay-client.js';
+import { DemoAccount } from '../src/console-demo.js';
+import { RelayClient, staticTokenProvider } from '../src/relay-client.js';
 import { defaultRelayUrl } from '../src/relay-default.js';
 import { FakeRelay, TOKEN_OF } from './helpers/fake-relay.js';
 import { DIST } from './helpers/mcp.js';
@@ -53,7 +53,7 @@ describe('/api/join on the local console server', () => {
 
   beforeEach(async () => {
     relay = await new FakeRelay().start();
-    const client = new RelayClient({ url: relay.url, team: 'demo', token: () => TOKEN_OF.alice!, attempts: 1 });
+    const client = new RelayClient({ url: relay.url, team: 'demo', token: staticTokenProvider(TOKEN_OF.alice!), attempts: 1 });
     app = createConsoleServer({
       backend: relayBackend(client),
       key: KEY,
@@ -113,7 +113,7 @@ describe('/api/join on the local console server', () => {
   });
 
   it('is 404 on a server that was given no join details', async () => {
-    const bare = createConsoleServer({ backend: demoBackend(new DemoTeam()), key: KEY, staticDir: NO_UI });
+    const bare = createConsoleServer({ backend: demoBackend(new DemoAccount()), key: KEY, staticDir: NO_UI });
     const p = await bare.listen(0);
     try {
       expect((await req(p, '/api/join', { key: KEY })).status).toBe(404);

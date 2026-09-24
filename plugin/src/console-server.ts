@@ -14,7 +14,10 @@
 // URL and makes no key. IAP is the gate: every request must carry a valid IAP assertion for
 // IAP_AUDIENCE and a Host equal to CONSOLE_PUBLIC_HOST; the viewer's email is forwarded to
 // the relay as X-Relay-On-Behalf-Of, with the service account's own ID token
-// (RELAY_AUTH=metadata). No flags are accepted in hosted mode.
+// (RELAY_AUTH=metadata). It serves every team the viewer is on (M9-SPEC §5; RELAY_TEAM is the
+// default one) and creates teams for them, sending the relay a salted hash of the viewer's
+// address (CONSOLE_IP_HASH_SALT, at least 32 characters, required). No flags are accepted in
+// hosted mode.
 //
 // Both modes answer GET /api/join themselves (the console's join panel): the relay and team,
 // JOIN_MARKETPLACE (optional; GitHub owner/repo or an https URL: what `/plugin marketplace
@@ -25,6 +28,7 @@ import { randomBytes } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import {
   DEMO_JOIN,
+  checkIpHashSalt,
   checkJoinMarketplace,
   checkJoinRepoUrl,
   checkPublicHost,
@@ -35,7 +39,7 @@ import {
   type ConsoleBackend,
   type JoinInfo,
 } from './console-app.js';
-import { DemoTeam } from './console-demo.js';
+import { DemoAccount } from './console-demo.js';
 import { openInBrowser } from './console-open.js';
 import { readApprovalsState, statePath } from './approvals-state.js';
 import { IapKeySet, checkIapAudience, iapVerifier } from './iap.js';
@@ -47,7 +51,7 @@ const log = makeLogger('console');
 const DEFAULT_PORT = 4317;
 
 const USAGE = `usage: bin/console [--demo] [--open]
-  --demo  serve a synthetic team (demo: alice, bob, carol) instead of calling the relay
+  --demo  serve synthetic teams (demo: alice, bob, carol) instead of calling the relay
   --open  open the console in the default browser (by way of a private, short-lived file)
 Signs in as you with the credential /team-relay:login stored; nothing else is needed.
 Environment: CONSOLE_PORT (default ${DEFAULT_PORT}; 0 picks a free port), and optionally
@@ -55,7 +59,7 @@ RELAY_URL, RELAY_TEAM, RELAY_AUTH (credential|google|token), RELAY_GCLOUD_ACCOUN
 JOIN_MARKETPLACE (optional; GitHub owner/repo or https URL) and JOIN_REPO_URL (optional, https):
 what the join panel tells new members to add as a plugin marketplace.
 CONSOLE_MODE=hosted is for the container only (PORT, CONSOLE_PUBLIC_HOST, IAP_AUDIENCE,
-RELAY_URL, RELAY_TEAM, RELAY_AUTH=metadata, JOIN_MARKETPLACE, JOIN_REPO_URL).`;
+CONSOLE_IP_HASH_SALT, RELAY_URL, RELAY_TEAM, RELAY_AUTH=metadata, JOIN_MARKETPLACE, JOIN_REPO_URL).`;
 
 function fail(message: string, code = 1): never {
   process.stderr.write(`console: ${message}\n`);
@@ -98,11 +102,14 @@ async function hosted(): Promise<void> {
   let backend: ConsoleBackend;
   let team: string;
   let join: JoinInfo;
+  let ipHashSalt: string;
   try {
     const repoUrl = checkJoinRepoUrl(env.JOIN_REPO_URL);
     const marketplace = checkJoinMarketplace(env.JOIN_MARKETPLACE);
     publicHost = checkPublicHost(configValue(env.CONSOLE_PUBLIC_HOST));
     audience = checkIapAudience(configValue(env.IAP_AUDIENCE));
+    // M9-SPEC §7.6: the salt for the viewer's address the relay's creation limit counts.
+    ipHashSalt = checkIpHashSalt(env.CONSOLE_IP_HASH_SALT);
     // The hosted console reads as the service account (a relay delegate), never with a
     // developer credential or a static token.
     if (authModeFromEnv(env) !== 'metadata') throw new Error('CONSOLE_MODE=hosted needs RELAY_AUTH=metadata');
@@ -116,14 +123,14 @@ async function hosted(): Promise<void> {
   const keys = new IapKeySet({ log });
   const verify = iapVerifier({ audience, keys, log });
   const staticDir = fileURLToPath(new URL('./console/', import.meta.url));
-  const app = createConsoleServer({ backend, hosted: { publicHost, verify }, staticDir, join, log });
+  const app = createConsoleServer({ backend, hosted: { publicHost, verify, ipHashSalt }, staticDir, join, log });
   let bound: number;
   try {
     bound = await app.listen(port);
   } catch (err) {
     fail(`cannot listen on 0.0.0.0:${port} (${(err as NodeJS.ErrnoException).code ?? describeError(err)})`);
   }
-  log(`hosted: serving team ${team} for ${publicHost} on 0.0.0.0:${bound}, behind IAP`);
+  log(`hosted: serving the viewer's teams (default ${team}) for ${publicHost} on 0.0.0.0:${bound}, behind IAP`);
   const stop = () => {
     void app.close().finally(() => process.exit(0));
     setTimeout(() => process.exit(0), 2000).unref();
@@ -152,8 +159,8 @@ async function main(): Promise<void> {
   let label: string;
   let join: JoinInfo;
   if (flags.demo) {
-    backend = demoBackend(new DemoTeam());
-    label = 'demo team (synthetic: alice, bob, carol)';
+    backend = demoBackend(new DemoAccount());
+    label = 'demo teams (synthetic: alice, bob, carol)';
     join = DEMO_JOIN;
   } else {
     let client;

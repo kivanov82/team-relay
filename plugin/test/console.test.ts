@@ -10,10 +10,10 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import _Ajv from 'ajv';
 import { CONTENT_SECURITY_POLICY, createConsoleServer, demoBackend, keyMatches, relayBackend, type ConsoleServer } from '../src/console-app.js';
-import { DEMO_CYCLE_MS, DemoTeam, SWEEP_LAG_MS, median3, stillOpen } from '../src/console-demo.js';
+import { DEMO_CYCLE_MS, DemoAccount, DemoTeam, SWEEP_LAG_MS, median3, stillOpen } from '../src/console-demo.js';
 import { REDIRECT_TTL_MS, openInBrowser, redirectHtml, type Run } from '../src/console-open.js';
 import { validateManifest } from '../src/manifest.js';
-import { RelayClient } from '../src/relay-client.js';
+import { RelayClient, staticTokenProvider } from '../src/relay-client.js';
 import { FakeRelay, TOKEN_OF } from './helpers/fake-relay.js';
 import { DIST } from './helpers/mcp.js';
 
@@ -183,7 +183,14 @@ const ME_SCHEMA = {
   type: 'object',
   additionalProperties: false,
   required: ['team', 'member', 'teammates'],
-  properties: { team: { type: 'string' }, member: MEMBER, teammates: { type: 'array', items: MEMBER } },
+  // M6-SPEC §2 and M9-SPEC §2: the relay also says the viewer's role and the team's name.
+  properties: {
+    team: { type: 'string' },
+    name: { type: 'string', minLength: 1, maxLength: 60 },
+    member: MEMBER,
+    role: { enum: ['owner', 'member'] },
+    teammates: { type: 'array', items: MEMBER },
+  },
 };
 
 // ajv ships CommonJS; under NodeNext the default import may be the module object.
@@ -209,7 +216,7 @@ describe('console server: the gate', () => {
 
   beforeEach(async () => {
     relay = await new FakeRelay().start();
-    const client = new RelayClient({ url: relay.url, team: 'demo', token: () => TOKEN_OF.alice!, attempts: 1 });
+    const client = new RelayClient({ url: relay.url, team: 'demo', token: staticTokenProvider(TOKEN_OF.alice!), attempts: 1 });
     app = createConsoleServer({ backend: relayBackend(client), key: KEY, staticDir: join(tmpdir(), 'team-relay-no-such-console') });
     port = await app.listen(0);
   });
@@ -379,7 +386,7 @@ describe('console server: static files', () => {
     writeFileSync(join(site, 'assets', 'app.css'), 'body{}');
     writeFileSync(join(root, 'secret.txt'), 'outside the console directory');
     symlinkSync(join(root, 'secret.txt'), join(site, 'assets', 'link.txt'));
-    app = createConsoleServer({ backend: demoBackend(new DemoTeam()), key: KEY, staticDir: site });
+    app = createConsoleServer({ backend: demoBackend(new DemoAccount()), key: KEY, staticDir: site });
     port = await app.listen(0);
   });
   afterEach(async () => {
@@ -419,7 +426,7 @@ describe('console --demo backend', () => {
     let now = Date.parse('2026-09-23T10:00:30.000Z');
     const team = new DemoTeam(() => now);
     expectValid(validMe, team.me());
-    expect(team.me()).toEqual({ team: 'demo', member: 'alice', teammates: ['bob', 'carol'] });
+    expect(team.me()).toEqual({ team: 'demo', name: 'Demo', member: 'alice', role: 'owner', teammates: ['bob', 'carol'] });
     for (let step = 0; step < 130; step++) {
       expectValid(validActivity, team.activity({ limit: 200 }));
       expectValid(validDirectory, team.directory());
@@ -688,7 +695,7 @@ describe('console --demo backend', () => {
   });
 
   it('through the server with --demo semantics: the same shapes over HTTP', async () => {
-    const app = createConsoleServer({ backend: demoBackend(new DemoTeam()), key: KEY, staticDir: join(tmpdir(), 'none') });
+    const app = createConsoleServer({ backend: demoBackend(new DemoAccount()), key: KEY, staticDir: join(tmpdir(), 'none') });
     const port = await app.listen(0);
     try {
       expectValid(validActivity, (await api(port, '/api/activity')).json());
@@ -706,7 +713,7 @@ describe('console --demo backend', () => {
 describe('GET /api/approvals/summary (M8-SPEC §5)', () => {
   it('the local console answers the count itself, behind the key; without a count source it is 404', async () => {
     let pending = 2;
-    const app = createConsoleServer({ backend: demoBackend(new DemoTeam()), key: KEY, staticDir: join(tmpdir(), 'none'), approvals: () => ({ pending }) });
+    const app = createConsoleServer({ backend: demoBackend(new DemoAccount()), key: KEY, staticDir: join(tmpdir(), 'none'), approvals: () => ({ pending }) });
     const port = await app.listen(0);
     try {
       expect((await req(port, '/api/approvals/summary', { key: null })).status).toBe(401);
@@ -718,7 +725,7 @@ describe('GET /api/approvals/summary (M8-SPEC §5)', () => {
     } finally {
       await app.close();
     }
-    const plain = createConsoleServer({ backend: demoBackend(new DemoTeam()), key: KEY, staticDir: join(tmpdir(), 'none') });
+    const plain = createConsoleServer({ backend: demoBackend(new DemoAccount()), key: KEY, staticDir: join(tmpdir(), 'none') });
     const p2 = await plain.listen(0);
     try {
       expect((await api(p2, '/api/approvals/summary')).status).toBe(404);

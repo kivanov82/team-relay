@@ -21,29 +21,53 @@
 //   answered only to a member of the team (M6-SPEC §7 item 6; below).
 // - Static files from dist/console/ under a strict CSP; a placeholder page when it is absent.
 //
+// Several teams (M9-SPEC §5): every team-scoped /api/* route (me, directory, activity,
+// requests, roster and its changes, inbox summary, join) takes the team from a `team` query
+// parameter or an X-Relay-Team header (the same value when both are sent), checked against
+// the viewer's active teams (GET /v1/me/teams, kept 15 s per viewer; a stored device
+// credential or a static token is bound to its one team, which is then the only one). Without
+// either, RELAY_TEAM is the team, and only when the viewer is on it. A team the viewer is not
+// on answers 403 {"error": "not_on_team", "email"?, "team"}, and nothing is asked of the relay.
+// The account routes, each a change with the roster changes' rules (JSON, Sec-Fetch-Site:
+// same-origin, the key or IAP, a checked body of at most 4 KiB, no query):
+// GET /api/teams (the viewer's teams and invitations), POST /api/teams (create one; hosted,
+// with X-Relay-Client-IP-Hash, M9-SPEC §7.6), POST /api/invitations/{team} (accept or
+// decline), DELETE /api/teams/{team} (an owner deletes it), GET /api/admin/teams and DELETE
+// /api/admin/teams/{team} (relay admins, M9-SPEC §4).
+//
 // Hosted mode (the container, CONSOLE_MODE=hosted, behind IAP):
 // - Binds 0.0.0.0; the Host must equal the service's public host exactly.
 // - No console key: every request, static files included, must carry a valid IAP assertion
 //   (x-goog-iap-jwt-assertion); anything else is a bare 401. The viewer's email from it is
-//   sent to the relay as X-Relay-On-Behalf-Of on each of the same routes. A viewer on no
-//   roster of the team (the relay's 403 not_a_member; M6-SPEC §4: any signed-in Google
-//   account reaches the page) gets 403 {"error": "not_on_team", "email"} and no data. That
-//   includes /api/join: the relay is asked who the viewer is (/me) first, and only a member
-//   of the team gets the join details (M6-SPEC §7 item 6).
+//   sent to the relay as X-Relay-On-Behalf-Of on each of the same routes. A viewer who is not
+//   an active member of the team asked for (M6-SPEC §4: any signed-in Google account reaches
+//   the page; M9-SPEC §7.2: an invitation is not membership) gets 403 {"error":
+//   "not_on_team", "email", "team"} and no data. That includes /api/join (M6-SPEC §7 item 6).
+//   The relay's own refusals of a non-member (the any-team delegate's 404, a per-team
+//   delegate's 403 not_a_member) answer the same, and drop the viewer's cached teams.
+// - A team creation carries X-Relay-Client-IP-Hash: sha256(CONSOLE_IP_HASH_SALT + the
+//   viewer's address), 64 lower-case hex. The address is the right-most X-Forwarded-For
+//   entry: Cloud Run's front end (which IAP sits in, with no load balancer in front here)
+//   appends the address the connection came from, so that entry is the only one a client
+//   cannot write; anything left of it is the client's own claim. IPv6 counts per /64, as the
+//   relay counts it. Without the header (not on Cloud Run) the socket's peer counts.
 
 import { createHash, timingSafeEqual } from 'node:crypto';
+import { isIP } from 'node:net';
 import { existsSync, readFileSync, realpathSync, statSync } from 'node:fs';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { extname, join, sep } from 'node:path';
-import { BadRequest, NotFound, RosterRefusal, type DemoTeam } from './console-demo.js';
+import { BadRequest, NotFound, RosterRefusal, type DemoAccount } from './console-demo.js';
 import { IAP_HEADER, type IapIdentity } from './iap.js';
 import {
   MEMBER_RE,
   REQUEST_ID_RE,
   RelayError,
   RelayNetworkError,
+  TEAM_RE,
   type AddMemberBody,
+  type CreateTeamBody,
   type RelayClient,
   type RosterRole,
   type UpdateMemberBody,
@@ -92,13 +116,27 @@ const MIME: Record<string, string> = {
   '.txt': 'text/plain; charset=utf-8',
 };
 
+/** How long a viewer's teams (GET /v1/me/teams) are trusted, and how many viewers are kept. */
+export const TEAMS_TTL_MS = 15_000;
+const TEAMS_CACHE_MAX = 1000;
+
 const RFC3339 = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,9})?(Z|[+-]\d{2}:\d{2})$/;
 
-/** Who a read is for: in hosted mode, the viewer IAP signed in. */
-export type ReadContext = { viewer?: string };
+/**
+ * Who a call is for: in hosted mode, the viewer IAP signed in; and which team it is about
+ * (M9-SPEC §5), once the console server has checked the viewer is on it.
+ */
+export type ReadContext = { viewer?: string; team?: string };
 
 /** What the proxy reads. Each call answers with the relay's JSON. */
 export type ConsoleBackend = {
+  /** RELAY_TEAM: the team when a call names none (M9-SPEC §5). */
+  readonly defaultTeam: string;
+  /**
+   * The one team this backend can reach when its sign-in is bound to a team (a stored device
+   * credential or a static token: no /v1/me/teams), else null.
+   */
+  readonly fixedTeam: string | null;
   me(ctx?: ReadContext): Promise<unknown>;
   directory(ctx?: ReadContext): Promise<unknown>;
   activity(q: { since?: string; limit?: number }, ctx?: ReadContext): Promise<unknown>;
@@ -110,7 +148,19 @@ export type ConsoleBackend = {
   addMember(body: AddMemberBody, ctx?: ReadContext): Promise<unknown>;
   updateMember(member: string, body: UpdateMemberBody, ctx?: ReadContext): Promise<unknown>;
   removeMember(member: string, ctx?: ReadContext): Promise<unknown>;
+  /** M9-SPEC §2: the viewer's teams and invitations (the relay's GET /v1/me/teams). */
+  myTeams(ctx?: ReadContext): Promise<unknown>;
+  createTeam(body: CreateTeamBody, ctx?: ReadContext & { clientIpHash?: string }): Promise<unknown>;
+  answerInvitation(team: string, accept: boolean, ctx?: ReadContext): Promise<unknown>;
+  /** M9-SPEC §7.7: an owner deletes `ctx.team`. */
+  deleteTeam(confirm: string, ctx?: ReadContext): Promise<unknown>;
+  /** M9-SPEC §4: relay admins. */
+  adminTeams(q: { after?: string; limit?: number }, ctx?: ReadContext): Promise<unknown>;
+  adminDeleteTeam(team: string, confirm: string, ctx?: ReadContext): Promise<unknown>;
 };
+
+/** At most this many per-team clients are kept (a hosted console serves many teams). */
+const TEAM_CLIENTS_MAX = 256;
 
 export function relayBackend(client: RelayClient): ConsoleBackend {
   const opts = (ctx?: ReadContext) => ({
@@ -118,30 +168,92 @@ export function relayBackend(client: RelayClient): ConsoleBackend {
     timeoutMs: 15_000,
     ...(ctx?.viewer !== undefined ? { onBehalfOf: ctx.viewer } : {}),
   });
+  // A device credential or a static token belongs to one team, and the relay's account routes
+  // refuse it (403 google_identity_required): that team is then the only one.
+  const bound = client.boundToTeam;
+  const clients = new Map<string, RelayClient>();
+  const on = (ctx?: ReadContext): RelayClient => {
+    const team = ctx?.team;
+    if (team === undefined || team === client.team) return client;
+    let c = clients.get(team);
+    if (!c) {
+      if (clients.size >= TEAM_CLIENTS_MAX) clients.delete(clients.keys().next().value!);
+      c = client.withTeam(team);
+      clients.set(team, c);
+    }
+    return c;
+  };
   return {
-    me: (ctx) => client.me(opts(ctx)),
-    directory: (ctx) => client.directory(opts(ctx)),
-    activity: (q, ctx) => client.activity(q, opts(ctx)),
-    request: (id, ctx) => client.getRequest(id, opts(ctx)),
-    roster: (ctx) => client.roster(opts(ctx)),
-    inboxSummary: (ctx) => client.inboxSummary(opts(ctx)),
-    addMember: (body, ctx) => client.addMember(body, opts(ctx)),
-    updateMember: (member, body, ctx) => client.updateMember(member, body, opts(ctx)),
-    removeMember: (member, ctx) => client.removeMember(member, opts(ctx)),
+    defaultTeam: client.team,
+    fixedTeam: bound ? client.team : null,
+    me: (ctx) => on(ctx).me(opts(ctx)),
+    directory: (ctx) => on(ctx).directory(opts(ctx)),
+    activity: (q, ctx) => on(ctx).activity(q, opts(ctx)),
+    request: (id, ctx) => on(ctx).getRequest(id, opts(ctx)),
+    roster: (ctx) => on(ctx).roster(opts(ctx)),
+    inboxSummary: (ctx) => on(ctx).inboxSummary(opts(ctx)),
+    addMember: (body, ctx) => on(ctx).addMember(body, opts(ctx)),
+    updateMember: (member, body, ctx) => on(ctx).updateMember(member, body, opts(ctx)),
+    removeMember: (member, ctx) => on(ctx).removeMember(member, opts(ctx)),
+    myTeams: async (ctx) => {
+      if (!bound) {
+        try {
+          return await client.myTeams(opts(ctx));
+        } catch (err) {
+          // A static token (RELAY_AUTH=token) has no Google identity either.
+          if (!(err instanceof RelayError && err.status === 403 && err.code === 'google_identity_required')) throw err;
+        }
+      }
+      return boundTeams(await client.me(opts(ctx)), client.team);
+    },
+    createTeam: (body, ctx) =>
+      client.createTeam(body, { ...opts(ctx), ...(ctx?.clientIpHash !== undefined ? { clientIpHash: ctx.clientIpHash } : {}) }),
+    answerInvitation: (team, accept, ctx) => client.answerInvitation(team, accept, opts(ctx)),
+    deleteTeam: (confirm, ctx) => on(ctx).deleteTeam(confirm, opts(ctx)),
+    adminTeams: (q, ctx) => client.adminTeams(q, opts(ctx)),
+    adminDeleteTeam: (team, confirm, ctx) => client.adminDeleteTeam(team, confirm, opts(ctx)),
   };
 }
 
-export function demoBackend(team: DemoTeam): ConsoleBackend {
+/**
+ * /v1/me/teams' shape for a sign-in bound to one team (a device credential or a static
+ * token): that team, from /me; no invitations, no admin, and no creating (`can_manage_teams`
+ * false: the relay asks for a Google identity there).
+ */
+function boundTeams(me: unknown, team: string): Record<string, unknown> {
+  const m = (me && typeof me === 'object' ? me : {}) as Record<string, unknown>;
+  const member = typeof m.member === 'string' ? m.member : null;
   return {
-    me: async () => team.me(),
-    directory: async () => team.directory(),
-    activity: async (q) => team.activity(q),
-    request: async (id) => team.request(id),
-    roster: async () => team.roster(),
-    inboxSummary: async () => team.inboxSummary(),
-    addMember: async (body) => team.addMember(body),
-    updateMember: async (member, body) => team.updateMember(member, body),
-    removeMember: async (member) => team.removeMember(member),
+    teams: member
+      ? [{ team, name: typeof m.name === 'string' ? m.name : team, member, role: m.role === 'owner' ? 'owner' : 'member' }]
+      : [],
+    invitations: [],
+    admin: false,
+    teams_created: null,
+    max_teams_created: null,
+    can_manage_teams: false,
+  };
+}
+
+export function demoBackend(account: DemoAccount): ConsoleBackend {
+  return {
+    defaultTeam: account.defaultTeam,
+    fixedTeam: null,
+    me: async (ctx) => account.team(ctx?.team).me(),
+    directory: async (ctx) => account.team(ctx?.team).directory(),
+    activity: async (q, ctx) => account.team(ctx?.team).activity(q),
+    request: async (id, ctx) => account.team(ctx?.team).request(id),
+    roster: async (ctx) => account.team(ctx?.team).roster(),
+    inboxSummary: async (ctx) => account.team(ctx?.team).inboxSummary(),
+    addMember: async (body, ctx) => account.team(ctx?.team).addMember(body),
+    updateMember: async (member, body, ctx) => account.team(ctx?.team).updateMember(member, body),
+    removeMember: async (member, ctx) => account.team(ctx?.team).removeMember(member),
+    myTeams: async () => account.myTeams(),
+    createTeam: async (body) => account.createTeam(body),
+    answerInvitation: async (team, accept) => account.answerInvitation(team, accept),
+    deleteTeam: async (confirm, ctx) => account.deleteTeam(ctx?.team ?? account.defaultTeam, confirm),
+    adminTeams: async (q) => account.adminTeams(q),
+    adminDeleteTeam: async (team, confirm) => account.adminDeleteTeam(team, confirm),
   };
 }
 
@@ -194,6 +306,176 @@ export function checkUpdateMember(raw: unknown): UpdateMemberBody {
   if (b.role !== undefined) out.role = role(b.role);
   if (Object.keys(out).length === 0) throw new BodyError('nothing to change: give add_email, remove_email or role');
   return out;
+}
+
+// ---------------------------------------------------------------------------------------
+// The account bodies (M9-SPEC §2, §4, §7), checked before anything reaches the relay.
+
+/** A team id the API creates (M9-SPEC §1); the file's teams may also hold `_` (TEAM_RE). */
+export const NEW_TEAM_ID_RE = /^[a-z][a-z0-9-]{2,31}$/;
+/** Control, format (bidi, zero-width), private-use, unassigned and line/paragraph separators. */
+const NAME_FORBIDDEN_RE = /[\p{Cc}\p{Cf}\p{Co}\p{Cn}\p{Zl}\p{Zp}]/u;
+
+function object(raw: unknown): Record<string, unknown> {
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) throw new BodyError('the body must be a JSON object');
+  return raw as Record<string, unknown>;
+}
+
+/** POST /api/teams: {name, owner_member_id, id?}; the name trimmed, 1 to 60 characters. */
+export function checkCreateTeam(raw: unknown): CreateTeamBody {
+  const b = object(raw);
+  onlyKeys(b, ['id', 'name', 'owner_member_id']);
+  const name = typeof b.name === 'string' ? b.name.trim() : '';
+  if ([...name].length < 1 || [...name].length > 60 || NAME_FORBIDDEN_RE.test(name)) {
+    throw new BodyError('name must be 1 to 60 characters, with no control or invisible characters');
+  }
+  if (typeof b.owner_member_id !== 'string' || !MEMBER_RE.test(b.owner_member_id)) {
+    throw new BodyError('owner_member_id must be 2 to 32 characters: a lower-case letter, then lower-case letters, digits or _');
+  }
+  const out: CreateTeamBody = { name, owner_member_id: b.owner_member_id };
+  if (b.id !== undefined) {
+    if (typeof b.id !== 'string' || !NEW_TEAM_ID_RE.test(b.id)) {
+      throw new BodyError('id must be 3 to 32 characters: a lower-case letter, then lower-case letters, digits or -');
+    }
+    out.id = b.id;
+  }
+  return out;
+}
+
+/** POST /api/invitations/{team}: exactly {"accept": true} or {"accept": false}. */
+export function checkInvitationAnswer(raw: unknown): boolean {
+  const b = object(raw);
+  onlyKeys(b, ['accept']);
+  if (typeof b.accept !== 'boolean') throw new BodyError('send {"accept": true} or {"accept": false}');
+  return b.accept;
+}
+
+/** A deletion's body: exactly {"confirm": "<the team id>"}, the id typed again. */
+export function checkConfirm(raw: unknown, team: string): string {
+  const b = object(raw);
+  onlyKeys(b, ['confirm']);
+  if (b.confirm !== team) throw new BodyError('type the team id to confirm: {"confirm": "<team id>"}');
+  return team;
+}
+
+// ---------------------------------------------------------------------------------------
+// The viewer's teams (M9-SPEC §2, §5), as the console hands them to its page.
+
+export type TeamEntry = { team: string; name: string; member: string; role: RosterRole };
+export type InvitationEntry = { team: string; name: string; member: string; role: RosterRole; invited_by_member: string | null };
+export type TeamsView = {
+  teams: TeamEntry[];
+  invitations: InvitationEntry[];
+  admin: boolean;
+  teams_created: number | null;
+  max_teams_created: number | null;
+  suggested_member: string | null;
+  /** False when the sign-in is bound to one team (a device credential): no creating, no invitations. */
+  can_manage_teams: boolean;
+};
+
+const count = (v: unknown): number | null => (typeof v === 'number' && Number.isInteger(v) && v >= 0 && v <= 1_000_000 ? v : null);
+const displayName = (v: unknown, team: string): string =>
+  typeof v === 'string' && v.trim() !== '' && [...v].length <= 60 && !NAME_FORBIDDEN_RE.test(v) ? v : team;
+const roleOf = (v: unknown): RosterRole => (v === 'owner' ? 'owner' : 'member');
+
+/** The relay's /v1/me/teams, kept to well-formed entries (never trusted to be shaped). */
+export function parseTeams(raw: unknown): TeamsView {
+  const r = (raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {}) as Record<string, unknown>;
+  const list = (v: unknown): Record<string, unknown>[] =>
+    Array.isArray(v) ? v.filter((x): x is Record<string, unknown> => !!x && typeof x === 'object' && !Array.isArray(x)).slice(0, 500) : [];
+  const seen = new Set<string>();
+  const teams: TeamEntry[] = [];
+  for (const t of list(r.teams)) {
+    if (typeof t.team !== 'string' || !TEAM_RE.test(t.team) || typeof t.member !== 'string' || !MEMBER_RE.test(t.member) || seen.has(t.team)) continue;
+    seen.add(t.team);
+    teams.push({ team: t.team, name: displayName(t.name, t.team), member: t.member, role: roleOf(t.role) });
+  }
+  const invitations: InvitationEntry[] = [];
+  for (const t of list(r.invitations)) {
+    if (typeof t.team !== 'string' || !TEAM_RE.test(t.team) || typeof t.member !== 'string' || !MEMBER_RE.test(t.member) || seen.has(t.team)) continue;
+    seen.add(t.team);
+    invitations.push({
+      team: t.team,
+      name: displayName(t.name, t.team),
+      member: t.member,
+      role: roleOf(t.role),
+      invited_by_member: typeof t.invited_by_member === 'string' && MEMBER_RE.test(t.invited_by_member) ? t.invited_by_member : null,
+    });
+  }
+  return {
+    teams,
+    invitations,
+    admin: r.admin === true,
+    teams_created: count(r.teams_created),
+    max_teams_created: count(r.max_teams_created),
+    suggested_member: typeof r.suggested_member === 'string' && MEMBER_RE.test(r.suggested_member) ? r.suggested_member : null,
+    can_manage_teams: r.can_manage_teams !== false,
+  };
+}
+
+// ---------------------------------------------------------------------------------------
+// The viewer's address for the relay's per-address creation limit (M9-SPEC §7.6).
+
+/** The right-most X-Forwarded-For entry (the one Google's front end added), else the socket peer. */
+export function clientAddress(req: IncomingMessage): string {
+  const raw = req.headers['x-forwarded-for'];
+  const joined = Array.isArray(raw) ? raw.join(',') : raw;
+  if (joined) {
+    const last = joined
+      .split(',')
+      .map((p) => p.trim())
+      .filter((p) => p !== '')
+      .at(-1);
+    if (last !== undefined) return last;
+  }
+  return req.socket.remoteAddress ?? '';
+}
+
+function expandIpv6(a: string): string[] | null {
+  let addr = a;
+  const v4 = /^(.*:)(\d{1,3}(?:\.\d{1,3}){3})$/.exec(addr);
+  if (v4) {
+    const o = v4[2]!.split('.').map(Number);
+    addr = `${v4[1]}${((o[0]! << 8) | o[1]!).toString(16)}:${((o[2]! << 8) | o[3]!).toString(16)}`;
+  }
+  const halves = addr.split('::');
+  if (halves.length > 2) return null;
+  const head = halves[0] ? halves[0].split(':') : [];
+  const tail = halves.length === 2 && halves[1] ? halves[1].split(':') : [];
+  const fill = halves.length === 2 ? 8 - head.length - tail.length : 0;
+  if (fill < 0) return null;
+  const groups = [...head, ...Array<string>(fill).fill('0'), ...tail];
+  return groups.length === 8 ? groups.map((g) => g.toLowerCase().replace(/^0+(?=.)/, '')) : null;
+}
+
+/** What one client counts as: an IPv4 address, an IPv6 /64, or "unknown" for anything else. */
+export function addressKey(address: string): string {
+  let a = address.trim();
+  const bracketed = /^\[([^\]]+)\](?::\d{1,5})?$/.exec(a);
+  if (bracketed) a = bracketed[1]!;
+  a = a.replace(/%.*$/, '');
+  const mapped = /^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/i.exec(a);
+  if (mapped) a = mapped[1]!;
+  const kind = isIP(a);
+  if (kind === 4) return a;
+  if (kind === 6) {
+    const groups = expandIpv6(a);
+    return groups ? `${groups.slice(0, 4).join(':')}::/64` : 'unknown';
+  }
+  return 'unknown';
+}
+
+/** X-Relay-Client-IP-Hash: sha256(salt + the viewer's address key), 64 lower-case hex. */
+export function clientIpHash(salt: string, req: IncomingMessage): string {
+  return createHash('sha256').update(salt + addressKey(clientAddress(req)), 'utf8').digest('hex');
+}
+
+/** CONSOLE_IP_HASH_SALT: required in hosted mode, at least 32 characters (surrounding space dropped). */
+export function checkIpHashSalt(raw: string | undefined): string {
+  const v = raw?.trim();
+  if (!v || v.length < 32 || v.length > 4096) throw new Error('CONSOLE_IP_HASH_SALT must be set to at least 32 characters');
+  return v;
 }
 
 /** GET /api/join: how to join the team, for the console's join panel. Nothing secret. */
@@ -318,14 +600,18 @@ export type HostedOptions = {
   publicHost: string;
   /** Verifies the IAP assertion: the viewer, or null to refuse. */
   verify: (assertion: string | undefined) => Promise<IapIdentity | null>;
+  /** CONSOLE_IP_HASH_SALT (M9-SPEC §7.6): salts the viewer's address before it is hashed. */
+  ipHashSalt: string;
 };
 
 export type ConsoleServerOptions = {
   backend: ConsoleBackend;
   /** dist/console/ (the built UI). */
   staticDir: string;
-  /** What GET /api/join answers; without it, /api/join is 404. */
+  /** What GET /api/join answers (its `team` is the one asked about); without it, /api/join is 404. */
   join?: JoinInfo;
+  /** Tests only: the clock the teams cache reads. */
+  now?: () => number;
   /**
    * M8-SPEC §5, local mode only: how many answers wait for this member's approval in their
    * channel working session on this computer (GET /api/approvals/summary; 404 without it).
@@ -396,7 +682,10 @@ function headerValue(req: IncomingMessage, name: string): string | undefined {
 export function createConsoleServer(opts: ConsoleServerOptions): ConsoleServer {
   const log = opts.log ?? (() => {});
   const hosted = opts.hosted ?? null;
-  if (hosted) checkPublicHost(hosted.publicHost);
+  if (hosted) {
+    checkPublicHost(hosted.publicHost);
+    checkIpHashSalt(hosted.ipHashSalt);
+  }
   else if (typeof opts.key !== 'string' || opts.key === '') throw new Error('a console key is required in local mode');
   let port = -1;
   let staticRoot: string | null = null;
@@ -412,13 +701,98 @@ export function createConsoleServer(opts: ConsoleServerOptions): ConsoleServer {
     return host === `127.0.0.1:${port}` || host === `localhost:${port}`;
   }
 
-  /** A relay (or demo) failure as the console answers it. */
-  function failure(res: ServerResponse, err: unknown, viewer: string | undefined): void {
-    // M6-SPEC §4: hosted, a signed-in account on no roster of this team (the relay's 403
-    // not_a_member for the delegate's on-behalf-of) gets no data, only this. A plain 401 is
-    // the console's own sign-in to the relay failing: a misconfiguration, passed on as such.
-    if (hosted && viewer !== undefined && err instanceof RelayError && err.status === 403 && err.code === 'not_a_member') {
-      return sendJson(res, 403, { error: 'not_on_team', email: viewer });
+  // --- The viewer's teams (M9-SPEC §5), kept briefly per viewer -----------------------
+  const now = opts.now ?? Date.now;
+  const teamsCache = new Map<string, { at: number; view: Promise<TeamsView> }>();
+
+  /** The viewer's teams: from the cache while fresh, else one /v1/me/teams (shared by concurrent calls). */
+  function viewerTeams(ctx: ReadContext, fresh = false): Promise<TeamsView> {
+    const key = ctx.viewer ?? '';
+    const hit = teamsCache.get(key);
+    if (hit && !fresh && now() - hit.at < TEAMS_TTL_MS) return hit.view;
+    const view = opts.backend.myTeams(ctx.viewer !== undefined ? { viewer: ctx.viewer } : {}).then(parseTeams);
+    if (teamsCache.size >= TEAMS_CACHE_MAX && !teamsCache.has(key)) teamsCache.delete(teamsCache.keys().next().value!);
+    const entry = { at: now(), view };
+    teamsCache.set(key, entry);
+    view.catch(() => {
+      if (teamsCache.get(key) === entry) teamsCache.delete(key);
+    });
+    return view;
+  }
+
+  function forgetTeams(viewer: string | undefined): void {
+    teamsCache.delete(viewer ?? '');
+  }
+
+  /** The not-on-team answer: no data, only who is signed in (hosted) and the team asked about. */
+  function notOnTeam(res: ServerResponse, viewer: string | undefined, team: string): void {
+    sendJson(res, 403, { error: 'not_on_team', ...(hosted && viewer !== undefined ? { email: viewer } : {}), team });
+  }
+
+  /**
+   * The team a team-scoped call is about: `team` (query) or X-Relay-Team, else RELAY_TEAM, and
+   * only one the viewer is an active member of. Answers the refusal itself and resolves null.
+   */
+  async function resolveTeam(req: IncomingMessage, res: ServerResponse, url: URL, ctx: ReadContext): Promise<string | null> {
+    const asked = askedTeam(req, res, url);
+    if (asked === null) return null;
+    const team = asked === undefined ? opts.backend.defaultTeam : asked;
+    const fixed = opts.backend.fixedTeam;
+    if (fixed !== null) {
+      if (team !== fixed) {
+        notOnTeam(res, ctx.viewer, team);
+        return null;
+      }
+      return team;
+    }
+    let view: TeamsView;
+    try {
+      view = await viewerTeams(ctx);
+    } catch (err) {
+      failure(res, err, ctx.viewer);
+      return null;
+    }
+    if (!view.teams.some((t) => t.team === team)) {
+      notOnTeam(res, ctx.viewer, team);
+      return null;
+    }
+    return team;
+  }
+
+  /** The team a call names (query `team` or X-Relay-Team), undefined for none; null once refused. */
+  function askedTeam(req: IncomingMessage, res: ServerResponse, url: URL): string | undefined | null {
+    const fromQuery = url.searchParams.getAll('team');
+    const header = req.headers['x-relay-team'];
+    if (fromQuery.length > 1 || Array.isArray(header)) {
+      sendJson(res, 400, { error: 'bad_request', detail: 'name the team once' });
+      return null;
+    }
+    const q = fromQuery[0];
+    if (q !== undefined && header !== undefined && q !== header) {
+      sendJson(res, 400, { error: 'bad_request', detail: 'the team parameter and X-Relay-Team differ' });
+      return null;
+    }
+    const asked = q ?? header;
+    if (asked !== undefined && !TEAM_RE.test(asked)) {
+      sendJson(res, 400, { error: 'bad_request', detail: 'team must be a team id' });
+      return null;
+    }
+    return asked;
+  }
+
+  /** A relay (or demo) failure as the console answers it. `team`: a team read that failed. */
+  function failure(res: ServerResponse, err: unknown, viewer: string | undefined, team?: string): void {
+    // M6-SPEC §4, M9-SPEC §7.3: the relay's refusal of a viewer who is not (or no longer) on
+    // the team (the any-team delegate's 404, a per-team delegate's 403 not_a_member) gets no
+    // data, only this, and their teams are read again next time. A plain 401 is the console's
+    // own sign-in to the relay failing: a misconfiguration, passed on as such.
+    if (err instanceof RelayError && err.status === 403 && err.code === 'not_a_member') {
+      forgetTeams(viewer);
+      return notOnTeam(res, viewer, team ?? opts.backend.defaultTeam);
+    }
+    if (team !== undefined && (err instanceof NotFound || (err instanceof RelayError && err.status === 404))) {
+      forgetTeams(viewer);
+      return notOnTeam(res, viewer, team);
     }
     if (err instanceof NotFound || (err instanceof RelayError && err.status === 404)) return sendJson(res, 404, { error: 'not_found' });
     if (err instanceof BadRequest) return sendJson(res, 400, { error: 'bad_request', detail: err.detail });
@@ -439,15 +813,37 @@ export function createConsoleServer(opts: ConsoleServerOptions): ConsoleServer {
     return sendJson(res, 502, { error: 'relay_unavailable', detail });
   }
 
-  /** M6-SPEC §3: POST /api/roster, PATCH and DELETE /api/roster/{member}. */
-  async function rosterChange(req: IncomingMessage, res: ServerResponse, url: URL, ctx: ReadContext, viewer: string | undefined): Promise<void> {
-    const path = url.pathname;
-    const one = /^\/api\/roster\/([^/]+)$/.exec(path);
-    const allowed = one ? ['PATCH', 'DELETE'] : ['POST'];
+  /** The routes that change something, by path: which methods each allows. */
+  function changeRoute(path: string): { methods: string[]; kind: 'roster' | 'roster_one' | 'teams' | 'team' | 'invitation' | 'admin_team'; id: string | null } | null {
+    if (path === '/api/roster') return { methods: ['POST'], kind: 'roster', id: null };
+    let m = /^\/api\/roster\/([^/]+)$/.exec(path);
+    if (m) return { methods: ['PATCH', 'DELETE'], kind: 'roster_one', id: m[1]! };
+    if (path === '/api/teams') return { methods: ['POST'], kind: 'teams', id: null };
+    m = /^\/api\/teams\/([^/]+)$/.exec(path);
+    if (m) return { methods: ['DELETE'], kind: 'team', id: m[1]! };
+    m = /^\/api\/invitations\/([^/]+)$/.exec(path);
+    if (m) return { methods: ['POST'], kind: 'invitation', id: m[1]! };
+    m = /^\/api\/admin\/teams\/([^/]+)$/.exec(path);
+    if (m) return { methods: ['DELETE'], kind: 'admin_team', id: m[1]! };
+    return null;
+  }
+
+  /**
+   * The changes: the roster's (M6-SPEC §3) and the account's (M9-SPEC §2, §4, §7). Each is
+   * JSON from the console's own page, with a body checked here first.
+   */
+  async function change(
+    req: IncomingMessage,
+    res: ServerResponse,
+    url: URL,
+    ctx: ReadContext,
+    route: NonNullable<ReturnType<typeof changeRoute>>,
+  ): Promise<void> {
     const method = req.method ?? '';
-    if (!allowed.includes(method)) {
+    const reads = route.kind === 'teams' || route.kind === 'roster' ? ['GET'] : [];
+    if (!route.methods.includes(method)) {
       req.resume();
-      return sendJson(res, 405, { error: 'method_not_allowed' }, { Allow: ['GET', ...allowed].filter((m) => !(one && m === 'GET')).join(', ') });
+      return sendJson(res, 405, { error: 'method_not_allowed' }, { Allow: [...reads, ...route.methods].join(', ') });
     }
     // A change is made only from the console's own page.
     if (headerValue(req, 'sec-fetch-site') !== 'same-origin') {
@@ -459,12 +855,16 @@ export function createConsoleServer(opts: ConsoleServerOptions): ConsoleServer {
       req.resume();
       return sendJson(res, 415, { error: 'unsupported_media_type', detail: 'Content-Type must be application/json' });
     }
-    if ([...url.searchParams.keys()].length > 0) {
+    // Only a roster change names a team (the query's `team` or X-Relay-Team); nothing else here.
+    const rosterKind = route.kind === 'roster' || route.kind === 'roster_one';
+    const extra = [...url.searchParams.keys()].filter((k) => !(rosterKind && k === 'team'));
+    if (extra.length > 0) {
       req.resume();
       return sendJson(res, 400, { error: 'bad_request', detail: 'no query parameters here' });
     }
-    const member = one ? one[1]! : null;
-    if (member !== null && !MEMBER_RE.test(member)) {
+    const id = route.id;
+    const idOk = id === null || (route.kind === 'roster_one' ? MEMBER_RE.test(id) : TEAM_RE.test(id));
+    if (!idOk) {
       req.resume();
       return sendJson(res, 404, { error: 'not_found' });
     }
@@ -482,27 +882,80 @@ export function createConsoleServer(opts: ConsoleServerOptions): ConsoleServer {
         return sendJson(res, 400, { error: 'bad_request', detail: 'the body is not JSON' });
       }
     }
+    const viewer = ctx.viewer;
+    const who: ReadContext = viewer !== undefined ? { viewer } : {};
     let call: () => Promise<unknown>;
+    let status = 200;
+    let what: string;
+    let team: string | undefined;
     try {
-      if (method === 'POST') {
-        const body = checkAddMember(raw);
-        call = () => opts.backend.addMember(body, ctx);
-      } else if (method === 'PATCH') {
-        const body = checkUpdateMember(raw);
-        call = () => opts.backend.updateMember(member!, body, ctx);
-      } else {
-        if (raw !== undefined && (typeof raw !== 'object' || raw === null || Array.isArray(raw) || Object.keys(raw).length > 0)) {
-          throw new BodyError('a removal takes no body');
+      switch (route.kind) {
+        case 'roster':
+        case 'roster_one': {
+          let body: unknown;
+          if (method === 'POST') body = checkAddMember(raw);
+          else if (method === 'PATCH') body = checkUpdateMember(raw);
+          else if (raw !== undefined && (typeof raw !== 'object' || raw === null || Array.isArray(raw) || Object.keys(raw).length > 0)) {
+            throw new BodyError('a removal takes no body');
+          }
+          const resolved = await resolveTeam(req, res, url, who);
+          if (resolved === null) return;
+          team = resolved;
+          const on: ReadContext = { ...who, team: resolved };
+          if (method === 'POST') {
+            status = 201;
+            call = () => opts.backend.addMember(body as AddMemberBody, on);
+          } else if (method === 'PATCH') call = () => opts.backend.updateMember(id!, body as UpdateMemberBody, on);
+          else call = () => opts.backend.removeMember(id!, on);
+          what = `roster ${method === 'POST' ? 'add' : method === 'PATCH' ? 'update' : 'remove'}${id ? ` ${id}` : ''} (team ${resolved})`;
+          break;
         }
-        call = () => opts.backend.removeMember(member!, ctx);
+        case 'teams': {
+          const body = checkCreateTeam(raw);
+          // M9-SPEC §7.6: hosted, the relay counts the viewer's address, salted and hashed.
+          const ipHash = hosted ? { clientIpHash: clientIpHash(hosted.ipHashSalt, req) } : {};
+          status = 201;
+          call = () => opts.backend.createTeam(body, { ...who, ...ipHash });
+          what = 'team create';
+          break;
+        }
+        case 'invitation': {
+          const accept = checkInvitationAnswer(raw);
+          call = () => opts.backend.answerInvitation(id!, accept, who);
+          what = `invitation ${accept ? 'accept' : 'decline'} (team ${id})`;
+          break;
+        }
+        case 'team': {
+          const confirm = checkConfirm(raw, id!);
+          // Only a team the viewer is on (the relay also checks they own it).
+          url.searchParams.set('team', id!);
+          const resolved = await resolveTeam(req, res, url, who);
+          if (resolved === null) return;
+          call = () => opts.backend.deleteTeam(confirm, { ...who, team: resolved });
+          what = `team delete (team ${id})`;
+          break;
+        }
+        case 'admin_team': {
+          const confirm = checkConfirm(raw, id!);
+          call = () => opts.backend.adminDeleteTeam(id!, confirm, who);
+          what = `admin team delete (team ${id})`;
+          break;
+        }
       }
     } catch (err) {
       return sendJson(res, 400, { error: 'bad_request', detail: err instanceof BodyError ? err.message : 'bad body' });
     }
-    log(`roster ${method === 'POST' ? 'add' : method === 'PATCH' ? 'update' : 'remove'}${member ? ` ${member}` : ''}`);
+    log(what);
     try {
-      return sendJson(res, method === 'POST' ? 201 : 200, await call());
+      const out = await call();
+      // What the viewer's teams are may have changed: read them again next time.
+      if (route.kind !== 'roster' && route.kind !== 'roster_one') forgetTeams(viewer);
+      return sendJson(res, status, out);
     } catch (err) {
+      if (route.kind !== 'roster' && route.kind !== 'roster_one') forgetTeams(viewer);
+      // A roster change's 404 is about the member (or the team: then not_on_team, from the
+      // relay's refusal of a non-member); an account route's 404 is the relay's own.
+      if (team !== undefined && route.kind === 'roster' && err instanceof RelayError && err.status === 404) return failure(res, err, viewer, team);
       return failure(res, err, viewer);
     }
   }
@@ -528,31 +981,15 @@ export function createConsoleServer(opts: ConsoleServerOptions): ConsoleServer {
     }
     const ctx: ReadContext = viewer !== undefined ? { viewer } : {};
     const path = url.pathname;
-    const roster = path === '/api/roster' || /^\/api\/roster\/[^/]+$/.test(path);
+    const route = changeRoute(path);
     if (req.method !== 'GET') {
-      if (roster) return rosterChange(req, res, url, ctx, viewer);
+      if (route) return change(req, res, url, ctx, route);
       req.resume();
       return sendJson(res, 405, { error: 'method_not_allowed', detail: 'the console is read-only' }, { Allow: 'GET' });
     }
     req.resume();
 
     const query = [...url.searchParams.keys()];
-    if (path === '/api/join') {
-      // Answered here, from the server's own configuration, never proxied.
-      if (query.length > 0) return sendJson(res, 400, { error: 'bad_request', detail: 'no query parameters here' });
-      if (hosted) {
-        // M6-SPEC §7 item 6: hosted, only a signed-in member of the team gets the join details.
-        // The relay is asked who the viewer is; anyone else gets the not-on-team response (the
-        // relay's 403 not_a_member), as on every other route, and nothing about joining.
-        try {
-          await opts.backend.me(ctx);
-        } catch (err) {
-          return failure(res, err, viewer);
-        }
-      }
-      if (!opts.join) return sendJson(res, 404, { error: 'not_found' });
-      return sendJson(res, 200, opts.join);
-    }
     if (path === '/api/approvals/summary') {
       // Answered here from the host's count on this computer (counts only), never proxied; the
       // hosted console cannot see a laptop's queue.
@@ -560,27 +997,60 @@ export function createConsoleServer(opts: ConsoleServerOptions): ConsoleServer {
       if (hosted || !opts.approvals) return sendJson(res, 404, { error: 'not_found' });
       return sendJson(res, 200, opts.approvals());
     }
-    let call: () => Promise<unknown>;
-    if (path === '/api/me' || path === '/api/directory' || path === '/api/roster' || path === '/api/inbox/summary') {
+    if (path === '/api/teams') {
+      // M9-SPEC §2: the viewer's teams and invitations; read afresh (the page asks rarely).
       if (query.length > 0) return sendJson(res, 400, { error: 'bad_request', detail: 'no query parameters here' });
-      // Hosted, the viewer's own IAP-verified email rides along on /api/me so the join panel can
-      // fill in their commands; it is theirs, and nobody else's is ever added.
-      call =
-        path === '/api/me'
-          ? async () => {
-              const me = await opts.backend.me(ctx);
-              return ctx.viewer !== undefined && me !== null && typeof me === 'object' && !Array.isArray(me)
-                ? { ...(me as Record<string, unknown>), email: ctx.viewer }
-                : me;
-            }
-          : path === '/api/directory'
-            ? () => opts.backend.directory(ctx)
-            : path === '/api/inbox/summary'
-              ? () => opts.backend.inboxSummary(ctx)
-              : () => opts.backend.roster(ctx);
-    } else if (path === '/api/activity') {
-      const q: { since?: string; limit?: number } = {};
+      let view: TeamsView;
+      try {
+        view = opts.backend.fixedTeam !== null ? parseTeams(await opts.backend.myTeams(ctx)) : await viewerTeams(ctx, true);
+      } catch (err) {
+        return failure(res, err, viewer);
+      }
+      return sendJson(res, 200, {
+        ...view,
+        default_team: opts.backend.defaultTeam,
+        // Hosted, the viewer's own IAP-verified email, for the not-on-team page; theirs only.
+        ...(hosted && viewer !== undefined ? { email: viewer } : {}),
+      });
+    }
+    if (path === '/api/admin/teams') {
+      // M9-SPEC §4: the relay decides who is an admin; the console only checks the query.
+      const q: { after?: string; limit?: number } = {};
       for (const k of query) {
+        if (k !== 'after' && k !== 'limit') return sendJson(res, 400, { error: 'bad_request', detail: `unknown parameter ${k.slice(0, 40)}` });
+      }
+      if (url.searchParams.getAll('after').length > 1 || url.searchParams.getAll('limit').length > 1) {
+        return sendJson(res, 400, { error: 'bad_request', detail: 'repeated parameter' });
+      }
+      const after = url.searchParams.get('after');
+      if (after !== null) {
+        if (!TEAM_RE.test(after)) return sendJson(res, 400, { error: 'bad_request', detail: 'after must be a team id' });
+        q.after = after;
+      }
+      const limit = url.searchParams.get('limit');
+      if (limit !== null) {
+        if (!/^[0-9]{1,4}$/.test(limit) || Number(limit) < 1 || Number(limit) > 1000) {
+          return sendJson(res, 400, { error: 'bad_request', detail: 'limit must be 1..1000' });
+        }
+        q.limit = Number(limit);
+      }
+      try {
+        return sendJson(res, 200, await opts.backend.adminTeams(q, ctx));
+      } catch (err) {
+        return failure(res, err, viewer);
+      }
+    }
+
+    // Every other route is about one team: `team` (query) or X-Relay-Team.
+    const own = query.filter((k) => k !== 'team');
+    const known = path === '/api/join' || path === '/api/me' || path === '/api/directory' || path === '/api/roster' || path === '/api/inbox/summary';
+    const requestMatch = /^\/api\/requests\/([^/]+)$/.exec(path);
+    if (!known && path !== '/api/activity' && !requestMatch) return sendJson(res, 404, { error: 'not_found' });
+    if (requestMatch && (!REQUEST_ID_RE.test(requestMatch[1]!) || own.length > 0)) return sendJson(res, 404, { error: 'not_found' });
+    if (known && own.length > 0) return sendJson(res, 400, { error: 'bad_request', detail: 'no query parameters here' });
+    const q: { since?: string; limit?: number } = {};
+    if (path === '/api/activity') {
+      for (const k of own) {
         if (k !== 'since' && k !== 'limit') return sendJson(res, 400, { error: 'bad_request', detail: `unknown parameter ${k.slice(0, 40)}` });
       }
       if (url.searchParams.getAll('since').length > 1 || url.searchParams.getAll('limit').length > 1) {
@@ -598,18 +1068,49 @@ export function createConsoleServer(opts: ConsoleServerOptions): ConsoleServer {
         }
         q.limit = Number(limit);
       }
-      call = () => opts.backend.activity(q, ctx);
-    } else {
-      const m = /^\/api\/requests\/([^/]+)$/.exec(path);
-      if (!m || !REQUEST_ID_RE.test(m[1]!) || query.length > 0) return sendJson(res, 404, { error: 'not_found' });
-      const id = m[1]!;
-      call = () => opts.backend.request(id, ctx);
+    }
+
+    if (path === '/api/join' && !hosted) {
+      // Answered here, from the server's own configuration, never proxied, and nothing secret:
+      // locally the key holder is the member, so no relay call is needed for it.
+      const asked = askedTeam(req, res, url);
+      if (asked === null) return;
+      if (!opts.join) return sendJson(res, 404, { error: 'not_found' });
+      return sendJson(res, 200, { ...opts.join, team: asked ?? opts.join.team });
+    }
+    const team = await resolveTeam(req, res, url, ctx);
+    if (team === null) return;
+    const on: ReadContext = { ...ctx, team };
+
+    if (path === '/api/join') {
+      // Hosted, only to an active member of the team (resolveTeam above; M6-SPEC §7 item 6).
+      if (!opts.join) return sendJson(res, 404, { error: 'not_found' });
+      return sendJson(res, 200, { ...opts.join, team });
+    }
+    let call: () => Promise<unknown>;
+    if (path === '/api/me') {
+      // Hosted, the viewer's own IAP-verified email rides along on /api/me so the join panel can
+      // fill in their commands; it is theirs, and nobody else's is ever added.
+      call = async () => {
+        const me = await opts.backend.me(on);
+        return on.viewer !== undefined && me !== null && typeof me === 'object' && !Array.isArray(me)
+          ? { ...(me as Record<string, unknown>), email: on.viewer }
+          : me;
+      };
+    } else if (path === '/api/directory') call = () => opts.backend.directory(on);
+    else if (path === '/api/inbox/summary') call = () => opts.backend.inboxSummary(on);
+    else if (path === '/api/roster') call = () => opts.backend.roster(on);
+    else if (path === '/api/activity') call = () => opts.backend.activity(q, on);
+    else {
+      const rid = requestMatch![1]!;
+      call = () => opts.backend.request(rid, on);
     }
 
     try {
       return sendJson(res, 200, await call());
     } catch (err) {
-      return failure(res, err, viewer);
+      // A request's 404 is about the request; any other read's is about the team.
+      return failure(res, err, viewer, requestMatch ? undefined : team);
     }
   }
 
@@ -654,7 +1155,7 @@ export function createConsoleServer(opts: ConsoleServerOptions): ConsoleServer {
     send(res, 401, 'unauthorized\n', 'text/plain; charset=utf-8', { 'Cache-Control': 'no-store' });
 
   const server = createServer((req, res) => {
-    // Only a roster change's body is ever read (rosterChange); any other is discarded.
+    // Only a change's body is ever read (change); any other is discarded.
     if (!hostAllowed(req)) {
       req.resume();
       send(res, 403, 'forbidden host\n', 'text/plain; charset=utf-8');

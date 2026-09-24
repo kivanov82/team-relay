@@ -18,9 +18,9 @@ import {
   relayBackend,
   type ConsoleServer,
 } from '../src/console-app.js';
-import { DemoTeam, NotFound, RosterRefusal } from '../src/console-demo.js';
+import { DemoAccount, DemoTeam, NotFound, RosterRefusal } from '../src/console-demo.js';
 import { IAP_HEADER } from '../src/iap.js';
-import { RelayClient } from '../src/relay-client.js';
+import { RelayClient, staticTokenProvider } from '../src/relay-client.js';
 import { FakeRelay, TOKEN_OF, type Recorded } from './helpers/fake-relay.js';
 
 const KEY = 'k'.repeat(43);
@@ -64,7 +64,7 @@ describe('roster proxy, local (M6-SPEC §3)', () => {
 
   beforeEach(async () => {
     relay = await new FakeRelay().start();
-    const client = new RelayClient({ url: relay.url, team: 'demo', token: () => TOKEN_OF.alice!, attempts: 1 });
+    const client = new RelayClient({ url: relay.url, team: 'demo', token: staticTokenProvider(TOKEN_OF.alice!), attempts: 1 });
     app = createConsoleServer({ backend: relayBackend(client), key: KEY, staticDir: NO_UI });
     port = await app.listen(0);
   });
@@ -201,7 +201,7 @@ describe('roster proxy, local (M6-SPEC §3)', () => {
 
   it('a member (not an owner) is refused by the relay; the console adds nothing of its own', async () => {
     await app.close();
-    const client = new RelayClient({ url: relay.url, team: 'demo', token: () => TOKEN_OF.bob!, attempts: 1 });
+    const client = new RelayClient({ url: relay.url, team: 'demo', token: staticTokenProvider(TOKEN_OF.bob!), attempts: 1 });
     app = createConsoleServer({ backend: relayBackend(client), key: KEY, staticDir: NO_UI });
     port = await app.listen(0);
     const roster = (await get('/api/roster')).json();
@@ -220,11 +220,11 @@ describe('roster proxy, hosted (M6-SPEC §3, §4)', () => {
   beforeEach(async () => {
     relay = await new FakeRelay().start();
     // The service account's token (a delegate at the real relay) and the viewer on behalf of.
-    const client = new RelayClient({ url: relay.url, team: 'demo', token: () => TOKEN_OF.alice!, attempts: 1 });
+    const client = new RelayClient({ url: relay.url, team: 'demo', token: staticTokenProvider(TOKEN_OF.alice!), attempts: 1 });
     app = createConsoleServer({
       backend: relayBackend(client),
       staticDir: NO_UI,
-      hosted: { publicHost: PUBLIC_HOST, verify: async (a) => (a === 'good-assertion' ? { email: VIEWER } : null) },
+      hosted: { publicHost: PUBLIC_HOST, verify: async (a) => (a === 'good-assertion' ? { email: VIEWER } : null), ipHashSalt: 's'.repeat(32) },
     });
     port = await app.listen(0);
   });
@@ -261,11 +261,11 @@ describe('roster proxy, hosted (M6-SPEC §3, §4)', () => {
       relay.fail((r) => r.path.startsWith('/v1/teams/demo/'), 403, 1, NOT_A_MEMBER);
       const r = await hosted('GET', path);
       expect(r.status, path).toBe(403);
-      expect(r.json(), path).toEqual({ error: 'not_on_team', email: VIEWER });
+      expect(r.json(), path).toEqual({ error: 'not_on_team', email: VIEWER, team: 'demo' });
     }
     relay.fail((r) => r.path === '/v1/teams/demo/roster', 403, 1, NOT_A_MEMBER);
     const change = await hosted('POST', '/api/roster', { headers: SAME_ORIGIN, body: JSON.stringify({ member: 'dave', email: 'dave@example.com' }) });
-    expect(change.json()).toEqual({ error: 'not_on_team', email: VIEWER });
+    expect(change.json()).toEqual({ error: 'not_on_team', email: VIEWER, team: 'demo' });
   });
 
   it('a plain 401 from the relay is the console\'s own sign-in failing: passed on, never not_on_team', async () => {
@@ -297,24 +297,46 @@ describe('the roster bodies', () => {
 
 describe('--demo roster (M6-SPEC §1 invariants)', () => {
   it('alice owns the demo team; changes follow the relay rules', async () => {
-    const team = new DemoTeam();
-    const backend = demoBackend(team);
-    const roster = (await backend.roster()) as { members: Array<{ member: string; role: string; emails: string[] }> };
-    expect(roster.members.map((m) => [m.member, m.role])).toEqual([
-      ['alice', 'owner'],
-      ['bob', 'member'],
-      ['carol', 'member'],
+    const backend = demoBackend(new DemoAccount());
+    const roster = (await backend.roster()) as { members: Array<{ member: string; role: string; emails: string[]; status: string }> };
+    expect(roster.members.map((m) => [m.member, m.role, m.status])).toEqual([
+      ['alice', 'owner', 'active'],
+      ['bob', 'member', 'active'],
+      ['carol', 'member', 'active'],
+      // M9-SPEC §7.2: an owner sees the open invitation.
+      ['dana', 'member', 'invited'],
     ]);
     expect(roster.members.flatMap((m) => m.emails).every((e) => e.endsWith('@example.com') || e.endsWith('@example.org'))).toBe(true);
-    await backend.addMember({ member: 'dave', email: 'dave@example.com' });
+    expect(await backend.addMember({ member: 'dave', email: 'dave@example.com' })).toMatchObject({ member: 'dave', status: 'invited' });
     await expect(backend.addMember({ member: 'dave', email: 'other@example.com' })).rejects.toBeInstanceOf(RosterRefusal);
     await expect(backend.addMember({ member: 'erin', email: 'bob@example.com' })).rejects.toThrow(/already belongs/);
     await expect(backend.removeMember('alice')).rejects.toThrow(/at least one owner/);
     await expect(backend.updateMember('alice', { role: 'member' })).rejects.toThrow(/at least one owner/);
-    await backend.updateMember('bob', { role: 'owner' });
-    await backend.updateMember('alice', { role: 'member' });
     await expect(backend.updateMember('dave', { remove_email: 'dave@example.com' })).rejects.toThrow(/at least one email/);
     await backend.removeMember('dave');
     await expect(backend.removeMember('dave')).rejects.toBeInstanceOf(NotFound);
+    await backend.updateMember('bob', { role: 'owner' });
+    await backend.updateMember('alice', { role: 'member' });
+    // No longer an owner, alice may change nothing.
+    await expect(backend.removeMember('carol')).rejects.toThrow(/Only owners/);
+  });
+
+  it('a member (not an owner) of a demo team sees active members only and may change nothing', async () => {
+    const team = new DemoTeam(Date.now, undefined, {
+      team: 'ops',
+      name: 'Operations',
+      roster: [
+        { member: 'olga', emails: ['olga@example.com'], role: 'owner', added_by: 'olga', added_at: new Date().toISOString(), status: 'active' },
+        { member: 'alice', emails: ['alice@example.com'], role: 'member', added_by: 'olga', added_at: new Date().toISOString(), status: 'active' },
+        { member: 'quinn', emails: ['quinn@example.com'], role: 'member', added_by: 'olga', added_at: new Date().toISOString(), status: 'invited' },
+      ],
+    });
+    expect(team.roster().members.map((m) => [m.member, m.emails])).toEqual([
+      ['olga', [null]],
+      ['alice', ['alice@example.com']],
+    ]);
+    expect(team.me()).toMatchObject({ team: 'ops', name: 'Operations', member: 'alice', role: 'member', teammates: ['olga'] });
+    expect(() => team.addMember({ member: 'zed', email: 'zed@example.com' })).toThrow(/Only owners/);
+    expect(team.activity().requests).toEqual([]);
   });
 });
