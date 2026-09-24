@@ -119,6 +119,23 @@ BAD_MANIFESTS = [
         lambda m: m["capabilities"].append(copy.deepcopy(_cap(m))),
         "twice",
     ),
+    # A schema pattern's final $ is the end of the string, as in JSON Schema and the plugin,
+    # not Python's "or before a trailing newline".
+    (
+        "capability name with a trailing newline",
+        lambda m: _cap(m).__setitem__("name", "staging_db_query\n"),
+        "does not match",
+    ),
+    (
+        "param name with a trailing newline",
+        lambda m: _cap(m)["params"].__setitem__("query\n", _string_param("^[a-z]*$")),
+        "does not match",
+    ),
+    (
+        "enum value with a trailing newline",
+        lambda m: _cap(m)["params"]["dataset"]["values"].append("orders\n"),
+        "at capabilities/0/params/dataset",
+    ),
 ]
 
 

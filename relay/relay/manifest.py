@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import functools
 import math
+import re
 from collections.abc import Mapping
 from typing import Any
 
@@ -175,10 +176,27 @@ def _contains_lone_surrogate(value: Any) -> bool:
     return False
 
 
+@functools.lru_cache(maxsize=64)
+def _schema_regex(pattern: str) -> re.Pattern[str]:
+    """A schema ``pattern`` with JSON Schema's (ECMA-262) meaning of a final ``$``: the end of
+    the string. Python's ``$`` also matches before a trailing newline, so ``"name\\n"`` would
+    pass ``^[a-z]+$``; the plugin's validator (ajv) refuses it. These patterns are the relay's
+    own schema, never a teammate's."""
+    if _is_anchored(pattern):
+        pattern = pattern[:-1] + r"\Z"
+    return re.compile(pattern)
+
+
+def _pattern_keyword(validator: Any, pattern: str, instance: Any, schema: Any) -> Any:
+    if validator.is_type(instance, "string") and not _schema_regex(pattern).search(instance):
+        yield jsonschema.ValidationError(f"{instance!r} does not match {pattern!r}")
+
+
 class ManifestValidator:
     def __init__(self, schema: Mapping[str, Any]) -> None:
         cls = validator_for(schema)
         cls.check_schema(schema)
+        cls = jsonschema.validators.extend(cls, {"pattern": _pattern_keyword})
         self._validator = cls(schema)
 
     def validate(self, manifest: Any) -> list[str]:
