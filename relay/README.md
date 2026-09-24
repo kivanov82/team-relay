@@ -119,8 +119,10 @@ delegates:
 - `GET /v1/health`: `{"ok": true}`, no credentials (Cloud Run's front end reserves some paths
   ending in `z`, so `/healthz` may never reach the app there).
 - `POST /v1/teams/{team}/requests/{id}/events`, recipient only (anyone else `404`): body
-  `{"tool": "^[A-Za-z0-9_.:-]{1,64}$", "status": "ok"|"error", "duration_ms": 0..3600000|null}`,
+  `{"tool": "^[A-Za-z0-9_.:-]{1,64}$", "status": "ok"|"error"|"waiting", "duration_ms": 0..3600000|null}`,
   nothing else (`extra="forbid"`, so no input, output or path can be sent). `201 {"seq": n}`.
+  `waiting` (M4-SPEC §2): the answering session is waiting for its member to allow a tool;
+  it is stored, capped, audited and kept out of the streams exactly like `ok` and `error`.
   Appended to the recipient's `tools` and to the progress list as `kind: "tool"` (one `seq`
   for both kinds); never an envelope. At most 50 per recipient (`429 too_many_tool_events`),
   a budget separate from progress's 200. Past `expire_at`: `410`. Audited as `request.event`

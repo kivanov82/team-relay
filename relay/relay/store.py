@@ -70,7 +70,7 @@ class ToolEvent:
     output or path, only the name, the outcome and the duration."""
 
     tool: str
-    status: str  # "ok" | "error"
+    status: str  # "ok" | "error" | "waiting" (M4-SPEC §2)
     at: datetime
     duration_ms: int | None = None
 

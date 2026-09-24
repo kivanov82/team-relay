@@ -116,8 +116,10 @@ MAX_TOOL_DURATION_MS = 3_600_000
 
 class ToolEventBody(StrictModel):
     """M2-SPEC §3.3: the name, the outcome and the duration of one tool use. Never its input,
-    output or path; ``extra="forbid"`` refuses any attempt to send more."""
+    output or path; ``extra="forbid"`` refuses any attempt to send more. ``waiting`` (M4-SPEC
+    §2) says the answering session is waiting for its member to allow a tool; the path it
+    asked for is never sent."""
 
     tool: Annotated[str, StringConstraints(pattern=r"^[A-Za-z0-9_.:-]{1,64}$")]
-    status: Literal["ok", "error"]
+    status: Literal["ok", "error", "waiting"]
     duration_ms: Annotated[int, Field(ge=0, le=MAX_TOOL_DURATION_MS)] | None = None

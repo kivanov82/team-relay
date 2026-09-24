@@ -122,6 +122,17 @@ async def test_tool_events_never_enter_a_stream(api: Api):
         {"tool": "Read", "status": "OK"},
         {"tool": "Read", "status": "failed"},
         {"tool": "Read", "status": None},
+        {"tool": "Read", "status": "Waiting"},
+        {"tool": "Read", "status": "waiting "},
+        {"tool": "Read", "status": "wait"},
+        {"tool": "Read", "status": "pending"},
+        {"tool": "Read", "status": "denied"},
+        {"tool": "Read", "status": "allowed"},
+        {"tool": "Read", "status": ["waiting"]},
+        # A waiting event names the tool, never the path it asked for (M4-SPEC §2).
+        {"tool": "Read", "status": "waiting", "path": "/Users/bob/notes"},
+        {"tool": "Read", "status": "waiting", "file_path": "/etc/hosts"},
+        {"tool": "Read", "status": "waiting", "input": {"pattern": "**/*"}},
         {"tool": "Read", "status": "ok", "duration_ms": -1},
         {"tool": "Read", "status": "ok", "duration_ms": 3_600_001},
         {"tool": "Read", "status": "ok", "duration_ms": True},
@@ -153,6 +164,9 @@ async def test_malformed_tool_events_are_refused_and_audited(api: Api, body: Any
     [
         {"tool": "x" * 64, "status": "ok"},
         {"tool": "A-z_0.9:mcp", "status": "error"},
+        {"tool": "Read", "status": "waiting"},
+        {"tool": "Grep", "status": "waiting", "duration_ms": 0},
+        {"tool": "Glob", "status": "waiting", "duration_ms": 3_600_000},
         {"tool": "Read", "status": "ok", "duration_ms": 0},
         {"tool": "Read", "status": "ok", "duration_ms": 3_600_000},
         {"tool": "Read", "status": "ok", "duration_ms": None},
@@ -216,6 +230,65 @@ async def test_tool_events_are_capped_per_recipient(api: Api):
     assert r.status_code == 201
     audit = await api.store.list_audit(api.team)
     assert [a.detail for a in audit if a.outcome == "refused"] == ["429 too_many_tool_events"]
+
+
+# M4-SPEC §2: "waiting" --------------------------------------------------------------------------
+
+
+async def test_a_waiting_event_is_recorded_like_any_tool_event(api: Api):
+    """Waiting, then the outcome of the same tool: both kept in order, one sequence with
+    progress, on the recipient and in the progress list; nothing else changes."""
+    rid = await api.ask(to=["bob", "carol"])
+    before = await _heads(api)
+    r = await api.post("bob", events(rid), {"tool": "Read", "status": "waiting"})
+    assert r.status_code == 201 and r.json() == {"seq": 1}
+    api.clock.advance(4)
+    r = await api.post("bob", events(rid), {"tool": "Read", "status": "ok", "duration_ms": 9})
+    assert r.status_code == 201 and r.json() == {"seq": 2}
+    api.clock.advance(1)
+    r = await api.post("bob", events(rid), {"tool": "Grep", "status": "waiting"})
+    assert r.json() == {"seq": 3}
+
+    assert await _heads(api) == before  # never a stream, waiting included
+    entry = (await api.feed_entry("carol", rid))["recipients"]["bob"]
+    assert entry["tools"] == [
+        {"tool": "Read", "status": "waiting", "at": at(0), "duration_ms": None},
+        {"tool": "Read", "status": "ok", "at": at(4), "duration_ms": 9},
+        {"tool": "Grep", "status": "waiting", "at": at(5), "duration_ms": None},
+    ]
+    assert entry["progress_count"] == 0
+    progress = (await api.get("alice", f"/requests/{rid}")).json()["progress"]
+    assert [(p["kind"], p["tool"], p["status"]) for p in progress] == [
+        ("tool", "Read", "waiting"),
+        ("tool", "Read", "ok"),
+        ("tool", "Grep", "waiting"),
+    ]
+    assert (await api.feed_entry("alice", rid))["updated_at"] == at(5)
+    audit = [a for a in await api.store.list_audit(api.team) if a.action == "request.event"]
+    assert [(a.actor, a.outcome) for a in audit] == [("bob", "recorded")] * 3
+
+
+async def test_waiting_events_count_against_the_same_cap(api: Api):
+    rid = await api.ask(to=["bob"])
+    for i in range(MAX_TOOL_EVENTS_PER_RECIPIENT):
+        status = "waiting" if i % 2 == 0 else "ok"
+        assert (
+            await api.post("bob", events(rid), {"tool": "Read", "status": status})
+        ).status_code == 201
+    r = await api.post("bob", events(rid), {"tool": "Read", "status": "waiting"})
+    assert r.status_code == 429 and r.json()["error"] == "too_many_tool_events"
+
+
+async def test_waiting_follows_the_same_access_and_expiry_rules(api: Api):
+    rid = await api.ask(
+        to=["bob"], ack_timeout_seconds=60, answer_timeout_seconds=60, ttl_seconds=60
+    )
+    body = {"tool": "Read", "status": "waiting"}
+    for member in ("alice", "carol"):
+        assert (await api.post(member, events(rid), body)).status_code == 404
+    api.clock.advance(60)
+    r = await api.post("bob", events(rid), body)
+    assert r.status_code == 410 and r.json()["error"] == "expired"
 
 
 async def test_tool_events_after_expiry_are_410(api: Api):
