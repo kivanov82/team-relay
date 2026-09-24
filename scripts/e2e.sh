@@ -6,7 +6,10 @@
 # SHA-256), starts the relay on a free 127.0.0.1 port with RELAY_AUTH_MODE=static, builds
 # the plugin bundles, runs the e2e vitest suite, and tears everything down on any exit.
 # The M2 scenarios (test/e2e/m2.test.ts) run only when the relay answers GET /v1/health and
-# GET /v1/teams/demo/activity; otherwise they are skipped and this script says so.
+# GET /v1/teams/demo/activity; otherwise they are skipped and this script says so. They
+# include M4 (docs/M4-SPEC.md §2, §3): a permission request's `waiting` tool event shows on
+# the activity feed and the next event for that tool follows it, and the answering channel's
+# shared folder names come back in the directory.
 # Extra arguments are passed to vitest. The tokens are never printed.
 set -euo pipefail
 

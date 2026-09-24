@@ -121,7 +121,12 @@ describe.skipIf(!M2)('M2 end to end (plugin side)', () => {
       { mode: 0o600 },
     );
     [bob, carol] = await Promise.all([
-      Party.start('m2-bob', 'channel.js', channelEnv('bob', 'answerer', { ...BOB_CAPABILITIES, ANSWERER_STATE_DIR: stateDir })),
+      Party.start(
+        'm2-bob',
+        'channel.js',
+        // M4-SPEC §3: bin/answerer hands the channel the shared folders' names to publish.
+        channelEnv('bob', 'answerer', { ...BOB_CAPABILITIES, ANSWERER_STATE_DIR: stateDir, ANSWERER_SHARES: JSON.stringify(['orders-service', 'runbooks']) }),
+      ),
       Party.start('m2-carol', 'channel.js', channelEnv('carol', 'answerer')),
     ]);
     alice = await Party.start('m2-alice', 'channel.js', channelEnv('alice', 'asker'));
@@ -319,6 +324,54 @@ describe.skipIf(!M2)('M2 end to end (plugin side)', () => {
     expect(await runHook({ hook_event_name: 'PostToolUse', tool_name: 'Read', duration_ms: 2 })).toBe(0);
     const seen = await waitFeed('alice', staleId, () => true, 'the stale request');
     expect(seen.recipients.bob!.tools).toEqual([]);
+  });
+
+  it('G. M4: a permission request shows on the feed as waiting and the next event clears it; shares are published by name', async () => {
+    // §3: the directory returns bob's shares inside his manifest, names only.
+    const dir = await api(tokenOf('carol'), 'GET', teamPath('directory'));
+    const bobEntry = (dir.body.members as Array<{ member: string; manifest: { shares?: unknown } | null }>).find((m) => m.member === 'bob')!;
+    expect(bobEntry.manifest?.shares).toEqual([{ name: 'orders-service' }, { name: 'runbooks' }]);
+
+    // §2: a permission request while answering posts `waiting`, never the path.
+    const asked = await alice.ok('ask_question', { to: ['bob'], question: 'M4: what does the handover note say?' });
+    const id = asked.request_id as string;
+    await bob.waitNote((n) => n.meta.request_id === id, DELIVERY_MS, 'the M4 question');
+    await bob.ok('ack_question', { request_id: id });
+    expect(
+      await runHook({
+        session_id: 'e2e',
+        hook_event_name: 'PermissionRequest',
+        permission_mode: 'default',
+        tool_name: 'Read',
+        tool_input: { file_path: `/tmp/${SECRET}/handover.md` },
+        permission_suggestions: [{ type: 'addRules', rules: [{ toolName: 'Read', ruleContent: `//tmp/${SECRET}/**` }], behavior: 'allow', destination: 'session' }],
+      }),
+    ).toBe(0);
+    const waiting = await waitFeed('alice', id, (e) => e.recipients.bob?.tools.at(-1)?.status === 'waiting', 'the waiting event');
+    expect(waiting.recipients.bob!.status).toBe('acked');
+    expect(waiting.recipients.bob!.tools.map(({ tool, status, duration_ms }) => ({ tool, status, duration_ms }))).toEqual([
+      { tool: 'Read', status: 'waiting', duration_ms: null },
+    ]);
+    // Everyone on the team sees the metadata: carol, who is not a participant, too.
+    const carolView = await waitFeed('carol', id, (e) => e.recipients.bob?.tools.at(-1)?.status === 'waiting', "carol's view of the waiting event");
+    expect(carolView.question).toBeNull();
+
+    // Allowed: the Read runs, and its ok is the next event for that tool.
+    expect(await runHook({ session_id: 'e2e', hook_event_name: 'PostToolUse', tool_name: 'Read', tool_input: { file_path: `/tmp/${SECRET}` }, tool_response: SECRET, duration_ms: 9 })).toBe(0);
+    const cleared = await waitFeed('alice', id, (e) => (e.recipients.bob?.tools.length ?? 0) >= 2, 'the event after the grant');
+    expect(cleared.recipients.bob!.tools.map(({ tool, status }) => [tool, status])).toEqual([
+      ['Read', 'waiting'],
+      ['Read', 'ok'],
+    ]);
+    const detail = await api(tokenOf('alice'), 'GET', teamPath('requests', id));
+    expect((detail.body.progress as Array<{ kind: string; tool?: string; status?: string }>).map((p) => [p.kind, p.tool, p.status])).toEqual([
+      ['tool', 'Read', 'waiting'],
+      ['tool', 'Read', 'ok'],
+    ]);
+    expect(JSON.stringify(detail.body) + JSON.stringify(cleared) + JSON.stringify(dir.body)).not.toContain(SECRET);
+
+    await bob.ok('reply', { request_id: id, text: 'It says to page on-call above 5,000.' });
+    await alice.waitNote((n) => n.meta.request_id === id && n.meta.type === 'answer', DELIVERY_MS, 'the M4 answer');
   });
 
   it('leaves every stream drained and no token in any log', async () => {
