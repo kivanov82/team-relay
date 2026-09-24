@@ -32,7 +32,7 @@ export interface Join {
   marketplace_source?: string | null
   marketplace: string
   plugin: string
-  /** True when the team's relay is the plugin's default, so a bare /team-relay:login reaches it. */
+  /** True when the team's relay is the plugin's default (no RELAY_URL needed; /team-relay:login takes no relay URL). */
   default_relay?: boolean
 }
 

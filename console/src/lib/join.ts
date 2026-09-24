@@ -25,8 +25,14 @@ export interface JoinCommands {
   /** `/plugin marketplace add <source>`, or null: ask the team owner where the plugin is. */
   marketplaceAdd: string | null
   install: string
-  /** The working session with the team channel loaded (channels research preview). */
+  /**
+   * The working session with the team channel loaded (channels research preview). For a relay
+   * other than the plugin's default it starts with `RELAY_URL=<relay>`: the only way to pick
+   * another relay (M5-SPEC §9: the login command takes no relay URL).
+   */
   working: string
+  /** Whether `working` names the relay (it is not the plugin's default). */
+  namesRelay: boolean
   login: string
   answering: string
   console: string
@@ -37,13 +43,15 @@ export function joinCommands(join: Join): JoinCommands {
   const marketplace = NAME_RE.test(join.marketplace) ? join.marketplace : 'team-relay-dev'
   const ref = `${plugin}@${marketplace}`
   const source = join.marketplace_source && SOURCE_RE.test(join.marketplace_source) ? join.marketplace_source : null
-  // A bare /<plugin>:login reaches the plugin's own relay; any other relay is named.
-  const relayArg = join.default_relay === true || !URL_RE.test(join.relay_url) ? '' : ` ${join.relay_url}`
+  // /<plugin>:login takes no arguments (M5-SPEC §9). It reaches the plugin's own relay; any
+  // other relay is named in the environment the working session starts with.
+  const namesRelay = join.default_relay !== true && URL_RE.test(join.relay_url)
   return {
     marketplaceAdd: source ? `/plugin marketplace add ${source}` : null,
     install: `/plugin install ${ref}`,
-    working: `claude --dangerously-load-development-channels plugin:${ref}`,
-    login: `/${plugin}:login${relayArg}`,
+    working: `${namesRelay ? `RELAY_URL=${join.relay_url} ` : ''}claude --dangerously-load-development-channels plugin:${ref}`,
+    namesRelay,
+    login: `/${plugin}:login`,
     answering: `/${plugin}:answering`,
     console: `/${plugin}:console`,
   }

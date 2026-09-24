@@ -172,11 +172,16 @@ describe('join panel: the steps (M5 §1)', () => {
     expect(document.querySelector('[data-invite-hint]')).toBeNull()
   })
 
-  it('names the relay in the sign-in command when it is not the plugin default', async () => {
+  it('names a relay that is not the plugin default in the working session environment, never in the sign-in command', async () => {
     server({ join: { ...JOIN, default_relay: false } })
     renderWithClient(<JoinPanel />)
     await screen.findByText('Install the plugin')
-    expect(commandText('sign-in command')).toBe('/zeta-relay:login https://relay-zeta.team.example')
+    // M5-SPEC §9: the login command takes no relay URL; RELAY_URL is the only way to pick one.
+    expect(commandText('working session command')).toBe(
+      'RELAY_URL=https://relay-zeta.team.example claude --dangerously-load-development-channels plugin:zeta-relay@zeta-market',
+    )
+    expect(commandText('sign-in command')).toBe('/zeta-relay:login')
+    expect(steps()).toHaveTextContent(/RELAY_URL points it at your team's relay/)
   })
 
   it('says in step 3 what the answering session may read (M4 §4)', async () => {
@@ -216,6 +221,8 @@ describe('join panel: the steps (M5 §1)', () => {
     await screen.findByText('Install the plugin')
     expect(command('marketplace command')).toBeNull()
     expect(commandText('sign-in command')).toBe('/zeta-relay:login')
+    expect(commandText('working session command')).toBe('claude --dangerously-load-development-channels plugin:zeta-relay@zeta-market')
+    expect(steps()).not.toHaveTextContent(/\$\(id\)/)
   })
 
   it('tells an owner how to invite someone (M6 §4)', async () => {

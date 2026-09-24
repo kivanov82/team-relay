@@ -191,6 +191,12 @@ function Steps({ owner }: { owner: boolean }) {
           <Note>
             Claude Code {MIN_CLAUDE_CODE} or newer and Node.js {MIN_NODE} or newer. It asks once for consent to load the
             channel.
+            {c.namesRelay ? (
+              <>
+                {' '}
+                <Code>RELAY_URL</Code> points it at your team&apos;s relay; keep it there each time you start Claude Code.
+              </>
+            ) : null}
           </Note>
         </Step>
 
