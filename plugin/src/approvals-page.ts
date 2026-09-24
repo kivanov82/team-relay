@@ -15,7 +15,7 @@ import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { type ApprovalQueue } from './approvals.js';
-import { choicesFor, draftFits } from './approvals-review.js';
+import { choicesFor, draftBody, draftFits, showable, visibleEscapes } from './approvals-review.js';
 import { neutraliseChannelTags } from './notify.js';
 
 const BODY_LIMIT = 4096;
@@ -98,13 +98,23 @@ export function pageItems(queue: ApprovalQueue, member: string): PageItem[] {
     let ask: string;
     let detail: string | null = null;
     let choices = choicesFor(item);
+    const politely = `"Decline politely" sends: "I couldn't answer this automatically; ${member} hasn't approved it."`;
     if (item.ask.type === 'permission') {
       ask = `Your automatic answerer wants to ${item.ask.action}. Allow lets it do this once, for this question only.`;
+    } else if (item.ask.type === 'run') {
+      ask = `This question waits for your approval before your automatic answerer works on it: ${item.ask.reason}. ${politely}`;
     } else {
-      ask = `The drafted answer waits because: ${item.ask.reasons.join('; ')}. "Decline politely" sends: "I couldn't answer this automatically; ${member} hasn't approved it."`;
-      detail = item.ask.data ? `${item.ask.text}\n\nData: ${JSON.stringify(item.ask.data, null, 2)}` : item.ask.text;
-      // The page shows the whole draft, so it can always be sent from here.
-      if (!draftFits(item)) choices = [{ const: 'send', title: 'Send this answer' }, ...choices];
+      ask = `The drafted answer waits because: ${item.ask.reasons.join('; ')}. ${politely}`;
+      const body = draftBody(item);
+      // M8-SPEC §7 item 8: the page shows the whole draft, so it can be sent from here, but only
+      // when it is shown exactly: a draft with characters that hide or reorder text is shown
+      // with them escaped, and cannot be sent.
+      if (showable(body)) {
+        detail = body;
+        if (!draftFits(item)) choices = [{ const: 'send', title: 'Send this answer' }, ...choices];
+      } else {
+        detail = `(Characters that cannot be shown as they are appear as \\u{…}; this draft cannot be sent from here.)\n\n${visibleEscapes(body)}`;
+      }
     }
     return { id: item.id, heading, teammate_text: teammate, ask, detail, choices, deadline: new Date(item.deadline).toISOString() };
   });

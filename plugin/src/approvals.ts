@@ -1,5 +1,6 @@
 // What waits for the member (M8-SPEC §3, §4): a tool use outside the automatic class (a read
-// outside the scope folder, a capability run) or a draft answer that must not ship on its own.
+// outside the scope folder, a capability run), a draft answer that must not ship on its own,
+// or (§7 item 5) a question past the volume limits, which waits for approval to be answered.
 // Nothing here decides anything: an item is decided only by the member, through the
 // elicitation dialog or the local approvals page (approvals-review.ts, approvals-page.ts), or
 // it lapses. An item lapses when its question's answer deadline passes or after 30 minutes,
@@ -36,20 +37,34 @@ export type DraftAsk = {
   reasons: string[];
 };
 
+/** M8-SPEC §7 item 5: a question beyond the volume limits waits for approval to run at all. */
+export type RunAsk = {
+  type: 'run';
+  /** Which limit it is past (fixed text with counts, no teammate text). */
+  reason: string;
+};
+
 export type PermissionDecision = 'allow' | 'deny';
 export type DraftDecision = 'send' | 'dont_send' | 'decline';
+export type RunDecision = 'allow' | 'deny' | 'decline';
 export type Outcome<D extends string> = D | 'lapsed' | 'cancelled';
 
 export type Pending = {
   id: string;
   ctx: ItemContext;
-  ask: PermissionAsk | DraftAsk;
+  ask: PermissionAsk | DraftAsk | RunAsk;
   created_at: number;
   deadline: number;
 };
 
 export const PERMISSION_DECISIONS: readonly PermissionDecision[] = ['allow', 'deny'];
 export const DRAFT_DECISIONS: readonly DraftDecision[] = ['send', 'dont_send', 'decline'];
+export const RUN_DECISIONS: readonly RunDecision[] = ['allow', 'deny', 'decline'];
+
+/** The decisions an item of this kind takes. */
+export function decisionsFor(ask: Pending['ask']): readonly string[] {
+  return ask.type === 'permission' ? PERMISSION_DECISIONS : ask.type === 'run' ? RUN_DECISIONS : DRAFT_DECISIONS;
+}
 
 type Entry = Pending & { settle: (outcome: string) => void; timer: NodeJS.Timeout };
 
@@ -85,7 +100,8 @@ export class ApprovalQueue {
 
   add(ctx: ItemContext, ask: PermissionAsk, answerDeadline: number): { id: string; outcome: Promise<Outcome<PermissionDecision>> };
   add(ctx: ItemContext, ask: DraftAsk, answerDeadline: number): { id: string; outcome: Promise<Outcome<DraftDecision>> };
-  add(ctx: ItemContext, ask: PermissionAsk | DraftAsk, answerDeadline: number): { id: string; outcome: Promise<string> } {
+  add(ctx: ItemContext, ask: RunAsk, answerDeadline: number): { id: string; outcome: Promise<Outcome<RunDecision>> };
+  add(ctx: ItemContext, ask: PermissionAsk | DraftAsk | RunAsk, answerDeadline: number): { id: string; outcome: Promise<string> } {
     const id = `ap_${randomBytes(8).toString('hex')}`;
     const deadline = this.deadlineFor(answerDeadline);
     let settle!: (outcome: string) => void;
@@ -136,8 +152,7 @@ export class ApprovalQueue {
   decide(id: string, decision: string): boolean {
     const e = this.items.get(id);
     if (!e) return false;
-    const allowed: readonly string[] = e.ask.type === 'permission' ? PERMISSION_DECISIONS : DRAFT_DECISIONS;
-    if (!allowed.includes(decision)) return false;
+    if (!decisionsFor(e.ask).includes(decision)) return false;
     if (this.now() >= e.deadline) {
       this.finish(id, 'lapsed');
       return false;

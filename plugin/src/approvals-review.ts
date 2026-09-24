@@ -13,8 +13,10 @@
 import { neutraliseChannelTags } from './notify.js';
 import { type ApprovalQueue, type Pending } from './approvals.js';
 
-/** The longest draft (text plus data as JSON) shown whole in a dialog; longer ones cannot be sent from it. */
+/** The longest draft shown whole in a dialog (measured as shown, quote marks included); longer ones cannot be sent from it. */
 export const DIALOG_DRAFT_LIMIT = 8000;
+/** How much of a draft that cannot be sent from the dialog is shown. */
+const DRAFT_PREVIEW_LIMIT = 1500;
 const QUESTION_LIMIT = 2000;
 
 export type ElicitParams = {
@@ -41,22 +43,57 @@ function clip(text: string, limit: number): string {
   return text.length <= limit ? text : `${text.slice(0, limit)} …[${text.length - limit} more characters not shown]`;
 }
 
-/** The teammate's text as the dialog quotes it: tags neutralised, clipped, each line quoted. */
-export function quoteTeammate(text: string, limit = QUESTION_LIMIT): string {
-  return clip(neutraliseChannelTags(text), limit)
+function quoteLines(text: string): string {
+  return text
     .split('\n')
     .map((l) => `> ${l}`)
     .join('\n');
 }
 
-function draftBody(item: Pending): string {
+/** The teammate's text as the dialog quotes it: tags neutralised, clipped, each line quoted. */
+export function quoteTeammate(text: string, limit = QUESTION_LIMIT): string {
+  return quoteLines(clip(neutraliseChannelTags(text), limit));
+}
+
+/** Exactly what would be sent: the text, and the data as JSON after it. */
+export function draftBody(item: Pending): string {
   if (item.ask.type !== 'draft') return '';
   return item.ask.data ? `${item.ask.text}\n\nData: ${JSON.stringify(item.ask.data, null, 2)}` : item.ask.text;
 }
 
-/** Whether a draft is short enough to be shown whole, and so sent, from the dialog. */
+/**
+ * Characters a dialog or a page cannot show as they are: controls (bar newline and tab),
+ * direction overrides and invisible characters. A draft holding one cannot be shown exactly,
+ * so it cannot be sent from where it is shown.
+ */
+const UNSHOWABLE = /[\u0000-\u0008\u000B-\u001F\u007F-\u009F\u00AD\u061C\u200B-\u200F\u2028-\u202E\u2060-\u206F\uFEFF\uFFF9-\uFFFB]/u;
+const UNSHOWABLE_ALL = /[\u0000-\u0008\u000B-\u001F\u007F-\u009F\u00AD\u061C\u200B-\u200F\u2028-\u202E\u2060-\u206F\uFEFF\uFFF9-\uFFFB]/gu;
+
+/** Whether the text can be shown exactly as it is (no character that hides or reorders text, no channel tag to neutralise). */
+export function showable(text: string): boolean {
+  return !UNSHOWABLE.test(text) && neutraliseChannelTags(text) === text;
+}
+
+/** A draft that cannot be shown exactly, made visible: every such character as \u{…}. */
+export function visibleEscapes(text: string): string {
+  return neutraliseChannelTags(text).replace(UNSHOWABLE_ALL, (c) => `\\u{${c.codePointAt(0)!.toString(16)}}`);
+}
+
+/**
+ * How the dialog shows a draft (M8-SPEC §7 item 8): the string measured is the string shown.
+ * `whole` is true only when that string is the entire draft, exactly, quote marks aside;
+ * only then is Send offered.
+ */
+export function shownDraft(item: Pending): { shown: string; whole: boolean } {
+  const body = draftBody(item);
+  const full = quoteLines(body);
+  if (showable(body) && full.length <= DIALOG_DRAFT_LIMIT) return { shown: full, whole: true };
+  return { shown: quoteLines(clip(visibleEscapes(body), DRAFT_PREVIEW_LIMIT)), whole: false };
+}
+
+/** Whether a draft is shown whole and exactly, and so can be sent, from the dialog. */
 export function draftFits(item: Pending): boolean {
-  return draftBody(item).length <= DIALOG_DRAFT_LIMIT;
+  return shownDraft(item).whole;
 }
 
 type Choice = { const: string; title: string };
@@ -66,6 +103,13 @@ export function choicesFor(item: Pending): Choice[] {
     return [
       { const: 'allow', title: 'Allow (this once, for this question)' },
       { const: 'deny', title: 'Deny' },
+    ];
+  }
+  if (item.ask.type === 'run') {
+    return [
+      { const: 'allow', title: 'Answer it automatically (the answer may still wait for you)' },
+      { const: 'deny', title: "Don't answer (nothing is sent)" },
+      { const: 'decline', title: 'Decline politely (say I did not approve it)' },
     ];
   }
   const out: Choice[] = [];
@@ -84,20 +128,30 @@ export function elicitationFor(item: Pending, index: number, total: number, memb
     lines.push(`${ctx.asker} asked (teammate text, as they wrote it):`, quoteTeammate(ctx.question));
   }
   lines.push('');
+  const politely = `"Decline politely" sends: "I couldn't answer this automatically; ${member} hasn't approved it."`;
   if (item.ask.type === 'permission') {
     lines.push(`Your automatic answerer wants to ${item.ask.action}.`, 'Allow lets it do this once, for this question only.');
+  } else if (item.ask.type === 'run') {
+    lines.push(
+      `This question waits for your approval before your automatic answerer works on it: ${item.ask.reason}.`,
+      'Answering it automatically follows the usual rules: what it reads outside the folder, and its answer when needed, still wait for you.',
+      '',
+      politely,
+    );
   } else {
     lines.push(`The answer your automatic answerer drafted waits for you because: ${item.ask.reasons.join('; ')}.`, '');
-    if (draftFits(item)) {
-      lines.push('The draft, exactly as it would be sent:', quoteTeammate(draftBody(item), DIALOG_DRAFT_LIMIT));
+    const { shown, whole } = shownDraft(item);
+    if (whole) {
+      lines.push('The draft, exactly as it would be sent (each line marked with "> "; the marks are not sent):', shown);
     } else {
       lines.push(
-        `The draft is too long to show here in full (${draftBody(item).length} characters), so it cannot be sent from this dialog.`,
-        'Its beginning:',
-        quoteTeammate(draftBody(item), 1500),
+        showable(draftBody(item))
+          ? `The draft is too long to show here in full (${draftBody(item).length} characters), so it cannot be sent from this dialog. Its beginning:`
+          : 'The draft holds characters that cannot be shown here as they are (shown below as \\u{…}), so it cannot be sent from this dialog. Its beginning:',
+        shown,
       );
     }
-    lines.push('', `"Decline politely" sends: "I couldn't answer this automatically; ${member} hasn't approved it."`);
+    lines.push('', politely);
   }
   lines.push('', 'Decline or Esc: decide later (it is denied if you have not decided by its deadline).');
   return {
