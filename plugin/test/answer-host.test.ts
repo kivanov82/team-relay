@@ -6,7 +6,7 @@
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { execFile } from 'node:child_process';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, symlinkSync, writeFileSync } from 'node:fs';
 import { request } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -201,7 +201,9 @@ describe('what waits for the member (M8-SPEC §3, §4)', () => {
     const first = await s.call('review_approvals');
     expect(first.json.message).toMatch(/^Reviewed 1: 1 allowed\./);
     expect(s.elicited[0]).toContain('alice asked (teammate text, as they wrote it):');
-    expect(s.elicited[0]).toContain('Your automatic answerer wants to read the file /etc/hosts.');
+    // §7 item 6: where the path really leads (on macOS /etc is a link to /private/etc).
+    const hosts = realpathSync('/etc/hosts');
+    expect(s.elicited[0]).toContain(`Your automatic answerer wants to read the file ${hosts === '/etc/hosts' ? hosts : `/etc/hosts → ${hosts}`}.`);
     // The stub was allowed, read, and replied: that draft waits, since an approval was needed.
     await waitFor(() => waitingNotes(s).length === 2, 15_000, 'the draft notice');
     expect(replyTo(id)).toBeUndefined();
@@ -222,7 +224,8 @@ describe('what waits for the member (M8-SPEC §3, §4)', () => {
     expect(replyTo(id)).toBeUndefined();
     const r = await s.call('review_approvals');
     expect(r.json.message).toBe('Reviewed 1: 1 declined politely. Nothing else is waiting.');
-    expect(s.elicited[0]).toContain('the answerer flagged it ("customer data")');
+    // §7 item 9: the answerer's reason, labelled as its own words.
+    expect(s.elicited[0]).toContain(`the answerer flagged it (in the answerer's own words: "customer data")`);
     await waitFor(() => replyTo(id), 5000, 'the polite decline');
     expect(replyTo(id)!.body.text).toBe("I couldn't answer this automatically; bob hasn't approved it.");
   });
@@ -243,7 +246,7 @@ describe('what waits for the member (M8-SPEC §3, §4)', () => {
     const id = ask(script([{ request_approval: 'not sure' }, { reply: { text: 'Probably Tuesday.' } }]));
     await waitFor(() => waitingNotes(s).length === 1, 15_000, 'the approval notice');
     await s.call('review_approvals');
-    expect(s.elicited[0]).toContain('the answerer asked for your approval ("not sure")');
+    expect(s.elicited[0]).toContain(`the answerer asked for your approval (in the answerer's own words: "not sure")`);
     await waitFor(() => replyTo(id), 5000, 'the answer');
   });
 
@@ -308,6 +311,114 @@ describe('what waits for the member (M8-SPEC §3, §4)', () => {
     expect((await s.call('whoami')).json).toMatchObject({ approvals_pending: 0 });
     expect(relay.toolEvents.filter((e) => e.request_id === id).map((e) => (e.body as { tool: string; status: string }).status)).toEqual(
       expect.arrayContaining(['waiting', 'error']),
+    );
+  });
+});
+
+describe('the read trail (M8-SPEC §7 item 1)', () => {
+  it('an answer after reading an ordinary file in the folder ships on its own; the hook reported the read', async () => {
+    const s = await session();
+    const id = ask(script([{ read: { tool_name: 'Read', input: { file_path: join(proj, 'NOTES.md') } } }, { reply: { text: 'europe-west3' } }]));
+    await waitFor(() => replyTo(id), 15_000, 'the answer');
+    const r = record(id);
+    const hook = r.calls.find((c: any) => c.hook);
+    expect(hook).toMatchObject({ blocked: false, pre: [0] });
+    expect(waitingNotes(s)).toHaveLength(0);
+  });
+
+  it('an answer after reading a file whose name suggests secrets waits, whatever the answerer says', async () => {
+    writeFileSync(join(proj, 'secrets.yaml'), 'db: staging\n');
+    const s = await session({ decide: () => 'dont_send' });
+    const id = ask(script([{ read: { tool_name: 'Read', input: { file_path: join(proj, 'secrets.yaml') } } }, { reply: { text: 'The db is staging.' } }]));
+    await waitFor(() => waitingNotes(s).length === 1, 15_000, 'the approval notice');
+    expect(replyTo(id)).toBeUndefined();
+    await s.call('review_approvals');
+    expect(s.elicited[0]).toContain('it read files whose names suggest secrets (secrets.yaml)');
+  });
+
+  it('a search whose matches include such a file makes the answer wait too', async () => {
+    const s = await session({ decide: () => 'dont_send' });
+    const response = { mode: 'content', filenames: [], content: `${join(proj, 'infra', 'terraform.tfstate')}:12:  "password": "x"` };
+    const id = ask(script([{ read: { tool_name: 'Grep', input: { pattern: 'password', path: proj }, response } }, { reply: { text: 'Nothing interesting.' } }]));
+    await waitFor(() => waitingNotes(s).length === 1, 15_000, 'the approval notice');
+    await s.call('review_approvals');
+    expect(s.elicited[0]).toContain('it read files whose names suggest secrets (terraform.tfstate)');
+    expect(replyTo(id)).toBeUndefined();
+  });
+
+  it('a search whose result was never reported makes the answer wait (the trail fails closed)', async () => {
+    const s = await session({ decide: () => 'dont_send' });
+    const id = ask(script([{ read: { tool_name: 'Grep', input: { pattern: 'x', path: proj }, skip_post: true } }, { reply: { text: 'Nothing.' } }]));
+    await waitFor(() => waitingNotes(s).length === 1, 15_000, 'the approval notice');
+    await s.call('review_approvals');
+    expect(s.elicited[0]).toContain('what one of its searches read could not be recorded');
+    expect(replyTo(id)).toBeUndefined();
+  });
+
+  it('a search that failed, or matched only ordinary files, does not hold the answer', async () => {
+    await session();
+    const id = ask(
+      script([
+        { read: { tool_name: 'Grep', input: { pattern: 'x', path: proj }, fail: true } },
+        { read: { tool_name: 'Grep', input: { pattern: 'bucket', path: proj }, response: { mode: 'files_with_matches', filenames: [join(proj, 'NOTES.md')] } } },
+        { reply: { text: 'In NOTES.md.' } },
+      ]),
+    );
+    await waitFor(() => replyTo(id), 15_000, 'the answer');
+  });
+});
+
+describe('what the member is asked (M8-SPEC §7 items 6, 7)', () => {
+  it('a path that resolves elsewhere is shown with where it really leads', async () => {
+    const outside = join(tmp, 'outside');
+    mkdirSync(outside);
+    writeFileSync(join(outside, 'x.txt'), 'x\n');
+    symlinkSync(join(outside, 'x.txt'), join(proj, 'link'));
+    const s = await session({ decide: () => 'deny' });
+    const id = ask(script([{ permission: { tool_name: 'Read', input: { file_path: join(proj, 'link') } } }, { reply: { text: 'no' } }]));
+    await waitFor(() => waitingNotes(s).length === 1, 15_000, 'the approval notice');
+    await s.call('review_approvals');
+    expect(s.elicited[0]).toContain(`Your automatic answerer wants to read the file ${join(proj, 'link')} → ${join(outside, 'x.txt')}.`);
+    await waitFor(() => record(id).calls.some((c: any) => c.tool === 'reply'), 15_000, 'the reply');
+  });
+
+  it('a Glob or Grep glob with a fixed prefix on the deny list is denied without asking', async () => {
+    const home = process.env.HOME ?? '/home/u';
+    const s = await session();
+    const id = ask(
+      script([
+        { permission: { tool_name: 'Glob', input: { pattern: join(home, '.ssh', '*') } } },
+        { permission: { tool_name: 'Glob', input: { pattern: '~/.aws/**' } } },
+        { permission: { tool_name: 'Glob', input: { pattern: '.kube/*', path: home } } },
+        { permission: { tool_name: 'Glob', input: { pattern: '/srv/app/**/*.pem' } } },
+        { permission: { tool_name: 'Grep', input: { pattern: 'x', path: '/srv', glob: join(home, '.config', 'gcloud', '**') } } },
+        { reply: { text: 'none' } },
+      ]),
+    );
+    await waitFor(() => existsSync(join(tmp, 'stub-claude', `${id}.json`)) && record(id).calls.some((c: any) => c.tool === 'reply'), 15_000, 'the reply');
+    const denials = record(id).calls.filter((c: any) => c.tool === 'permission').map((c: any) => JSON.parse(c.text));
+    expect(denials.map((d: any) => d.behavior)).toEqual(['deny', 'deny', 'deny', 'deny', 'deny']);
+    for (const d of denials) expect(d.message).toMatch(/never readable/);
+    expect(s.elicited).toHaveLength(0);
+  });
+});
+
+describe('taking over answering (M8-SPEC §7 item 4)', () => {
+  it('is announced in the working session', async () => {
+    const s = await session();
+    await waitFor(() => s.notes.find((n) => n.content.includes('now answers teammates automatically')), 5000, 'the announcement');
+    const note = s.notes.find((n) => n.content.includes('now answers teammates automatically'))!;
+    expect(note.meta).toEqual({ type: 'status' });
+    expect(note.content).toBe(`team-relay: This session now answers teammates automatically from ${proj}; reads inside it are automatic.`);
+  });
+
+  it('says so when reads are not automatic', async () => {
+    const plain = join(tmp, 'plain');
+    mkdirSync(plain);
+    const s = await session({ cwd: plain });
+    await waitFor(() => s.notes.find((n) => n.content.includes('now answers teammates automatically')), 5000, 'the announcement');
+    expect(s.notes.find((n) => n.content.includes('now answers teammates automatically'))!.content).toMatch(
+      /from .*\/plain; reads inside it are not automatic \(it is not inside a git work tree.*\): every read needs your approval\.$/,
     );
   });
 });

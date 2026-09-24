@@ -592,12 +592,14 @@ class AskerConnection {
     void this.watch().catch((err) => log(`connection watcher ended: ${describeError(err)}`));
   }
 
-  stop() {
+  /** Stops everything; resolves once the host has stopped (its shared folder withdrawn, M8-SPEC §7 item 12). */
+  stop(): Promise<void> {
     this.stopper.stop();
     this.live?.stopper.stop();
     this.pending?.cancel();
-    void this.host?.stop();
+    const host = this.host;
     this.host = null;
+    return host ? host.stop().catch(() => {}) : Promise.resolve();
   }
 
   answerHost(): AnswerHost | null {
@@ -1213,9 +1215,12 @@ async function main(): Promise<void> {
     if (stopper.stopped) return;
     stopper.stop();
     answeringLock?.release();
-    connection?.stop();
-    void server.close().finally(() => process.exit(0));
-    setTimeout(() => process.exit(0), 2000).unref();
+    // The host withdraws its shared folder at the relay as it stops (bounded: 1.5 s).
+    const stopped = connection?.stop() ?? Promise.resolve();
+    void Promise.race([stopped, new Promise((r) => setTimeout(r, 1600))])
+      .then(() => server.close())
+      .finally(() => process.exit(0));
+    setTimeout(() => process.exit(0), 2500).unref();
   };
   process.stdin.on('end', shutdown);
   process.stdin.on('close', shutdown);

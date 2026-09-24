@@ -21,7 +21,9 @@ const STDIN_LIMIT = 1024 * 1024;
 
 /** M8-SPEC §4: the host's notice when an answer waits for the member's approval. */
 export const APPROVAL_TEXT = 'Team relay: an answer is waiting for your approval';
-const TEXTS = [NOTICE_TEXT, APPROVAL_TEXT] as const;
+/** M8-SPEC §7 item 4: the host's notice when a session takes over answering. */
+export const TAKEOVER_TEXT = 'Team relay: this session now answers teammates automatically';
+const TEXTS = [NOTICE_TEXT, APPROVAL_TEXT, TAKEOVER_TEXT] as const;
 export type NoticeText = (typeof TEXTS)[number];
 
 /**

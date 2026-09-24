@@ -1,18 +1,25 @@
-// The host (M8-SPEC §1–§5): the channel server of a channel working session answers the
+// The host (M8-SPEC §1–§5, §7): the channel server of a channel working session answers the
 // member's teammates on its own, within the folder the session works in.
 //
 // - It holds the machine's answering lock (answering-lock.ts); only then does it read the
-//   `inbox` stream. Without the lock it retries every 30 s and answers nothing.
+//   `inbox` stream. Without the lock it retries every 30 s and answers nothing. Taking over is
+//   announced in the working session and by a desktop notification (§7 item 4).
 // - For each question or capability call: ack at the relay at once, then (one at a time) run
 //   a locked-down headless Claude in the scope folder (headless.ts) that finishes with the
 //   host's `reply` tool, over a private socket (host-socket.ts, answer-tools.ts).
 // - What ships on its own and what waits for the member is decided here, deterministically
 //   (§3): reads outside the folder and every capability tool wait (the permission tool); a
-//   draft ships only when the answerer did not flag it, the secret screen passes it and no
-//   approval was needed during the run. Everything else waits in the ApprovalQueue, which
-//   only the member's dialog or page decides, and which denies on timeout.
+//   draft ships only when the answerer did not flag it, the secret screen passes it, no file
+//   it read has a name that suggests secrets and every search it made was recorded (the read
+//   trail, §7 item 1), and no approval was needed during the run. Everything else waits in
+//   the ApprovalQueue, which only the member's dialog or page decides, and which denies on
+//   timeout. Past the volume limits (§7 item 5) a question waits for approval to run at all.
 // - The member is told in the working session (a status event), by a desktop notification
-//   (fixed text), and the asker's console by a `waiting` tool event.
+//   (fixed text), and the asker's console by a `waiting` tool event; grouped (§7 item 5).
+// - Nothing is lost on stop (§7 item 12): the inbox cursor moves past a question only once it
+//   is fully handled (answered, declined or lapsed), so one in flight when the session closes
+//   is received again by the next host, which skips it if the relay says it is answered. The
+//   shared folder is withdrawn when the host stops.
 //
 // Teammate text is data throughout: it reaches the answerer only inside a nonce-framed block
 // of its prompt, and the working session only quoted and neutralised in a status event.
@@ -45,7 +52,8 @@ import {
 import { HostSocket, newToken } from './host-socket.js';
 import { codePointLength, hasLoneSurrogate, loadManifest, validateManifest } from './manifest.js';
 import { envelopeToNotification, neutraliseChannelTags, RecentIds } from './notify.js';
-import { APPROVAL_TEXT, notifyCommand } from './notify-desktop.js';
+import { APPROVAL_TEXT, TAKEOVER_TEXT, notifyCommand, type NoticeText } from './notify-desktop.js';
+import { sensitiveName } from './read-trail-core.js';
 import { RelayError, type AuthMode, type Envelope, type Me, type RelayClient, backoffDelay } from './relay-client.js';
 import { relayCredentialDirs, scopeFolder, type Scope } from './scope.js';
 import { screenDraft } from './secret-screen.js';
@@ -56,6 +64,16 @@ export const POLITE_DECLINE = (member: string) => `I couldn't answer this automa
 const REPLY_DATA_LIMIT = 64 * 1024;
 const LOCK_RETRY_MS = 30_000;
 const QUOTE_LIMIT = 200;
+
+/** M8-SPEC §7 item 5: at most this many questions from one asker wait to be answered automatically. */
+export const MAX_QUEUED_PER_ASKER = 3;
+/** M8-SPEC §7 item 5: at most this many automatic runs in any hour. */
+export const MAX_RUNS_PER_HOUR = 20;
+const HOUR_MS = 3_600_000;
+/** M8-SPEC §7 item 5: at most one desktop notification, and one push quoting a teammate, per this long. */
+export const NOTICE_GAP_MS = 5 * 60_000;
+/** How long stopping waits for the shared folder to be withdrawn at the relay. */
+const WITHDRAW_MS = 1500;
 
 /** How the relay is reached, so the answerer's own servers can reach it the same way. */
 export type HostConnection = {
@@ -85,9 +103,12 @@ export type HostOptions = {
   stateFile?: string;
   lockRetryMs?: number;
   /** Desktop notification (fixed text); default: osascript / notify-send. */
-  notify?: () => void;
+  notify?: (text: NoticeText) => void;
   /** Opens the fallback page; default: the redirect-file opener. */
   openPage?: (url: string) => void;
+  /** The volume limits and the notice gap (tests make them small). */
+  limits?: { perAsker?: number; perHour?: number; noticeGapMs?: number };
+  now?: () => number;
 };
 
 export type HostStatus = {
@@ -108,44 +129,82 @@ function singleLine(text: string, limit: number): string {
   return flat.length <= limit ? flat : `${flat.slice(0, limit)}…`;
 }
 
+/** One question or capability call from the inbox, until it is fully handled. */
+type Job = {
+  item: WorkItem;
+  /** Its inbox seq: the cursor moves past it only once it is fully handled. */
+  seq: number;
+  /** The member allowed it to run past the volume limits. */
+  approved: boolean;
+};
+
 type Run = {
+  job: Job;
   item: WorkItem;
   replied: boolean;
+  /** The reply went into the approval queue: the job is handled when that settles. */
+  drafted: boolean;
   approvalNeeded: boolean;
   approvalRequested: string | null;
   waiting: number;
   cwd: string;
   denyDirs: string[];
+  /** The read trail (§7 item 1): files read or searched with names that suggest secrets. */
+  sensitiveReads: Set<string>;
+  /** Searches reported before they ran whose results have not been reported yet. */
+  openSearches: Set<string>;
 };
 
 export class AnswerHost {
-  readonly queue = new ApprovalQueue();
+  readonly queue: ApprovalQueue;
   private readonly env: NodeJS.ProcessEnv;
   private readonly scope: Scope;
   private readonly dist: string;
   private readonly node: string;
   private readonly lockFile: string;
   private readonly stateFile: string;
+  private readonly now: () => number;
+  private readonly perAsker: number;
+  private readonly perHour: number;
+  private readonly noticeGapMs: number;
   private readonly controller = new AbortController();
   private lock: Acquired | null = null;
   private holder: LockInfo | null = null;
   private socket: HostSocket | null = null;
   private page: ApprovalsPage | null = null;
-  private work: WorkItem[] = [];
+  private work: Job[] = [];
   private working = false;
   private current: Run | null = null;
   private reviewing = false;
   private claudeMissing = false;
   private readonly recent = new RecentIds(500);
   private whyNot: string | null = 'starting';
+  /** When each automatic run started, for the hourly limit. */
+  private runStarts: number[] = [];
+  private lastDesktop = Number.NEGATIVE_INFINITY;
+  private lastQuoted = Number.NEGATIVE_INFINITY;
+  /** Whether a folder was published as shared, so stopping withdraws it. */
+  private sharing = false;
+  // The inbox cursor (§7 item 12).
+  private readAfter: number | undefined = undefined;
+  private readonly open = new Set<number>();
+  private maxSeen = 0;
+  private cursorWanted = 0;
+  private cursorPosted = 0;
+  private cursorChain: Promise<void> = Promise.resolve();
 
   constructor(private readonly o: HostOptions) {
     this.env = o.env;
+    this.now = o.now ?? Date.now;
+    this.queue = new ApprovalQueue({ now: this.now });
     this.scope = scopeFolder(o.cwd ?? process.cwd(), o.env);
     this.dist = o.distDir ?? ownDist();
     this.node = o.node ?? process.execPath;
     this.lockFile = o.lockFile ?? lockPath(o.env);
     this.stateFile = o.stateFile ?? statePath(o.env);
+    this.perAsker = o.limits?.perAsker ?? MAX_QUEUED_PER_ASKER;
+    this.perHour = o.limits?.perHour ?? MAX_RUNS_PER_HOUR;
+    this.noticeGapMs = o.limits?.noticeGapMs ?? NOTICE_GAP_MS;
     this.queue.onChange((e) => this.onQueueChange(e.type, e.item, e.outcome));
   }
 
@@ -220,14 +279,28 @@ export class AnswerHost {
       return;
     }
     this.writeState();
-    await this.publish(this.scope.qualifies && this.scope.share ? [this.scope.share] : []);
+    this.announce();
+    const shares = this.scope.qualifies && this.scope.share ? [this.scope.share] : [];
+    this.sharing = shares.length > 0;
+    await this.publish(shares, { attempts: 2, signal: this.controller.signal });
     this.o.log(`answering automatically in ${this.scope.path}${this.scope.qualifies ? '' : ' (no automatic reads)'}`);
     await this.inboxLoop();
+  }
+
+  /** §7 item 4: taking over answering is said in the working session and on the desktop. */
+  private announce(): void {
+    const reads = this.scope.qualifies
+      ? 'reads inside it are automatic.'
+      : `reads inside it are not automatic (${this.scope.reason}): every read needs your approval.`;
+    void Promise.resolve(this.o.push(`team-relay: This session now answers teammates automatically from ${this.scope.path}; ${reads}`)).catch(() => {});
+    this.notifyDesktop(TAKEOVER_TEXT);
   }
 
   async stop(): Promise<void> {
     if (this.stopped) return;
     this.controller.abort();
+    // Whatever waits is withdrawn, not decided: the questions it belongs to are received again
+    // by the next host, because the cursor never moved past them.
     this.queue.cancelAll();
     await this.page?.stop().catch(() => {});
     this.page = null;
@@ -238,8 +311,14 @@ export class AnswerHost {
     } catch {
       // nothing to clear
     }
+    const held = this.lock !== null;
     this.lock?.release();
     this.lock = null;
+    // §7 item 12: the shared folder is withdrawn (the manifest re-published without it).
+    if (held && this.sharing) {
+      this.sharing = false;
+      await this.publish([], { attempts: 1, timeoutMs: WITHDRAW_MS, signal: AbortSignal.timeout(WITHDRAW_MS) });
+    }
   }
 
   private sleep(ms: number): Promise<void> {
@@ -257,34 +336,50 @@ export class AnswerHost {
   }
 
   /** M4-SPEC §3 / M8-SPEC §1: the capabilities this member runs, and the folder it shares. */
-  private async publish(shares: string[]): Promise<void> {
+  private async publish(shares: string[], opts: { attempts: number; timeoutMs?: number; signal: AbortSignal }): Promise<void> {
     try {
       const manifest = loadManifest(this.env.MANIFEST_PATH || defaultManifestPath());
       const { exposed } = exposedCapabilities(manifest, this.env);
       const payload = validateManifest(discoveryPayload(exposed, shares.map((name) => ({ name }))));
-      const res = await this.o.client.publishManifest(this.o.me.member, payload, { attempts: 2, signal: this.controller.signal });
+      const res = await this.o.client.publishManifest(this.o.me.member, payload, opts);
       this.o.log(`published capabilities: ${res.capabilities.join(', ') || '(none)'}; shared folder: ${shares.join(', ') || '(none)'}`);
     } catch (err) {
-      if (!this.stopped) this.o.log(`the capability manifest was not published (${describeError(err)})`);
+      if (!opts.signal.aborted || shares.length === 0) this.o.log(`the capability manifest was not published (${describeError(err)})`);
     }
   }
 
-  // -- the inbox --------------------------------------------------------------------------------
+  // -- the inbox and its cursor (§7 item 12) -----------------------------------------------------
 
   private async inboxLoop(): Promise<void> {
     let failures = 0;
     const { client } = this.o;
     while (!this.stopped) {
-      const started = Date.now();
+      const started = this.now();
       try {
-        const page = await client.readStream('inbox', { wait: 25, limit: 50 }, { attempts: 1, signal: this.controller.signal });
+        const q = { wait: 25, limit: 50, ...(this.readAfter !== undefined ? { after: this.readAfter } : {}) };
+        const page = await client.readStream('inbox', q, { attempts: 1, signal: this.controller.signal });
         failures = 0;
+        if (this.readAfter === undefined) {
+          // The first read starts at the stored cursor: everything at or before it is handled.
+          this.readAfter = page.cursor;
+          this.cursorWanted = this.cursorPosted = page.cursor;
+        }
         for (const envelope of page.messages) {
           if (this.stopped) return;
-          await this.accept(envelope);
-          await client.ackCursor('inbox', envelope.seq, { attempts: 1, signal: this.controller.signal });
+          const seq = envelope.seq;
+          const tracked = Number.isSafeInteger(seq) && seq > (this.readAfter ?? 0);
+          if (tracked) {
+            this.open.add(seq);
+            this.maxSeen = Math.max(this.maxSeen, seq);
+          }
+          const kept = await this.accept(envelope, seq);
+          // Only after it is accepted: an envelope whose acknowledgement failed is read again.
+          if (tracked) {
+            this.readAfter = seq;
+            if (!kept) this.handled(seq);
+          }
         }
-        if (page.messages.length === 0 && Date.now() - started < 1000) await this.sleep(1000);
+        if (page.messages.length === 0 && this.now() - started < 1000) await this.sleep(1000);
       } catch (err) {
         if (this.stopped) return;
         if (err instanceof RelayError && err.status === 401) {
@@ -298,14 +393,44 @@ export class AnswerHost {
     }
   }
 
-  /** One inbox envelope: acknowledged at the relay at once, then queued for an answerer. */
-  private async accept(envelope: Envelope): Promise<void> {
+  /**
+   * A question is fully handled: the cursor may move past it, and past every later one that is
+   * handled too, but never past one still open.
+   */
+  private handled(seq: number): void {
+    if (this.stopped) return;
+    this.open.delete(seq);
+    let target = this.maxSeen;
+    for (const s of this.open) target = Math.min(target, s - 1);
+    if (target <= this.cursorWanted) return;
+    this.cursorWanted = target;
+    this.cursorChain = this.cursorChain.then(() => this.postCursor());
+  }
+
+  private async postCursor(): Promise<void> {
+    const want = this.cursorWanted;
+    if (this.stopped || want <= this.cursorPosted) return;
+    try {
+      await this.o.client.ackCursor('inbox', want, { attempts: 2, signal: this.controller.signal });
+      this.cursorPosted = Math.max(this.cursorPosted, want);
+    } catch (err) {
+      if (!this.stopped) this.o.log(`the inbox cursor was not moved (${describeError(err)}); it moves with the next handled question`);
+      // Asked again next time: the wanted position stays ahead of the posted one.
+      this.cursorWanted = this.cursorPosted;
+    }
+  }
+
+  /**
+   * One inbox envelope: acknowledged at the relay at once, then queued for an answerer.
+   * Returns whether a job was kept for it (false: nothing more to do, it is handled).
+   */
+  private async accept(envelope: Envelope, seq: number): Promise<boolean> {
     const { client, me } = this.o;
-    if (this.recent.has(envelope.id)) return;
+    if (this.recent.has(envelope.id)) return false;
     const n = envelopeToNotification(envelope, { stream: 'inbox', team: me.team, member: me.member });
     if ('reject' in n) {
       this.o.log(`skipped inbox seq ${String(envelope.seq)}: ${n.reject}`);
-      return;
+      return false;
     }
     let ack: Record<string, unknown>;
     try {
@@ -314,15 +439,19 @@ export class AnswerHost {
       if (err instanceof RelayError && [404, 409, 410].includes(err.status)) {
         this.recent.add(envelope.id);
         this.o.log(`${envelope.request_id} can no longer be answered (${err.status}); skipped`);
-        return;
+        return false;
       }
       throw err;
     }
     this.recent.add(envelope.id);
-    if (ack.status === 'answered') return;
+    // Received again after a stop, and answered meanwhile (or by the host before): skipped.
+    if (ack.status === 'answered') {
+      this.o.log(`${envelope.request_id} is already answered; skipped`);
+      return false;
+    }
     const data = envelope.data ?? {};
     const deadline =
-      deadlineOf(ack.answer_deadline) ?? deadlineOf(data.answer_deadline) ?? new Date(Date.now() + 86_400_000).toISOString();
+      deadlineOf(ack.answer_deadline) ?? deadlineOf(data.answer_deadline) ?? new Date(this.now() + 86_400_000).toISOString();
     const item: WorkItem = {
       request_id: envelope.request_id,
       from: envelope.from,
@@ -333,8 +462,21 @@ export class AnswerHost {
         ? { capability: { name: String(data.capability), params: isPlainObject(data.params) ? data.params : {} } }
         : {}),
     };
-    this.work.push(item);
+    const job: Job = { item, seq, approved: false };
+    // §7 item 5: at most this many questions from one asker wait to be answered automatically.
+    const queued = this.work.filter((j) => j.item.from === item.from).length;
+    if (queued >= this.perAsker) {
+      this.askToRun(job, `${item.from} already has ${queued} questions waiting to be answered automatically (at most ${this.perAsker})`);
+      return true;
+    }
+    this.work.push(job);
     void this.drain();
+    return true;
+  }
+
+  /** The job is over: the cursor may pass it (unless the host is stopping, when it is received again). */
+  private finish(job: Job): void {
+    if (Number.isSafeInteger(job.seq)) this.handled(job.seq);
   }
 
   private async drain(): Promise<void> {
@@ -342,21 +484,60 @@ export class AnswerHost {
     this.working = true;
     try {
       while (!this.stopped) {
-        const item = this.work.shift();
-        if (!item) break;
-        if (Date.now() >= item.answer_deadline) {
+        const job = this.work.shift();
+        if (!job) break;
+        const item = job.item;
+        if (this.now() >= item.answer_deadline) {
           this.o.log(`${item.request_id} passed its answer deadline before it could be answered`);
+          this.finish(job);
           continue;
         }
+        if (!job.approved) {
+          // §7 item 5: at most this many automatic runs in any hour.
+          const since = this.now() - HOUR_MS;
+          this.runStarts = this.runStarts.filter((t) => t > since);
+          if (this.runStarts.length >= this.perHour) {
+            this.askToRun(job, `${this.runStarts.length} questions were answered automatically in the last hour (at most ${this.perHour})`);
+            continue;
+          }
+          this.runStarts.push(this.now());
+        }
         try {
-          await this.answer(item);
+          await this.answer(job);
         } catch (err) {
           this.o.log(`answering ${item.request_id} failed: ${describeError(err)}`);
+          this.finish(job);
         }
       }
     } finally {
       this.working = false;
     }
+  }
+
+  /** §7 item 5: past a volume limit, a question waits for the member's approval to run at all. */
+  private askToRun(job: Job, reason: string): void {
+    const { outcome } = this.queue.add(this.ctxOf(job.item), { type: 'run', reason }, job.item.answer_deadline);
+    void outcome.then(async (o) => {
+      if (o === 'cancelled') return; // the host is stopping: received again by the next one
+      if (o === 'allow') {
+        job.approved = true;
+        this.work.push(job);
+        void this.drain();
+        return;
+      }
+      if (o === 'decline') {
+        try {
+          await this.sendReply(job.item.request_id, POLITE_DECLINE(this.o.me.member), null);
+          this.o.log(`declined ${job.item.request_id} politely`);
+        } catch (err) {
+          this.o.log(`the answer to ${job.item.request_id} could not be sent (${describeError(err)})`);
+        }
+      } else {
+        this.o.log(`nothing sent for ${job.item.request_id} (${o})`);
+      }
+      this.toolEvent(job.item.request_id, 'approval', 'error');
+      this.finish(job);
+    });
   }
 
   // -- one answerer run -------------------------------------------------------------------------
@@ -366,7 +547,8 @@ export class AnswerHost {
     return b && isAbsolute(b) ? b : 'claude';
   }
 
-  private async answer(item: WorkItem): Promise<void> {
+  private async answer(job: Job): Promise<void> {
+    const item = job.item;
     const socket = this.socket;
     if (!socket) return;
     const runDir = mkdtempSync(join(socket.dir, 'run-'));
@@ -392,7 +574,19 @@ export class AnswerHost {
     const active = new ActiveRequests(plan.stateDir, (err) => this.o.log(`open request not recorded: ${describeError(err)}`));
     await active.add(item.request_id, new Date(item.answer_deadline).toISOString());
 
-    const run: Run = { item, replied: false, approvalNeeded: false, approvalRequested: null, waiting: 0, cwd: plan.cwd, denyDirs: plan.denyDirs };
+    const run: Run = {
+      job,
+      item,
+      replied: false,
+      drafted: false,
+      approvalNeeded: false,
+      approvalRequested: null,
+      waiting: 0,
+      cwd: plan.cwd,
+      denyDirs: plan.denyDirs,
+      sensitiveReads: new Set(),
+      openSearches: new Set(),
+    };
     this.current = run;
     socket.setRun(plan.token, (method, params) => this.onCall(run, method, params));
     try {
@@ -425,6 +619,8 @@ export class AnswerHost {
       // Whatever the run still waited for is withdrawn: it can no longer be used.
       this.queue.cancelWhere((p) => p.ctx.request_id === item.request_id && p.ask.type === 'permission');
       rmSync(runDir, { recursive: true, force: true });
+      // A drafted reply is handled when the member's decision settles; anything else is over.
+      if (!run.drafted) this.finish(job);
     }
   }
 
@@ -448,7 +644,42 @@ export class AnswerHost {
       return { ok: true, message: "Noted: your answer will wait for the member's approval before it is sent." };
     }
     if (method === 'permission') return this.onPermission(run, p);
+    if (method === 'trail') return this.onTrail(run, p);
     throw new Error(`unknown method: ${method}`);
+  }
+
+  // -- §7 item 1: the read trail ------------------------------------------------------------
+
+  /** A read-trail hook's report (read-trail.ts). Every field is checked again here. */
+  private onTrail(run: Run, p: Record<string, unknown>): { ok: boolean } {
+    const phase = p.phase;
+    const tool = p.tool;
+    if (tool !== 'Read' && tool !== 'Grep') return { ok: false };
+    const id = typeof p.tool_use_id === 'string' && p.tool_use_id ? p.tool_use_id.slice(0, 200) : '(no id)';
+    const note = (raw: unknown) => {
+      if (typeof raw !== 'string' || raw === '') return;
+      const path = resolvePath(run.cwd, raw.slice(0, 4096));
+      for (const candidate of [raw, path, realOr(path)]) {
+        if (sensitiveName(candidate)) run.sensitiveReads.add(basename(candidate.replace(/[/\\]+$/, '')));
+      }
+    };
+    if (phase === 'pre') {
+      note(p.path);
+      if (tool === 'Grep') run.openSearches.add(id);
+      return { ok: true };
+    }
+    if (tool !== 'Grep') return { ok: false };
+    if (phase === 'post') {
+      const paths = Array.isArray(p.paths) ? p.paths.slice(0, 5000) : [];
+      for (const x of paths) note(x);
+      run.openSearches.delete(id);
+      return { ok: true };
+    }
+    if (phase === 'failed') {
+      run.openSearches.delete(id);
+      return { ok: true };
+    }
+    return { ok: false };
   }
 
   // -- §3: the reply decision table ---------------------------------------------------------
@@ -470,6 +701,8 @@ export class AnswerHost {
       reason: typeof p.reason === 'string' ? p.reason : null,
       requested: run.approvalRequested,
       approvalDuringRun: run.approvalNeeded,
+      sensitiveReads: [...run.sensitiveReads],
+      openSearches: run.openSearches.size,
       text,
       data,
     });
@@ -484,8 +717,9 @@ export class AnswerHost {
       this.o.log(`answered ${run.item.request_id} automatically`);
       return { ok: true, message: 'Sent.' };
     }
+    run.drafted = true;
     const { outcome } = this.queue.add(this.ctxOf(run.item), { type: 'draft', text, data, reasons }, run.item.answer_deadline);
-    void outcome.then((o) => this.settleDraft(run.item, text, data, o));
+    void outcome.then((o) => this.settleDraft(run.job, text, data, o));
     return { ok: true, message: "Your answer waits for the member's approval. Nothing more to do: end here." };
   }
 
@@ -493,7 +727,10 @@ export class AnswerHost {
     await this.o.client.reply(requestId, { idempotency_key: randomUUID(), text, data });
   }
 
-  private async settleDraft(item: WorkItem, text: string, data: Record<string, unknown> | null, outcome: string): Promise<void> {
+  private async settleDraft(job: Job, text: string, data: Record<string, unknown> | null, outcome: string): Promise<void> {
+    const item = job.item;
+    // The host is stopping: nothing is sent, and the question is received again by the next host.
+    if (outcome === 'cancelled') return;
     try {
       if (outcome === 'send') {
         await this.sendReply(item.request_id, text, data);
@@ -508,6 +745,7 @@ export class AnswerHost {
       this.o.log(`the answer to ${item.request_id} could not be sent (${describeError(err)})`);
     }
     this.toolEvent(item.request_id, 'approval', outcome === 'send' ? 'ok' : 'error');
+    this.finish(job);
   }
 
   // -- §3: the permission tool --------------------------------------------------------------
@@ -539,22 +777,42 @@ export class AnswerHost {
     return { allow: false, message };
   }
 
+  /** Whether an absolute path (or where it resolves to) is on the deny list or in a denied directory. */
+  private denied(run: Run, path: string): boolean {
+    const real = realOr(path);
+    const ctx = { home: this.env.HOME ?? '', credentialDirs: relayCredentialDirs(this.env) };
+    return (
+      credentialHit(path, ctx) !== null ||
+      credentialHit(real, ctx) !== null ||
+      run.denyDirs.some((d) => within(real, realOr(d)) || within(path, d) || within(real, d))
+    );
+  }
+
   /** What the member is asked, or why it is denied without asking. */
   private classify(run: Run, toolName: string, input: Record<string, unknown>): { tool: string; action: string } | { deny: string } {
     const { server, tool } = splitToolName(toolName);
     if (server === null && (tool === 'Read' || tool === 'Glob' || tool === 'Grep')) {
+      const refused = { deny: 'That path is never readable (credentials and configuration are off limits). Do not try to reach it another way.' };
       const raw = tool === 'Read' ? input.file_path : input.path;
       const given = typeof raw === 'string' && raw ? raw : run.cwd;
       const path = resolvePath(run.cwd, given);
-      const real = realOr(path);
-      const ctx = { home: this.env.HOME ?? '', credentialDirs: relayCredentialDirs(this.env) };
-      if (credentialHit(path, ctx) || credentialHit(real, ctx) || run.denyDirs.some((d) => within(real, realOr(d)) || within(path, d))) {
-        return { deny: 'That path is never readable (credentials and configuration are off limits). Do not try to reach it another way.' };
+      if (this.denied(run, path)) return refused;
+      // §7 item 7: a Glob pattern, or a Grep glob, with a fixed prefix is checked against the
+      // deny list before the member is asked; a hit is denied without asking.
+      for (const key of tool === 'Glob' ? ['pattern'] : tool === 'Grep' ? ['glob'] : []) {
+        const pattern = input[key];
+        if (typeof pattern !== 'string' || pattern === '') continue;
+        const target = patternTarget(pattern, path, this.env.HOME ?? '');
+        if (this.denied(run, target.prefix) || credentialHit(target.whole, { home: this.env.HOME ?? '' }) !== null) return refused;
       }
+      // §7 item 6: the member sees where a path really leads.
+      const real = realOr(path);
+      const where = real !== path ? `${path} → ${real}` : path;
       const pattern = typeof input.pattern === 'string' ? singleLine(input.pattern, 200) : '';
-      if (tool === 'Read') return { tool, action: `read the file ${path}` };
-      if (tool === 'Glob') return { tool, action: `list the files matching ${JSON.stringify(pattern)} in ${path}` };
-      return { tool, action: `search ${path} for ${JSON.stringify(pattern)}` };
+      if (tool === 'Read') return { tool, action: `read the file ${where}` };
+      if (tool === 'Glob') return { tool, action: `list the files matching ${JSON.stringify(pattern)} in ${where}` };
+      const glob = typeof input.glob === 'string' ? ` (files matching ${JSON.stringify(singleLine(input.glob, 200))})` : '';
+      return { tool, action: `search ${where}${glob} for ${JSON.stringify(pattern)}` };
     }
     if (server === 'capabilities') {
       const item = run.item;
@@ -572,22 +830,39 @@ export class AnswerHost {
     return { deny: `${toolName || 'That tool'} is not available when answering automatically.` };
   }
 
-  // -- telling the member and the asker -----------------------------------------------------
+  // -- telling the member and the asker (§4, §7 item 5) -----------------------------------------
 
   private onQueueChange(type: 'added' | 'settled', item: Pending, _outcome?: string) {
     this.writeState();
     if (type !== 'added' || this.stopped) return;
     const n = this.queue.size;
-    const quoted =
-      item.ctx.kind === 'capability_call' && item.ctx.capability
-        ? `run ${item.ctx.capability.name} ${singleLine(JSON.stringify(item.ctx.capability.params), QUOTE_LIMIT)}`
-        : singleLine(item.ctx.question, QUOTE_LIMIT);
-    void Promise.resolve(
-      this.o.push(`team-relay: ${item.ctx.asker} asked: "${quoted}" — an answer is waiting for your approval (${n} pending). Run /team-relay:approvals.`),
-    ).catch(() => {});
+    const now = this.now();
+    let content: string;
+    if (now - this.lastQuoted >= this.noticeGapMs) {
+      // The first push of a while quotes the teammate (neutralised, one line, clipped).
+      this.lastQuoted = now;
+      const quoted =
+        item.ctx.kind === 'capability_call' && item.ctx.capability
+          ? `run ${item.ctx.capability.name} ${singleLine(JSON.stringify(item.ctx.capability.params), QUOTE_LIMIT)}`
+          : singleLine(item.ctx.question, QUOTE_LIMIT);
+      const what = item.ask.type === 'run' ? 'answering it is waiting for your approval' : 'an answer is waiting for your approval';
+      content = `team-relay: ${item.ctx.asker} asked: "${quoted}" — ${what} (${n} pending). Run /team-relay:approvals.`;
+    } else {
+      // Later ones carry counts only: no teammate text.
+      content = `team-relay: another item is waiting for your approval (${n} pending). Run /team-relay:approvals.`;
+    }
+    void Promise.resolve(this.o.push(content)).catch(() => {});
     this.toolEvent(item.ctx.request_id, item.ask.type === 'permission' ? item.ask.tool : 'approval', 'waiting');
+    this.notifyDesktop(APPROVAL_TEXT);
+  }
+
+  /** A desktop notification (fixed text), at most one per NOTICE_GAP_MS. */
+  private notifyDesktop(text: NoticeText): void {
+    const now = this.now();
+    if (now - this.lastDesktop < this.noticeGapMs) return;
+    this.lastDesktop = now;
     try {
-      (this.o.notify ?? defaultNotify)();
+      (this.o.notify ?? defaultNotify)(text);
     } catch {
       // a notification is a side surface
     }
@@ -636,6 +911,24 @@ export class AnswerHost {
   }
 }
 
+/**
+ * §7 item 7: what a Glob pattern (or a Grep glob) can reach, as absolute paths: `prefix`, its
+ * fixed part (up to the first segment with a glob character), and `whole`, the pattern itself.
+ * A relative pattern is taken from the searched path; `~/` from home.
+ */
+export function patternTarget(pattern: string, base: string, home: string): { prefix: string; whole: string } {
+  let p = pattern;
+  if (p === '~' || p.startsWith('~/')) p = home + p.slice(1);
+  const whole = isAbsolute(p) ? resolvePath(p) : resolvePath(base, p);
+  const parts = whole.split('/');
+  const fixed: string[] = [];
+  for (const part of parts) {
+    if (/[*?[\]{}!]/.test(part)) break;
+    fixed.push(part);
+  }
+  return { prefix: fixed.join('/') || '/', whole };
+}
+
 export type RunPlan = {
   runDir: string;
   stateDir: string;
@@ -647,7 +940,7 @@ export type RunPlan = {
   args: string[];
   env: Record<string, string>;
   stdin: string;
-  files: { mcpConfig: string; settings: string; toolEvent: string | null };
+  files: { mcpConfig: string; settings: string; toolEvent: string | null; readTrail: string };
 };
 
 /** How the answerer's servers reach the relay, and what they must never read. */
@@ -745,15 +1038,20 @@ export function planRun(p: {
   const mcpConfig = join(runDir, 'mcp.json');
   const settings = join(runDir, 'settings.json');
   const toolEventFile = relay.toolEvent ? join(runDir, 'tool-event.json') : null;
+  const readTrailFile = join(runDir, 'read-trail.json');
   const write = (path: string, value: unknown) => writeFileSync(path, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600, flag: 'wx' });
   write(mcpConfig, childMcpConfig({ node: p.node, answerTools: join(p.dist, 'answer-tools.js'), socket: p.socket.path, token, capabilities }));
   if (toolEventFile) write(toolEventFile, relay.toolEvent);
+  // §7 item 1: the read-trail hook reaches the host with the run's token, from a file in the
+  // host's private directory (denied to the answerer's own reads).
+  write(readTrailFile, { socket: p.socket.path, token });
   write(
     settings,
     childSettings({
       scope,
       denyFiles: relay.denyFiles,
       denyDirs,
+      readTrailHook: { node: p.node, script: join(p.dist, 'read-trail.js'), config: readTrailFile },
       ...(toolEventFile ? { toolEventHook: { node: p.node, script: join(p.dist, 'tool-event.js'), config: toolEventFile } } : {}),
     }),
   );
@@ -768,7 +1066,7 @@ export function planRun(p: {
     args: childArgs({ mcpConfig, settings }, rubric(p.member, scope), model),
     env: childEnv(env),
     stdin: buildPrompt(p.item),
-    files: { mcpConfig, settings, toolEvent: toolEventFile },
+    files: { mcpConfig, settings, toolEvent: toolEventFile, readTrail: readTrailFile },
   };
 }
 
@@ -778,20 +1076,33 @@ export function draftReasons(d: {
   reason: string | null;
   requested: string | null;
   approvalDuringRun: boolean;
+  /** §7 item 1: base names of files read or searched whose names suggest secrets. */
+  sensitiveReads?: readonly string[];
+  /** §7 item 1: searches whose results were never reported. */
+  openSearches?: number;
   text: string;
   data: Record<string, unknown> | null;
 }): string[] {
   const reasons: string[] = [];
-  if (d.needsApproval) reasons.push(`the answerer flagged it${d.reason ? ` ("${singleLine(d.reason, 200)}")` : ''}`);
-  if (d.requested !== null) reasons.push(`the answerer asked for your approval ("${singleLine(d.requested, 200)}")`);
+  // §7 item 9: what the answerer wrote is labelled as its own words.
+  const words = (r: string) => ` (in the answerer's own words: "${singleLine(r, 200)}")`;
+  if (d.needsApproval) reasons.push(`the answerer flagged it${d.reason ? words(d.reason) : ''}`);
+  if (d.requested !== null) reasons.push(`the answerer asked for your approval${words(d.requested)}`);
   const secrets = screenDraft(d.text, d.data);
   if (secrets.length) reasons.push(`the secret screen found ${secrets.map((s) => s.kind).join(', ')}`);
+  const sensitive = [...new Set(d.sensitiveReads ?? [])];
+  if (sensitive.length) {
+    const names = sensitive.slice(0, 3).map((n) => singleLine(n, 80)).join(', ');
+    const more = sensitive.length > 3 ? ` and ${sensitive.length - 3} more` : '';
+    reasons.push(`it read files whose names suggest secrets (${names}${more})`);
+  }
+  if ((d.openSearches ?? 0) > 0) reasons.push('what one of its searches read could not be recorded');
   if (d.approvalDuringRun) reasons.push('it needed your permission for a step while it worked');
   return reasons;
 }
 
-function defaultNotify(): void {
-  const cmd = notifyCommand(process.platform, APPROVAL_TEXT);
+function defaultNotify(text: NoticeText): void {
+  const cmd = notifyCommand(process.platform, text);
   if (!cmd) return;
   execFile(cmd.file, cmd.args, { timeout: 3000, windowsHide: true }, () => {});
 }
