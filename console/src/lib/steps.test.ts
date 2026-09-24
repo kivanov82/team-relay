@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest'
 
 import type { ActivityRequest } from '@/api/types'
 import { fixtureRequests, RQ } from '@/mock/fixtures'
-import { deriveTrack, effectiveRequest, effectiveStatus, phaseOf, settledAt } from './steps'
+import { accessWaitLabel, deriveTrack, effectiveRequest, effectiveStatus, pendingGrant, phaseOf, settledAt, usedTools } from './steps'
 
 function req(id: string): ActivityRequest {
   const r = fixtureRequests.find((x) => x.request_id === id)
@@ -43,6 +43,56 @@ describe('deriveTrack', () => {
     expect(byKey.tools?.state).toBe('done')
     expect(byKey.answered?.state).toBe('current')
     expect(byKey.returned?.state).toBe('upcoming')
+  })
+
+  it('waits on the member to allow access while the most recent tool event is waiting (M4 §2)', () => {
+    const { track, byKey } = states(RQ.grant, 'carol')
+    expect(track.phase).toBe('awaiting_access')
+    expect(track.focus).toBe('tools')
+    expect(byKey.tools?.state).toBe('waiting')
+    // The step's time is the first tool that ran (the Glob), not the request for access.
+    expect(byKey.tools?.at).toBe(Date.parse('2026-09-23T10:12:47.100Z'))
+    expect(byKey.answered?.state).toBe('upcoming')
+    expect(byKey.returned?.state).toBe('upcoming')
+    const r = req(RQ.grant).recipients.carol!
+    expect(pendingGrant(r)).toBe('Read')
+    expect(usedTools(r).map((t) => t.tool)).toEqual(['Glob'])
+    expect(accessWaitLabel('carol', 'alice')).toBe('Waiting for carol to allow access')
+    expect(accessWaitLabel('alice', 'alice')).toBe('Waiting for you to allow access')
+  })
+
+  it('is waiting even with no tool used yet, and the next event for that tool clears it', () => {
+    const q: ActivityRequest = structuredClone(req(RQ.grant))
+    const carol = q.recipients.carol!
+    carol.tools = [{ tool: 'Grep', status: 'waiting', at: '2026-09-23T10:12:47.000Z', duration_ms: null }]
+    let t = deriveTrack(q, carol)
+    expect(t.phase).toBe('awaiting_access')
+    expect(t.steps.find((s) => s.key === 'tools')).toMatchObject({ state: 'waiting', at: null })
+    // Allowed: the Grep ran.
+    carol.tools.push({ tool: 'Grep', status: 'ok', at: '2026-09-23T10:13:02.000Z', duration_ms: 40 })
+    t = deriveTrack(q, carol)
+    expect(t.phase).toBe('working')
+    expect(pendingGrant(carol)).toBeNull()
+    expect(t.steps.find((s) => s.key === 'tools')).toMatchObject({ state: 'done', at: Date.parse('2026-09-23T10:13:02.000Z') })
+    // Denied, then it failed: an error clears it too.
+    carol.tools.push({ tool: 'Read', status: 'waiting', at: '2026-09-23T10:13:05.000Z', duration_ms: null })
+    expect(phaseOf(carol)).toBe('awaiting_access')
+    carol.tools.push({ tool: 'Read', status: 'error', at: '2026-09-23T10:13:20.000Z', duration_ms: 2 })
+    expect(phaseOf(carol)).toBe('working')
+    // A second request for access waits again, on the newer tool.
+    carol.tools.push({ tool: 'Glob', status: 'waiting', at: '2026-09-23T10:13:25.000Z', duration_ms: null })
+    expect(pendingGrant(carol)).toBe('Glob')
+  })
+
+  it('stops waiting once the exchange settles, answered or out of time', () => {
+    const q: ActivityRequest = structuredClone(req(RQ.grant))
+    const carol = q.recipients.carol!
+    expect(phaseOf({ ...carol, status: 'answered', answered_at: '2026-09-23T10:14:00.000Z' })).toBe('returning')
+    expect(pendingGrant({ ...carol, status: 'answered' })).toBeNull()
+    const late = effectiveRequest(q, Date.parse(q.answer_deadline))
+    expect(phaseOf(late.recipients.carol!)).toBe('timed_out')
+    const t = deriveTrack(late, late.recipients.carol!)
+    expect(t.steps.map((s) => s.state)).not.toContain('waiting')
   })
 
   it('waits on the ack once delivered', () => {

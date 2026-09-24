@@ -228,6 +228,21 @@
   animation: step-wait 1.6s ease-in-out infinite;
 }
 
+/* The step waiting for a member to allow access (M4-SPEC §2): the same halo, in amber. */
+@keyframes grant-wait {
+  0%,
+  100% {
+    box-shadow: 0 0 0 0 var(--warn-soft);
+  }
+  50% {
+    box-shadow: 0 0 0 4px var(--warn-soft);
+  }
+}
+
+.grant-wait {
+  animation: grant-wait 1.6s ease-in-out infinite;
+}
+
 /* A request that just arrived: one soft wash that fades out. */
 @keyframes row-fresh {
   from {
@@ -258,6 +273,10 @@
   .step-wait {
     animation: none;
     box-shadow: 0 0 0 3px var(--signal-soft);
+  }
+  .grant-wait {
+    animation: none;
+    box-shadow: 0 0 0 3px var(--warn-soft);
   }
 }
 

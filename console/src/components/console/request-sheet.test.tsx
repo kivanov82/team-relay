@@ -50,6 +50,50 @@ describe('RequestSheet', () => {
     expect(within(dialog).queryByText('dataset')).toBeNull()
   })
 
+  it('shows a recipient waiting for its member to allow access, in amber, and the tool it waits on (M4 §2)', () => {
+    setConsoleKey('k'.repeat(32))
+    setTransport(async () => json({ error: 'not_found' }, 404))
+    renderWithClient(<RequestSheet req={find(RQ.grant)} me="alice" now={NOW} onClose={() => {}} />)
+
+    const dialog = screen.getByRole('dialog')
+    const detail = dialog.querySelector('[data-recipient-detail="carol"]') as HTMLElement
+    // The status pill and the timeline say who is being waited on.
+    expect(within(detail).getAllByText('Waiting for carol to allow access')[0]).toHaveClass('text-warn')
+    expect(detail.querySelector('[data-step="tools"]')).toHaveAttribute('data-state', 'waiting')
+    expect(within(detail.querySelector('[data-step="tools"]') as HTMLElement).getByText('waiting for carol to allow access')).toHaveClass('text-warn')
+    expect(detail.querySelector('[data-step="answered"]')).toHaveAttribute('data-state', 'upcoming')
+    // The tool table: the Glob ran, the Read waits; one tool used so far, not two.
+    const waitingRow = detail.querySelector('[data-tool="Read"][data-status="waiting"]') as HTMLElement
+    expect(within(waitingRow).getByText('Waiting for access').closest('[data-waiting]')).toHaveAttribute('data-waiting', 'current')
+    expect(detail.querySelector('[data-tool="Glob"][data-status="ok"]')).not.toBeNull()
+    expect(within(detail).getByText('1 used')).toBeInTheDocument()
+    // Nothing about the path is shown: only the tool's name.
+    expect(detail.textContent).not.toMatch(/\//)
+  })
+
+  it('clears the waiting state once the next event for that tool arrives, and keeps the request in the history', () => {
+    setConsoleKey('k'.repeat(32))
+    setTransport(async () => json({ error: 'not_found' }, 404))
+    const allowed: ActivityRequest = structuredClone(find(RQ.grant))
+    allowed.recipients.carol!.tools.push({ tool: 'Read', status: 'ok', at: '2026-09-23T10:13:30.000Z', duration_ms: 14 })
+    renderWithClient(<RequestSheet req={allowed} me="alice" now={NOW} onClose={() => {}} />)
+
+    const detail = screen.getByRole('dialog').querySelector('[data-recipient-detail="carol"]') as HTMLElement
+    expect(within(detail).queryByText(/to allow access/)).toBeNull()
+    expect(within(detail).getByText('Working')).toBeInTheDocument()
+    expect(detail.querySelector('[data-step="tools"]')).toHaveAttribute('data-state', 'done')
+    const past = detail.querySelector('[data-tool="Read"][data-status="waiting"]') as HTMLElement
+    expect(within(past).getByText('Asked for access').closest('[data-waiting]')).toHaveAttribute('data-waiting', 'past')
+    expect(within(detail).getByText('2 used')).toBeInTheDocument()
+  })
+
+  it('says "you" when the viewer is the one being asked', () => {
+    setConsoleKey('k'.repeat(32))
+    setTransport(async () => json({ error: 'not_found' }, 404))
+    renderWithClient(<RequestSheet req={find(RQ.grant)} me="carol" now={NOW} onClose={() => {}} />)
+    expect(within(screen.getByRole('dialog')).getAllByText('Waiting for you to allow access').length).toBeGreaterThan(0)
+  })
+
   it('shows a participant the question and the answer preview in full', () => {
     setConsoleKey('k'.repeat(32))
     setTransport(async () => json({ ...fixtureCapabilityDetail, progress: [] }))

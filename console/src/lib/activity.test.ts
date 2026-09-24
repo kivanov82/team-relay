@@ -107,13 +107,15 @@ describe('derived views', () => {
     expect(mine).not.toContain(RQ.maskedCapability)
     expect(mine).toContain(RQ.incoming)
     const open = applyFilter(all, 'open', 'alice').map((r) => r.request_id).sort()
-    expect(open).toEqual([RQ.incoming, RQ.returning, RQ.working].sort())
+    // A recipient waiting for its member to allow access is still in flight (M4 §2).
+    expect(open).toEqual([RQ.grant, RQ.incoming, RQ.returning, RQ.working].sort())
   })
 
   it('summarises a fan-out by counting answers', () => {
     expect(summarize(find(RQ.broadcast))).toEqual({ tone: 'warn', label: '1 of 2 answered' })
     expect(summarize(find(RQ.timedOut))).toEqual({ tone: 'bad', label: 'Timed out' })
     expect(summarize(find(RQ.working))).toEqual({ tone: 'live', label: 'Working' })
+    expect(summarize(find(RQ.grant))).toEqual({ tone: 'warn', label: 'Needs access' })
   })
 
   it('measures elapsed to the last settlement, or to now while in flight', () => {
@@ -126,7 +128,7 @@ describe('derived views', () => {
   it('draws a question out and an answer back as separate edges in their direction of travel', () => {
     const fl = flights(all)
     const keys = fl.map((f) => `${f.from}>${f.to}:${f.direction}`).sort()
-    expect(keys).toEqual(['alice>bob:out', 'bob>alice:out', 'carol>alice:back'])
+    expect(keys).toEqual(['alice>bob:out', 'alice>carol:out', 'bob>alice:out', 'carol>alice:back'])
   })
 
   it('fans a broadcast out to every recipient still in flight', () => {

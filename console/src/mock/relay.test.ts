@@ -141,3 +141,25 @@ describe('MockRelay feed and directory', () => {
     resetTransport()
   })
 })
+
+describe('MockRelay access grants (M4 §2) and shares (M4 §3)', () => {
+  it('starts with carol asked to allow a read, then carries on once she allows it', () => {
+    const at = (sec: number) => one(feed(relayAt('alice', sec)), (r) => r.request_id === RQ.grant)
+    expect(at(1).recipients.carol?.tools.at(-1)).toMatchObject({ tool: 'Read', status: 'waiting', duration_ms: null })
+    expect(at(7).recipients.carol?.tools.at(-1)).toMatchObject({ tool: 'Read', status: 'ok' })
+    expect(at(20).recipients.carol?.status).toBe('answered')
+  })
+
+  it('has bob wait for a grant in every round of traffic, then allow it', () => {
+    const round = (sec: number) =>
+      one(feed(relayAt('alice', sec)), (r) => r.asker === 'alice' && r.question !== null && /payments sandbox key/.test(r.question))
+    expect(round(12).recipients.bob?.tools.map((t) => t.status)).toEqual(['ok', 'waiting'])
+    expect(round(20).recipients.bob?.tools.map((t) => t.status)).toEqual(['ok', 'waiting', 'ok'])
+  })
+
+  it('publishes shares with the manifests', () => {
+    const dir = relayAt('alice', 1).directory()
+    expect(dir.members.find((m) => m.member === 'bob')?.manifest?.shares).toEqual([{ name: 'orders-service' }, { name: 'runbooks' }])
+    expect(dir.members.find((m) => m.member === 'carol')?.manifest?.shares).toEqual([])
+  })
+})

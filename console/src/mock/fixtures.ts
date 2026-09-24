@@ -11,6 +11,9 @@
 //   masked              carol → bob and bob → carol: alice is not a participant
 //   incoming            bob → alice, delivered to alice's answering session, not acked
 //   returning           alice → carol, service_health answered, answer not yet picked up
+//   waiting for access  alice → carol, acked, a Glob, then a Read carol has not allowed yet
+//                       (M4 §2: the tool event is `waiting`)
+// bob shares two folders with his answering session; carol shares none (M4 §3).
 
 import type { ActivityPage, ActivityRequest, Directory, Join, Manifest, Me, RequestDetail } from '@/api/types'
 
@@ -80,7 +83,11 @@ export const fixtureDirectory: Directory = {
     {
       member: 'bob',
       last_seen: '2026-09-23T10:14:57.000Z',
-      manifest: { version: 1, capabilities: [stagingDbQuery, serviceHealth] },
+      manifest: {
+        version: 1,
+        capabilities: [stagingDbQuery, serviceHealth],
+        shares: [{ name: 'orders-service' }, { name: 'runbooks' }],
+      },
       published_at: '2026-09-23T08:31:12.000Z',
       sessions: {
         working: { last_seen: '2026-09-23T10:14:44.000Z' },
@@ -91,7 +98,7 @@ export const fixtureDirectory: Directory = {
     {
       member: 'carol',
       last_seen: '2026-09-23T10:14:58.000Z',
-      manifest: { version: 1, capabilities: [serviceHealth, productionDbCount] },
+      manifest: { version: 1, capabilities: [serviceHealth, productionDbCount], shares: [] },
       published_at: '2026-09-22T16:02:40.000Z',
       sessions: {
         working: { last_seen: '2026-09-23T10:11:40.000Z' },
@@ -127,6 +134,7 @@ export const RQ = {
   incoming: 'rq_7a3e9c6f2b8d4e5ba50c3f7b1d6e4ac9',
   returning: 'rq_8b4f0d7a3c9e4f6cb61d4a8c2e7f5bda',
   maskedCapability: 'rq_9c5a1e8b4d0f4a7dc72e5b9d3f8a6ceb',
+  grant: 'rq_a0d6b2f9c5e14b8e9d8f3a6c0b4e7d21',
 } as const
 
 export const fixtureRequests: ActivityRequest[] = [
@@ -290,6 +298,32 @@ export const fixtureRequests: ActivityRequest[] = [
       }),
     },
     participant: false,
+  },
+  {
+    request_id: RQ.grant,
+    kind: 'question',
+    asker: 'alice',
+    broadcast: false,
+    created_at: '2026-09-23T10:12:40.000Z',
+    updated_at: '2026-09-23T10:12:49.500Z',
+    ack_deadline: '2026-09-23T10:14:40.000Z',
+    answer_deadline: '2026-09-23T10:42:40.000Z',
+    expire_at: '2026-09-30T10:12:40.000Z',
+    capability: null,
+    question: 'What does the on-call handover note say about the queue backlog alert?',
+    recipients: {
+      carol: recipient({
+        status: 'acked',
+        delivered_at: '2026-09-23T10:12:40.610Z',
+        acked_at: '2026-09-23T10:12:44.300Z',
+        tools: [
+          { tool: 'Glob', status: 'ok', at: '2026-09-23T10:12:47.100Z', duration_ms: 22 },
+          // M4 §2: a read outside carol's shared folders, waiting for her to allow it.
+          { tool: 'Read', status: 'waiting', at: '2026-09-23T10:12:49.500Z', duration_ms: null },
+        ],
+      }),
+    },
+    participant: true,
   },
   {
     request_id: RQ.working,

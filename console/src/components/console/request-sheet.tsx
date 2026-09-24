@@ -1,11 +1,11 @@
-import { Check, X } from 'lucide-react'
+import { Check, KeyRound, X } from 'lucide-react'
 import { useEffect, useState } from 'react'
 
 import type { ActivityRecipient, ActivityRequest, ProgressEntry } from '@/api/types'
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from '@/components/ui/sheet'
 import { useRequestDetail } from '@/hooks/queries'
 import { elapsedMs, isOpen, phaseTone, summarize } from '@/lib/activity'
-import { deriveTrack, PHASE_LABEL, type Step } from '@/lib/steps'
+import { accessWaitLabel, deriveTrack, PHASE_LABEL, pendingGrant, usedTools, type Step } from '@/lib/steps'
 import { formatClock, formatDayClock, formatDuration, ms } from '@/lib/time'
 import { cn } from '@/lib/utils'
 import { KindIcon } from './activity'
@@ -40,7 +40,7 @@ function Params({ params }: { params: Record<string, unknown> }) {
   )
 }
 
-function Timeline({ steps, req, r }: { steps: Step[]; req: ActivityRequest; r: ActivityRecipient }) {
+function Timeline({ steps, req, r, waitLabel }: { steps: Step[]; req: ActivityRequest; r: ActivityRecipient; waitLabel: string }) {
   const due = (key: Step['key']): string | null => {
     if (key === 'acked' && r.status === 'pending') return `due ${formatClock(ms(req.ack_deadline) ?? 0)}`
     if (key === 'acked' && r.status === 'no_response') return `was due ${formatClock(ms(req.ack_deadline) ?? 0)}`
@@ -71,6 +71,7 @@ function Timeline({ steps, req, r }: { steps: Step[]; req: ActivityRequest; r: A
                   s.state === 'done' && 'size-2 bg-subtle',
                   s.state === 'current' && 'step-wait size-2.5 bg-signal',
                   s.state === 'failed' && 'size-2.5 bg-bad',
+                  s.state === 'waiting' && 'grant-wait size-2.5 bg-warn',
                   s.state === 'skipped' && 'size-2 border border-dashed border-faint',
                   s.state === 'upcoming' && 'size-2 border border-border bg-card',
                 )}
@@ -80,6 +81,7 @@ function Timeline({ steps, req, r }: { steps: Step[]; req: ActivityRequest; r: A
               <span className={cn('truncate', s.state === 'upcoming' || s.state === 'skipped' ? 'text-subtle' : 'text-foreground')}>{s.label}</span>
               {s.state === 'current' ? <span className="text-[11.5px] text-signal">waiting</span> : null}
               {s.state === 'failed' ? <span className="text-[11.5px] text-bad">missed</span> : null}
+              {s.state === 'waiting' ? <span className="truncate text-[11.5px] text-warn">{waitLabel.replace(/^Waiting/, 'waiting')}</span> : null}
               {s.state === 'skipped' ? <span className="text-[11.5px] text-faint">none used</span> : null}
             </span>
             <span className="tnum flex items-baseline gap-3 text-right text-[12px]">
@@ -99,8 +101,9 @@ function Timeline({ steps, req, r }: { steps: Step[]; req: ActivityRequest; r: A
   )
 }
 
-function ToolTable({ r, ackedAt }: { r: ActivityRecipient; ackedAt: number | null }) {
+function ToolTable({ r, ackedAt, waitLabel }: { r: ActivityRecipient; ackedAt: number | null; waitLabel: string }) {
   if (r.tools.length === 0) return <p className="text-[12.5px] text-subtle">No tools used.</p>
+  const waiting = pendingGrant(r) !== null
   return (
     <table className="w-full border-collapse text-[12px]">
       <thead>
@@ -114,11 +117,23 @@ function ToolTable({ r, ackedAt }: { r: ActivityRecipient; ackedAt: number | nul
       <tbody className="tnum">
         {r.tools.map((t, i) => {
           const at = ms(t.at)
+          // Only the most recent event can still be waiting; an earlier one was answered.
+          const current = waiting && i === r.tools.length - 1
           return (
             <tr key={`${t.tool}-${i}`} className="border-t border-hairline" data-tool={t.tool} data-status={t.status}>
               <td className="py-1.5 pr-2 font-mono text-[11.5px]">{t.tool}</td>
               <td className="py-1.5 pr-2">
-                {t.status === 'ok' ? (
+                {t.status === 'waiting' ? (
+                  current ? (
+                    <span className="inline-flex items-center gap-1 text-warn" data-waiting="current" title={waitLabel}>
+                      <KeyRound aria-hidden className="size-3.5" /> Waiting for access
+                    </span>
+                  ) : (
+                    <span className="inline-flex items-center gap-1 text-subtle" data-waiting="past">
+                      <KeyRound aria-hidden className="size-3.5" /> Asked for access
+                    </span>
+                  )
+                ) : t.status === 'ok' ? (
                   <span className="inline-flex items-center gap-1 text-ok">
                     <Check aria-hidden className="size-3.5" /> OK
                   </span>
@@ -185,20 +200,22 @@ function RecipientDetail({
   const track = deriveTrack(req, r)
   const tone = phaseTone(track.phase)
   const preview = r.answer_preview
+  const waitLabel = accessWaitLabel(member, me)
+  const used = usedTools(r).length
   return (
     <article className="flex flex-col gap-4 rounded-lg border bg-card p-4" data-recipient-detail={member}>
       <header className="flex items-center gap-2.5">
         <Avatar member={member} you={member === me} />
         <span className="text-[13.5px] font-semibold">{member === me ? `${member} (you)` : member}</span>
         <StatusPill tone={tone} className="ml-auto">
-          {PHASE_LABEL[track.phase]}
+          {track.phase === 'awaiting_access' ? waitLabel : PHASE_LABEL[track.phase]}
         </StatusPill>
       </header>
 
-      <Timeline steps={track.steps} req={req} r={r} />
+      <Timeline steps={track.steps} req={req} r={r} waitLabel={waitLabel} />
 
-      <Section title="Tools" aside={r.tools.length > 0 ? <span className="tnum">{r.tools.length} used</span> : undefined}>
-        <ToolTable r={r} ackedAt={ms(r.acked_at)} />
+      <Section title="Tools" aside={used > 0 ? <span className="tnum">{used} used</span> : undefined}>
+        <ToolTable r={r} ackedAt={ms(r.acked_at)} waitLabel={waitLabel} />
       </Section>
 
       <Progress r={r} entries={progress === null ? null : progress.filter((p) => p.member === member)} />

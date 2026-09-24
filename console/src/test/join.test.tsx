@@ -188,6 +188,25 @@ describe('join panel: the steps', () => {
     }
   })
 
+  it('says in step 5 what the answering session may read (M4 §4)', async () => {
+    server()
+    renderWithClient(<JoinPanel />)
+    await screen.findByText('Start your answering session')
+    await waitFor(() => expect(document.querySelector('[data-reads]')).not.toBeNull())
+    const step5 = document.querySelector('[data-step="5"]') as HTMLElement
+    const reads = step5.querySelector('[data-reads]') as HTMLElement
+    // Nothing by default; share folders deliberately; grant when asked; never credentials; not a sandbox.
+    expect(reads).toHaveTextContent('It reads none of your files by default.')
+    expect(reads).toHaveTextContent(/share it deliberately before you start: export ANSWERER_READ_DIRS=~\/src\/app:~\/notes/)
+    expect(reads).toHaveTextContent(/teammates see the folder names/)
+    expect(reads).toHaveTextContent(/it asks you in that terminal, naming the file or folder: allow it once, for the session, or deny it/)
+    expect(reads).toHaveTextContent(/desktop notification tells you when it is waiting/)
+    expect(reads).toHaveTextContent(/Credentials and keys are never readable, whatever you allow/)
+    expect(reads).toHaveTextContent(/permission rules, not an OS sandbox/)
+    // The read setting is optional: the command block itself does not set it.
+    expect(commandText('answering session commands')).not.toContain('ANSWERER_READ_DIRS')
+  })
+
   it('uses a placeholder, and says which email, when /api/me gives none', async () => {
     const { email: _email, ...noEmail } = ME
     server({ me: noEmail })

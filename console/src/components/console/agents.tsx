@@ -1,3 +1,5 @@
+import { FolderOpen } from 'lucide-react'
+
 import type { DirectoryMember } from '@/api/types'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
@@ -31,14 +33,40 @@ function Stat({ label, value }: { label: string; value: string }) {
   )
 }
 
+/**
+ * The folders the member's answering session reads without asking (M4 §3), by name: the
+ * plugin publishes basenames only. Anything else it reads, the member allows at the time.
+ */
+function Shares({ agent }: { agent: DirectoryMember }) {
+  const names = (agent.manifest?.shares ?? []).map((s) => s.name)
+  const text = names.length === 0 ? 'Shares nothing' : `Shares: ${names.join(', ')}`
+  return (
+    <div
+      className="flex min-w-0 basis-full items-center gap-1.5 pl-[38px] text-[11.5px] min-[420px]:ml-auto min-[420px]:max-w-[55%] min-[420px]:basis-auto min-[420px]:pl-0"
+      data-shares={names.join(',')}
+      title={`${text}. Folders this member's answering session reads without asking; anything else, the member allows when asked.`}
+    >
+      <FolderOpen aria-hidden className="size-3.5 shrink-0 text-faint" />
+      {names.length === 0 ? (
+        <span className="truncate text-subtle">Shares nothing</span>
+      ) : (
+        <span className="min-w-0 truncate">
+          <span className="text-subtle">Shares: </span>
+          <span className="font-mono text-[11px]">{names.join(', ')}</span>
+        </span>
+      )}
+    </div>
+  )
+}
+
 export function AgentRow({ agent, now }: { agent: DirectoryMember; now: number }) {
   const caps = agent.manifest?.capabilities ?? []
   const published = ms(agent.published_at)
   return (
     <li className="flex flex-col gap-3 px-4 py-3.5" data-agent={agent.member}>
-      <div className="flex items-center gap-2.5">
+      <div className="flex flex-wrap items-center gap-x-2.5 gap-y-1">
         <Avatar member={agent.member} />
-        <div className="min-w-0 flex-1">
+        <div className="min-w-0 shrink-0">
           <div className="text-[13.5px] font-semibold leading-tight">{agent.member}</div>
           <div className="text-[11.5px] text-subtle">
             {caps.length === 0
@@ -47,6 +75,7 @@ export function AgentRow({ agent, now }: { agent: DirectoryMember; now: number }
             {published !== null ? <span className="tnum">, published {formatAgo(now - published)}</span> : null}
           </div>
         </div>
+        <Shares agent={agent} />
       </div>
 
       <div className="grid grid-cols-1 gap-1.5 text-[12px] min-[420px]:grid-cols-2">

@@ -90,6 +90,67 @@ describe('the console', () => {
     expect(within(carol).getByText('production_db_count')).toBeInTheDocument()
   })
 
+  it('shows each agent\'s shared folders, by name, or that it shares nothing (M4 §3)', async () => {
+    server()
+    renderWithClient(<App />)
+    await flush(10)
+    const bob = document.querySelector('[data-agent="bob"]') as HTMLElement
+    expect(bob.querySelector('[data-shares]')).toHaveAttribute('data-shares', 'orders-service,runbooks')
+    expect(bob.querySelector('[data-shares]')).toHaveTextContent('Shares: orders-service, runbooks')
+    const carol = document.querySelector('[data-agent="carol"]') as HTMLElement
+    expect(carol.querySelector('[data-shares]')).toHaveTextContent('Shares nothing')
+  })
+
+  it('says "shares nothing" for a teammate whose plugin publishes no shares list', async () => {
+    const dir = structuredClone(fixtureDirectory)
+    delete dir.members[0]!.manifest!.shares
+    dir.members[1]!.manifest = null
+    setTransport(async (path) => {
+      const url = new URL(path, 'http://console.invalid/')
+      if (url.pathname === '/api/me') return json(fixtureMe)
+      if (url.pathname === '/api/directory') return json(dir)
+      if (url.pathname === '/api/activity') return json(fixtureActivity)
+      return json({ error: 'not_found' }, 404)
+    })
+    renderWithClient(<App />)
+    await flush(10)
+    for (const m of ['bob', 'carol']) {
+      expect(document.querySelector(`[data-agent="${m}"] [data-shares]`)).toHaveTextContent('Shares nothing')
+    }
+  })
+
+  it('shows a recipient waiting for access in amber on the feed, and clears it when the next event for that tool arrives (M4 §2)', async () => {
+    let second = true
+    server({
+      activity: (since) => {
+        if (since === null) return json(fixtureActivity)
+        if (second) {
+          second = false
+          const allowed = structuredClone(fixtureActivity.requests.find((r) => r.request_id === RQ.grant)!)
+          allowed.updated_at = '2026-09-23T10:15:02.000Z'
+          allowed.recipients.carol!.tools.push({ tool: 'Read', status: 'ok', at: '2026-09-23T10:15:02.000Z', duration_ms: 14 })
+          return json({ requests: [allowed], next_since: '2026-09-23T10:15:02.000Z', server_time: '2026-09-23T10:15:03.000Z' })
+        }
+        return json({ requests: [], next_since: since, server_time: '2026-09-23T10:15:06.000Z' })
+      },
+    })
+    renderWithClient(<App />)
+    await flush(10)
+    const row = () => document.querySelector(`li[data-request="${RQ.grant}"]`) as HTMLElement
+    const line = () => row().querySelector('[data-recipient="carol"]') as HTMLElement
+    expect(line()).toHaveAttribute('data-phase', 'awaiting_access')
+    expect(within(line()).getByText('Waiting for carol to allow access')).toHaveClass('text-warn')
+    expect(line().querySelector('[data-step="tools"]')).toHaveAttribute('data-state', 'waiting')
+    expect(line().querySelector('[data-tool-waiting="Read"]')).not.toBeNull()
+    expect(within(row()).getByText('Needs access')).toBeInTheDocument()
+
+    await flush(3_000)
+    expect(line()).toHaveAttribute('data-phase', 'working')
+    expect(within(row()).queryByText(/to allow access/)).toBeNull()
+    expect(line().querySelector('[data-step="tools"]')).toHaveAttribute('data-state', 'done')
+    expect(line().querySelector('[data-tool-waiting]')).toBeNull()
+  })
+
   it('polls the feed every 3 s from next_since less 30 s of overlap and merges updates by request_id', async () => {
     let second = true
     const s = server({

@@ -16,13 +16,16 @@ function stepTitle(s: Step): string {
       return `${s.label}: none used`
     case 'upcoming':
       return `${s.label}: not yet`
+    case 'waiting':
+      return `${s.label}: waiting for permission to use a tool`
   }
 }
 
 /**
  * Six steps as dots on a rail: sent, delivered, acked, tools, answered, returned. Done
- * steps are solid, the one being waited on carries the accent, a failure is red, and an
- * optional step that was passed over (no tools) is a hollow ring.
+ * steps are solid, the one being waited on carries the accent, a failure is red, an
+ * optional step that was passed over (no tools) is a hollow ring, and tools waiting for the
+ * member to allow access (M4 §2) are amber.
  */
 export function StepTrack({ steps, className }: { steps: Step[]; className?: string }) {
   const label = steps.map((s) => stepTitle(s)).join('; ')
@@ -30,7 +33,7 @@ export function StepTrack({ steps, className }: { steps: Step[]; className?: str
     <div role="img" aria-label={label} className={cn('flex items-center', className)}>
       {steps.map((s, i) => {
         const prev = steps[i - 1]
-        const railDone = prev !== undefined && (s.state === 'done' || s.state === 'skipped' || s.state === 'current' || s.state === 'failed') && prev.state !== 'upcoming'
+        const railDone = prev !== undefined && s.state !== 'upcoming' && prev.state !== 'upcoming'
         return (
           <span key={s.key} className="flex items-center" data-step={s.key} data-state={s.state} title={stepTitle(s)}>
             {i > 0 ? (
@@ -46,6 +49,7 @@ export function StepTrack({ steps, className }: { steps: Step[]; className?: str
                 s.state === 'done' && 'size-[7px] bg-subtle',
                 s.state === 'current' && 'step-wait size-[9px] bg-signal',
                 s.state === 'failed' && 'size-[9px] bg-bad',
+                s.state === 'waiting' && 'grant-wait size-[9px] bg-warn',
                 s.state === 'skipped' && 'size-[7px] border border-dashed border-faint',
                 s.state === 'upcoming' && 'size-[7px] border border-border bg-card',
               )}

@@ -1,11 +1,11 @@
-import { ArrowRight, LockKeyhole, MessageSquareText, Radio, SquareTerminal } from 'lucide-react'
+import { ArrowRight, KeyRound, LockKeyhole, MessageSquareText, Radio, SquareTerminal } from 'lucide-react'
 import { useEffect, useRef, useState } from 'react'
 
 import type { ActivityRecipient, ActivityRequest } from '@/api/types'
 import { Skeleton } from '@/components/ui/skeleton'
 import { ToggleGroup, ToggleGroupItem } from '@/components/ui/toggle-group'
 import { applyFilter, elapsedMs, isOpen, phaseTone, summarize, type Filter } from '@/lib/activity'
-import { deriveTrack, PHASE_LABEL } from '@/lib/steps'
+import { accessWaitLabel, deriveTrack, PHASE_LABEL, pendingGrant, usedTools } from '@/lib/steps'
 import { formatClock, formatDuration, ms } from '@/lib/time'
 import { cn } from '@/lib/utils'
 import { EnvBadge, MASKED_TEXT, Panel, StatusPill } from './primitives'
@@ -53,19 +53,33 @@ function Route({ req, me }: { req: ActivityRequest; me: string | null }) {
 }
 
 function Tools({ r, max = 3 }: { r: ActivityRecipient; max?: number }) {
-  if (r.tools.length === 0) return null
+  const waitingFor = pendingGrant(r)
+  const used = usedTools(r)
+  if (used.length === 0 && waitingFor === null) return null
   const names: { tool: string; error: boolean; n: number }[] = []
-  for (const t of r.tools) {
+  for (const t of used) {
     const found = names.find((x) => x.tool === t.tool)
     if (found) {
       found.n += 1
       found.error ||= t.status === 'error'
     } else names.push({ tool: t.tool, error: t.status === 'error', n: 1 })
   }
-  const shown = names.slice(0, max)
-  const rest = names.length - shown.length
+  // The tool waiting for the member's permission leads, in amber (M4 §2).
+  const shown = names.filter((x) => x.tool !== waitingFor).slice(0, waitingFor === null ? max : max - 1)
+  const rest = names.filter((x) => x.tool !== waitingFor).length - shown.length
+  const all = [...(waitingFor === null ? [] : [waitingFor]), ...names.map((x) => x.tool).filter((t) => t !== waitingFor)]
   return (
-    <span className="hidden min-w-0 items-center gap-1 lg:flex" aria-label={`Tools: ${names.map((x) => x.tool).join(', ')}`}>
+    <span className="hidden min-w-0 items-center gap-1 lg:flex" aria-label={`Tools: ${all.join(', ')}`}>
+      {waitingFor !== null ? (
+        <span
+          data-tool-waiting={waitingFor}
+          title={`${waitingFor}: waiting for permission`}
+          className="inline-flex h-[18px] items-center gap-1 rounded border border-warn/40 bg-warn-soft px-1.5 font-mono text-[10.5px] text-warn"
+        >
+          <KeyRound aria-hidden className="size-3" />
+          {waitingFor}
+        </span>
+      ) : null}
       {shown.map((x) => (
         <span
           key={x.tool}
@@ -86,7 +100,8 @@ function Tools({ r, max = 3 }: { r: ActivityRecipient; max?: number }) {
 function RecipientLine({ req, member, r, me }: { req: ActivityRequest; member: string; r: ActivityRecipient; me: string | null }) {
   const track = deriveTrack(req, r)
   const tone = phaseTone(track.phase)
-  const toolsNote = track.phase === 'working' && r.tools.length > 0 ? `, ${r.tools.length} tool${r.tools.length > 1 ? 's' : ''}` : ''
+  const used = usedTools(r).length
+  const toolsNote = track.phase === 'working' && used > 0 ? `, ${used} tool${used > 1 ? 's' : ''}` : ''
   return (
     <div className="flex min-w-0 items-center gap-3" data-recipient={member} data-phase={track.phase}>
       <span className="w-12 shrink-0 truncate text-[12px] text-subtle">{member === me ? 'you' : member}</span>
@@ -100,7 +115,7 @@ function RecipientLine({ req, member, r, me }: { req: ActivityRequest; member: s
           tone === 'bad' && 'text-bad',
         )}
       >
-        {PHASE_LABEL[track.phase]}
+        {track.phase === 'awaiting_access' ? accessWaitLabel(member, me) : PHASE_LABEL[track.phase]}
         {toolsNote}
       </span>
       <Tools r={r} />

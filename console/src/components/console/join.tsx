@@ -216,6 +216,21 @@ function Steps() {
           too). To offer a capability, also export <Code>CAP_&lt;NAME&gt;_ENABLED=true</Code> and{' '}
           <Code>CAP_&lt;NAME&gt;_RUNNER</Code>; plugin/README.md has the details.
         </Note>
+        <div data-reads className="flex flex-col gap-1.5">
+          <Note>
+            <span className="text-foreground">It reads none of your files by default.</span> To let it read a folder
+            without asking, share it deliberately before you start: <Code>export ANSWERER_READ_DIRS=~/src/app:~/notes</Code>{' '}
+            (teammates see the folder names).
+          </Note>
+          <Note>
+            For anything else it asks you in that terminal, naming the file or folder: allow it once, for the session, or
+            deny it. A desktop notification tells you when it is waiting.
+          </Note>
+          <Note>
+            Credentials and keys are never readable, whatever you allow. These are Claude Code permission rules, not an
+            OS sandbox.
+          </Note>
+        </div>
       </Step>
 
       <Step n={6} title="Check that it worked">

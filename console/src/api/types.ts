@@ -51,9 +51,16 @@ export interface ManifestCapability {
   required?: string[]
 }
 
+/** A folder the member's answering session reads without asking, by name only (M4 §3). */
+export interface ManifestShare {
+  name: string
+}
+
 export interface Manifest {
   version: 1
   capabilities: ManifestCapability[]
+  /** Absent from older plugins; an empty list is "shares nothing". */
+  shares?: ManifestShare[]
 }
 
 export interface SessionPresence {
@@ -91,9 +98,15 @@ export interface Directory {
 
 export type RecipientStatus = 'pending' | 'acked' | 'answered' | 'no_response' | 'timed_out'
 
+/**
+ * M2 §3.3; `waiting` (M4 §2): the answering session is asking its member to allow the tool
+ * (a read outside the shared folders). The next `ok` or `error` event for it clears that.
+ */
+export type ToolStatus = 'ok' | 'error' | 'waiting'
+
 export interface ToolEvent {
   tool: string
-  status: 'ok' | 'error'
+  status: ToolStatus
   at: Iso
   duration_ms: number | null
 }
@@ -151,7 +164,7 @@ export interface ProgressEntry {
   pct?: number | null
   time: Iso
   tool?: string
-  status?: 'ok' | 'error'
+  status?: ToolStatus
   duration_ms?: number | null
 }
 

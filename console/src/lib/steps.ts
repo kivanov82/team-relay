@@ -1,7 +1,8 @@
 // The per-recipient step track (M2 §5): sent, delivered, acked, tools, answered, returned.
 // Derived from the timestamps the relay records (M2 §3.2, §3.3; M1 §3.8, §3.9) and the
 // recipient's status. The current step is the first one not yet reached; a request that
-// ran out of time fails at that step instead.
+// ran out of time fails at that step instead. While the recipient's most recent tool event
+// is `waiting` (M4 §2), the exchange waits on the tools step for the member to allow access.
 
 import type { ActivityRecipient, ActivityRequest, RecipientStatus } from '@/api/types'
 import { ms } from './time'
@@ -19,6 +20,8 @@ export type StepState =
   | 'skipped'
   /** Where the exchange stopped: no ack in time, or no answer in time. */
   | 'failed'
+  /** Tools: waiting for the recipient's member to allow access (M4 §2). */
+  | 'waiting'
 
 export interface Step {
   key: StepKey
@@ -34,6 +37,8 @@ export type Phase =
   | 'sending'
   | 'delivered'
   | 'working'
+  /** Acknowledged, and waiting for the member to allow a tool (M4 §2). */
+  | 'awaiting_access'
   | 'returning'
   | 'answered'
   | 'no_response'
@@ -52,20 +57,42 @@ export const PHASE_LABEL: Record<Phase, string> = {
   sending: 'Waiting for delivery',
   delivered: 'Waiting for ack',
   working: 'Working',
+  awaiting_access: 'Waiting for access',
   returning: 'Answer on its way back',
   answered: 'Answered',
   no_response: 'No response',
   timed_out: 'Timed out',
 }
 
-export const IN_FLIGHT: ReadonlySet<Phase> = new Set(['sending', 'delivered', 'working', 'returning'])
+export const IN_FLIGHT: ReadonlySet<Phase> = new Set(['sending', 'delivered', 'working', 'awaiting_access', 'returning'])
+
+/**
+ * The tool an acknowledged recipient is waiting for its member to allow (M4 §2): its most
+ * recent tool event is `waiting`. The next `ok` or `error` event for that tool (or any
+ * later event) clears it, and so does the exchange settling. Null when nothing waits.
+ */
+export function pendingGrant(r: ActivityRecipient): string | null {
+  if (r.status !== 'acked') return null
+  const last = r.tools.at(-1)
+  return last !== undefined && last.status === 'waiting' ? last.tool : null
+}
+
+/** The tool calls that ran (ok or error): a `waiting` event is a request, not a use. */
+export function usedTools(r: ActivityRecipient): ActivityRecipient['tools'] {
+  return r.tools.filter((t) => t.status !== 'waiting')
+}
+
+/** How to say who is being waited on: "you" for the viewer. */
+export function accessWaitLabel(member: string, me: string | null): string {
+  return `Waiting for ${member === me ? 'you' : member} to allow access`
+}
 
 export function phaseOf(r: ActivityRecipient): Phase {
   switch (r.status) {
     case 'answered':
       return r.answer_delivered_at ? 'answered' : 'returning'
     case 'acked':
-      return 'working'
+      return pendingGrant(r) !== null ? 'awaiting_access' : 'working'
     case 'pending':
       return r.delivered_at ? 'delivered' : 'sending'
     case 'no_response':
@@ -114,13 +141,15 @@ export function deriveTrack(req: ActivityRequest, r: ActivityRecipient): Track {
   const answered = r.status === 'answered'
   const acked = answered || r.status === 'acked' || r.status === 'timed_out' || ms(r.acked_at) !== null
   const delivered = acked || ms(r.delivered_at) !== null
-  const firstTool = r.tools.length > 0 ? Math.min(...r.tools.map((t) => ms(t.at) ?? Infinity)) : null
+  const used = usedTools(r)
+  const firstTool = used.length > 0 ? Math.min(...used.map((t) => ms(t.at) ?? Infinity)) : null
+  const awaiting = phase === 'awaiting_access'
 
   const reached: Record<StepKey, boolean> = {
     sent: true,
     delivered,
     acked,
-    tools: r.tools.length > 0,
+    tools: used.length > 0,
     answered,
     returned: answered && ms(r.answer_delivered_at) !== null,
   }
@@ -146,11 +175,14 @@ export function deriveTrack(req: ActivityRequest, r: ActivityRecipient): Track {
     focus = key
     break
   }
+  // Waiting for the member to allow a tool: that is what the exchange waits on now.
+  if (awaiting) focus = 'tools'
 
   let lastAt: number | null = null
   const steps: Step[] = order.map((key) => {
     let state: StepState
-    if (reached[key]) state = 'done'
+    if (awaiting && key === 'tools') state = 'waiting'
+    else if (reached[key]) state = 'done'
     else if (key === focus) state = failed ? 'failed' : 'current'
     else if (key === 'tools' && (answered || failed)) state = 'skipped'
     else state = 'upcoming'

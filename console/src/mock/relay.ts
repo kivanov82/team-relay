@@ -15,7 +15,6 @@ import type {
   DirectoryMember,
   ProgressEntry,
   RequestDetail,
-  ToolEvent,
 } from '@/api/types'
 import { FIXTURE_NOW, RQ, fixtureCapabilityDetail, fixtureDirectory, fixtureJoin, fixtureMe, fixtureRequests } from './fixtures'
 
@@ -76,7 +75,7 @@ const ack = (m: string, at: number): ScriptEvent => ({
   },
 })
 
-const tool = (m: string, at: number, name: string, status: ToolEvent['status'], durationMs: number): ScriptEvent => ({
+const tool = (m: string, at: number, name: string, status: 'ok' | 'error', durationMs: number): ScriptEvent => ({
   at,
   apply: (q, progress) => {
     rec(q, m).tools.push({ tool: name, status, at: iso(at), duration_ms: durationMs })
@@ -89,6 +88,25 @@ const tool = (m: string, at: number, name: string, status: ToolEvent['status'], 
       tool: name,
       status,
       duration_ms: durationMs,
+      time: iso(at),
+    })
+  },
+})
+
+/** M4 §2: the answering session asks its member to allow a tool (no duration). */
+const waiting = (m: string, at: number, name: string): ScriptEvent => ({
+  at,
+  apply: (q, progress) => {
+    rec(q, m).tools.push({ tool: name, status: 'waiting', at: iso(at), duration_ms: null })
+    progress.push({
+      seq: progress.length + 1,
+      member: m,
+      kind: 'tool',
+      text: null,
+      pct: null,
+      tool: name,
+      status: 'waiting',
+      duration_ms: null,
       time: iso(at),
     })
   },
@@ -193,7 +211,9 @@ function cycleScripts(k: number, t0: number): Script[] {
         deliver('bob', s(2.7)),
         ack('bob', s(6.1)),
         tool('bob', s(9.4), 'Grep', 'ok', 51),
-        tool('bob', s(12.2), 'Read', 'ok', 14),
+        // The key file is outside bob's shared folders: he is asked, and allows it.
+        waiting('bob', s(10.3), 'Read'),
+        tool('bob', s(19.2), 'Read', 'ok', 14),
         answer('bob', s(24.6), 'Yes. deploy/staging.env still references the August key; its rotation is scheduled for 1 October.'),
         returned('bob', s(25.8)),
       ],
@@ -365,6 +385,16 @@ function fixtureScripts(shift: number): Script[] {
         }
       case RQ.returning:
         return { base: b, events: [returned('carol', at(3))] }
+      case RQ.grant:
+        // carol allows the read; the answer follows.
+        return {
+          base: b,
+          events: [
+            tool('carol', at(6), 'Read', 'ok', 14),
+            answer('carol', at(14), 'It says to page the platform on-call if the backlog stays above 5,000 for ten minutes.'),
+            returned('carol', at(15.2)),
+          ],
+        }
       case RQ.capability:
         // Its progress notes, re-timed, so the detail sheet has them to show.
         return {
