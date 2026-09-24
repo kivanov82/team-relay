@@ -14,7 +14,8 @@
 //   from the console.
 // - GET /api/join, answered by the console server itself (never proxied): what a new member
 //   needs to install the plugin (relay URL, team, the repository to clone, marketplace and
-//   plugin names). Nothing secret; the same gate as the other /api routes.
+//   plugin names). Nothing secret; the same gate as the other /api routes. Hosted, it is
+//   answered only to a member of the team (M6-SPEC §7 item 6; below).
 // - Static files from dist/console/ under a strict CSP; a placeholder page when it is absent.
 //
 // Hosted mode (the container, CONSOLE_MODE=hosted, behind IAP):
@@ -23,7 +24,9 @@
 //   (x-goog-iap-jwt-assertion); anything else is a bare 401. The viewer's email from it is
 //   sent to the relay as X-Relay-On-Behalf-Of on each of the same routes. A viewer on no
 //   roster of the team (the relay's 403 not_a_member; M6-SPEC §4: any signed-in Google
-//   account reaches the page) gets 403 {"error": "not_on_team", "email"} and no data.
+//   account reaches the page) gets 403 {"error": "not_on_team", "email"} and no data. That
+//   includes /api/join: the relay is asked who the viewer is (/me) first, and only a member
+//   of the team gets the join details (M6-SPEC §7 item 6).
 
 import { createHash, timingSafeEqual } from 'node:crypto';
 import { existsSync, readFileSync, realpathSync, statSync } from 'node:fs';
@@ -523,8 +526,18 @@ export function createConsoleServer(opts: ConsoleServerOptions): ConsoleServer {
 
     const query = [...url.searchParams.keys()];
     if (path === '/api/join') {
-      // Answered here, from the server's own configuration; the relay is not asked.
+      // Answered here, from the server's own configuration, never proxied.
       if (query.length > 0) return sendJson(res, 400, { error: 'bad_request', detail: 'no query parameters here' });
+      if (hosted) {
+        // M6-SPEC §7 item 6: hosted, only a signed-in member of the team gets the join details.
+        // The relay is asked who the viewer is; anyone else gets the not-on-team response (the
+        // relay's 403 not_a_member), as on every other route, and nothing about joining.
+        try {
+          await opts.backend.me(ctx);
+        } catch (err) {
+          return failure(res, err, viewer);
+        }
+      }
       if (!opts.join) return sendJson(res, 404, { error: 'not_found' });
       return sendJson(res, 200, opts.join);
     }

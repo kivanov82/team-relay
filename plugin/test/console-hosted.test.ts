@@ -146,6 +146,8 @@ class FakeDelegateRelay {
   seen: Seen[] = [];
   /** How many of the next requests answer 401. */
   refuse = 0;
+  /** Viewers on no roster of the team: 403 not_a_member, as the relay answers them. */
+  nonMembers = new Set<string>();
   url = '';
   private server = createServer((req, res) => {
     const path = (req.url ?? '').split('?')[0]!;
@@ -160,6 +162,7 @@ class FakeDelegateRelay {
       return json(401, { error: 'unauthenticated' });
     }
     const viewer = req.headers['x-relay-on-behalf-of'];
+    if (typeof viewer === 'string' && this.nonMembers.has(viewer)) return json(403, { error: 'not_a_member', detail: 'not on this team' });
     if (path === '/v1/teams/demo/me') return json(200, { team: 'demo', member: viewer === 'alice@example.com' ? 'alice' : 'someone', teammates: ['bob'] });
     if (path === '/v1/teams/demo/directory') return json(200, { members: [], stats_complete: true });
     if (path === '/v1/teams/demo/activity') return json(200, { requests: [], next_since: null, server_time: new Date().toISOString() });
@@ -350,13 +353,14 @@ describe('hosted console server (M3-SPEC §3)', () => {
     expect(relay.seen).toHaveLength(0);
   });
 
-  it('answers /api/join itself, behind the same IAP gate, and never asks the relay', async () => {
+  it('answers /api/join itself, behind the same IAP gate, only to a member of the team (M6-SPEC §7 item 6)', async () => {
     const join = joinInfo('https://team-relay-xyz.a.run.app', 'demo', 'https://github.com/example/multiagent.git');
     const port = await hostedApp(join);
     const refused = await get(port, '/api/join');
     expect(refused.status).toBe(401);
     expect(refused.body).toBe('unauthorized\n');
     expect((await get(port, '/api/join', { assertion: await sign(other) })).status).toBe(401);
+    expect(relay.seen).toHaveLength(0);
     const ok = await get(port, '/api/join', { assertion: await sign(signer) });
     expect(ok.status).toBe(200);
     expect(ok.headers['content-type']).toMatch(/^application\/json/);
@@ -370,10 +374,41 @@ describe('hosted console server (M3-SPEC §3)', () => {
       plugin: 'team-relay',
       default_relay: false,
     });
+    // The relay was asked only who the viewer is, on the viewer's behalf; the join details
+    // themselves come from the server's own configuration.
+    expect(relay.seen.map((x) => `${x.method} ${x.path}`)).toEqual(['GET /v1/teams/demo/me']);
+    expect(relay.seen[0]!.headers['x-relay-on-behalf-of']).toBe('alice@example.com');
     expect((await get(port, '/api/join', { assertion: await sign(signer), method: 'POST' })).status).toBe(405);
     expect((await get(port, '/api/join?x=1', { assertion: await sign(signer) })).status).toBe(400);
     expect((await get(port, '/api/join', { assertion: await sign(signer), host: 'evil.example' })).status).toBe(403);
-    expect(relay.seen).toHaveLength(0);
+    expect(relay.seen).toHaveLength(1);
+  });
+
+  it('gives a signed-in account on no roster of the team the not-on-team response on /api/join, and no join details', async () => {
+    const join = joinInfo('https://team-relay-xyz.a.run.app', 'demo', 'https://github.com/example/multiagent.git');
+    const port = await hostedApp(join);
+    relay.nonMembers.add('mallory@example.com');
+    const res = await get(port, '/api/join', { assertion: await sign(signer, baseClaims({ email: 'mallory@example.com' })) });
+    expect(res.status).toBe(403);
+    expect(JSON.parse(res.body)).toEqual({ error: 'not_on_team', email: 'mallory@example.com' });
+    expect(res.body).not.toContain('team-relay-xyz');
+    expect(res.body).not.toContain('multiagent');
+    // The relay's own sign-in failing (a plain 401) is passed on as such, still with no details.
+    relay.refuse = 5;
+    const broken = await get(port, '/api/join', { assertion: await sign(signer) });
+    expect(broken.status).toBe(502);
+    expect(JSON.parse(broken.body)).toMatchObject({ error: 'relay_refused', relay_status: 401 });
+    expect(broken.body).not.toContain('team-relay-xyz');
+    relay.refuse = 0;
+    // Without a join configuration, a member gets 404 and a non-member still only not_on_team.
+    await app!.close();
+    await jwks.close();
+    await relay.close();
+    await metadata.close();
+    const bare = await hostedApp();
+    relay.nonMembers.add('mallory@example.com');
+    expect((await get(bare, '/api/join', { assertion: await sign(signer) })).status).toBe(404);
+    expect((await get(bare, '/api/join', { assertion: await sign(signer, baseClaims({ email: 'mallory@example.com' })) })).status).toBe(403);
   });
 
   it('refuses a Host other than CONSOLE_PUBLIC_HOST, even with a valid assertion', async () => {

@@ -187,10 +187,13 @@ describe('mock roster (M6 §2, §4)', () => {
     expect((await member.change('POST', '/api/roster', { member: 'dana', email: 'dana@example.com' }).json()).relay_status).toBe(403)
   })
 
-  it('answers not_on_team for a stranger, and still the join details', async () => {
+  it('answers not_on_team for a stranger, the join details included (M6 §7 item 6)', async () => {
     const relay = relayAt('alice', 0)
-    relay.stranger = true
     expect((await relay.handle('api/join')).status).toBe(200)
+    relay.stranger = true
+    const join = await relay.handle('api/join')
+    expect(join.status).toBe(403)
+    expect(await join.json()).toEqual({ error: 'not_on_team', email: 'dana@example.com' })
     const r = await relay.handle('api/me')
     expect(r.status).toBe(403)
     expect(await r.json()).toEqual({ error: 'not_on_team', email: 'dana@example.com' })

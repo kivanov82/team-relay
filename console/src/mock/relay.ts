@@ -713,9 +713,11 @@ export class MockRelay {
     const url = new URL(path, 'http://console.invalid/')
     const p = url.pathname.replace(/^\/+/, '/')
     const method = (init?.method ?? 'GET').toUpperCase()
-    // Answered by the console server itself, so it does not depend on the relay.
-    if (p === '/api/join') return json(fixtureJoin)
+    // A stranger gets nothing, the join details included (M6-SPEC §7 item 6: the hosted
+    // console answers /api/join only to a member of its team).
     if (this.stranger) return json({ error: 'not_on_team', email: 'dana@example.com' }, 403)
+    // Answered by the console server itself, so it does not depend on the relay being reachable.
+    if (p === '/api/join') return json(fixtureJoin)
     if (!this.reachable) return json({ error: 'relay_unreachable' }, 502)
     if (this.rateLimited) return json({ error: 'relay_refused', relay_status: 429, relay_error: 'rate_limited' }, 502)
     if (method !== 'GET') {
