@@ -27,6 +27,9 @@ const HOME_PATHS = [
 const ANY_DEPTH = [
   '**/.env', '**/.env.*', '**/.envrc', '**/*.pem', '**/*.key', '**/id_rsa*', '**/id_ed25519*',
   '**/*.p12', '**/*.pfx', '**/*.keystore', '**/*.jks', '**/credentials.json', '**/*.tfvars', '**/keystore/**',
+  // M8-SPEC §7 item 2
+  '**/.npmrc', '**/.netrc', '**/.pypirc', '**/.git-credentials', '**/id_ecdsa*', '**/id_dsa*', '**/*.ppk',
+  '**/*.tfstate', '**/*.tfstate.*', '**/.aws/**', '**/.kube/**',
 ];
 
 /** The whole deny list the launcher must write, in order. */
