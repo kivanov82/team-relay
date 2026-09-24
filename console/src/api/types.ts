@@ -12,6 +12,8 @@ export interface Me {
   teammates: string[]
   /** The viewer's email, when the server gives it (the join panel's commands use it). */
   email?: string
+  /** The viewer's role on the roster (M6), from relays that say. */
+  role?: RosterRole
 }
 
 /**

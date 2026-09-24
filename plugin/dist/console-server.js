@@ -23679,8 +23679,8 @@ function createConsoleServer(opts) {
     if (hosted2) return host === hosted2.publicHost;
     return host === `127.0.0.1:${port}` || host === `localhost:${port}`;
   }
-  function failure(res, err, path, viewer) {
-    if (hosted2 && viewer !== void 0 && err instanceof RelayError && (err.status === 401 || err.status === 404 && path === "/api/me")) {
+  function failure(res, err, viewer) {
+    if (hosted2 && viewer !== void 0 && err instanceof RelayError && err.status === 403 && err.code === "not_a_member") {
       return sendJson(res, 403, { error: "not_on_team", email: viewer });
     }
     if (err instanceof NotFound || err instanceof RelayError && err.status === 404) return sendJson(res, 404, { error: "not_found" });
@@ -23762,7 +23762,7 @@ function createConsoleServer(opts) {
     try {
       return sendJson(res, method === "POST" ? 201 : 200, await call());
     } catch (err) {
-      return failure(res, err, path, viewer);
+      return failure(res, err, viewer);
     }
   }
   async function api(req, res, url, viewer) {
@@ -23834,7 +23834,7 @@ function createConsoleServer(opts) {
     try {
       return sendJson(res, 200, await call());
     } catch (err) {
-      return failure(res, err, path, viewer);
+      return failure(res, err, viewer);
     }
   }
   function staticFile(req, res, url) {

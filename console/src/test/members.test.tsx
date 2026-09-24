@@ -303,3 +303,50 @@ describe('roster rules', () => {
     expect(markup.message).toBe('That member id or email is already on the team.')
   })
 })
+
+describe('a refused sign-in (M5 §6, M6 §4)', () => {
+  const refusing = () =>
+    setTransport(async (path) => {
+      const url = new URL(path, 'http://console.invalid/')
+      if (url.pathname === '/api/join') return json(fixtureJoin)
+      return json({ error: 'relay_refused', relay_status: 401, relay_error: 'unauthenticated' }, 502)
+    })
+
+  it('locally, says to run /team-relay:login again', async () => {
+    refusing()
+    renderWithClient(<App />)
+    const banner = await screen.findByRole('alert')
+    expect(banner).toHaveTextContent('The relay refused your sign-in')
+    expect(banner).toHaveTextContent('/team-relay:login')
+  })
+
+  it('hosted, a plain 401 is the console service, not the viewer: never the not-on-team page', async () => {
+    setConsoleKey(null)
+    Object.defineProperty(window, 'location', { configurable: true, value: new URL('https://console.team.example/') })
+    try {
+      refusing()
+      renderWithClient(<App />)
+      const banner = await screen.findByRole('alert')
+      expect(banner).toHaveTextContent('The console could not sign in to the relay')
+      expect(screen.queryByText("You're not on this team yet")).toBeNull()
+    } finally {
+      Object.defineProperty(window, 'location', { configurable: true, value: new URL('http://127.0.0.1:4317/') })
+    }
+  })
+})
+
+describe('owner from /me (M6 §2)', () => {
+  it('uses the role /me gives while the roster has not loaded', async () => {
+    setTransport(async (path) => {
+      const url = new URL(path, 'http://console.invalid/')
+      if (url.pathname === '/api/me') return json({ ...fixtureMe, role: 'owner' })
+      if (url.pathname === '/api/join') return json(fixtureJoin)
+      if (url.pathname === '/api/directory') return json(fixtureDirectory)
+      if (url.pathname === '/api/activity') return json(fixtureActivity)
+      if (url.pathname === '/api/roster') return new Promise<Response>(() => {})
+      return json({ error: 'not_found' }, 404)
+    })
+    renderWithClient(<App />)
+    await waitFor(() => expect(document.querySelector('[data-invite-hint]')).not.toBeNull())
+  })
+})

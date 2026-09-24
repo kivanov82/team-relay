@@ -34,7 +34,8 @@ export function Console() {
   const members = member ? mapMembers(member, me.data?.teammates ?? [], directory.data?.members, now) : []
   const held = openId ? (activity.data?.byId[openId] ?? null) : null
   const selected = held ? effectiveRequest(held, now) : null
-  const owner = isOwner(roster.data, member)
+  // The roster when it has loaded (it is read again after every change), else /me's role.
+  const owner = roster.data ? isOwner(roster.data, member) : me.data?.role === 'owner'
   // An older relay without a roster (404): no Members panel at all.
   const rosterMissing = roster.error?.kind === 'not_found'
 

@@ -68,8 +68,9 @@ RFC 8252 (no device codes, so nothing to phish):
 3. On the relay you sign in with Google, see the teams your account belongs to, and choose
    one. The relay sends the browser to `http://127.0.0.1:<port>/callback?code&state`.
 4. The listener takes exactly that request (`GET /callback`, `Host: 127.0.0.1:<port>`, the
-   `state` compared in constant time; anything else ends the sign-in), shows "Connected. You
-   can close this tab.", and exchanges the code and the verifier at `POST
+   `state` compared in constant time; anything else ends the sign-in; Cancel on the chooser
+   comes back as `?error=access_denied` and ends it as "sign-in cancelled"), shows
+   "Connected. You can close this tab.", and exchanges the code and the verifier at `POST
    {relay}/v1/login/token` for a device credential (`trc_…`).
 5. The credential is stored in `$XDG_CONFIG_HOME/team-relay/credentials.json` (default
    `~/.config/team-relay/`), `{relay_url, team, member, credential, expires_at}`, the
@@ -373,9 +374,11 @@ The same server runs in a container on Cloud Run behind IAP (`Dockerfile.console
   required in hosted mode) and `X-Relay-On-Behalf-Of: <viewer email, lower-cased>`; the
   relay acts as that member (M3-SPEC §2; roster changes need the delegate's `manage-roster`
   scope and an owner, M6-SPEC §3);
-- answers `403 {"error": "not_on_team", "email"}` when the relay does not know the signed-in
-  account (IAP admits any Google account, M6-SPEC §5), and the console shows "You're not on
-  this team yet. Ask the owner to add <email>." with no data.
+- answers `403 {"error": "not_on_team", "email"}` when the relay says the signed-in account is
+  on no roster of the team (its `403 not_a_member`; IAP admits any Google account, M6-SPEC
+  §5), and the console shows "You're not on this team yet. Ask the owner to add <email>."
+  with no data. A plain `401` from the relay is the console's own sign-in failing (a setup
+  problem) and is shown as such;
 
 `IAP_AUDIENCE` for a Cloud Run service is, in Google's "signed headers" documentation,
 `/projects/PROJECT_NUMBER/locations/REGION/services/SERVICE_NAME` (the project *number*).

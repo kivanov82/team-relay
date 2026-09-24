@@ -25888,6 +25888,7 @@ function respond(res, status, body) {
   });
   res.end(body);
 }
+var SUPERSEDED = "the sign-in was replaced by a newer one or a logout";
 var LoginError = class extends Error {
   constructor(message) {
     super(message);
@@ -26021,6 +26022,12 @@ async function startLogin(opts) {
     if (states.length !== 1 || !STATE_RE.test(states[0]) || !sameSecret(states[0], state)) {
       return bad("This answer does not belong to the sign-in Claude Code started.", "state mismatch");
     }
+    const errors = url2.searchParams.getAll("error");
+    if (errors.length > 0) {
+      respond(res, 200, page("Sign-in cancelled", "Nothing was changed. You can close this tab."));
+      log2(`the sign-in was cancelled in the browser (${/^[a-z_]{1,40}$/.test(errors[0]) ? errors[0] : "error"})`);
+      return fail2("sign-in cancelled in the browser; run /team-relay:login to try again");
+    }
     if (codes.length !== 1 || !CODE_RE.test(codes[0])) return bad("The sign-in answer carried no code.", "no code");
     respond(res, 200, page("Connected", "Connected. You can close this tab."));
     void exchange(codes[0]);
@@ -26050,7 +26057,7 @@ async function startLogin(opts) {
   } catch {
     log2("could not open a browser; open the sign-in link yourself");
   }
-  return { url, port, done, cancel: () => fail2("the sign-in was cancelled") };
+  return { url, port, done, cancel: () => fail2(SUPERSEDED) };
 }
 
 // src/notify.ts
@@ -33592,7 +33599,7 @@ var AskerConnection = class {
         if (this.pending === flow) this.pending = null;
         const why = describeError(err);
         log(`sign-in ended: ${why}`);
-        if (!/cancelled/.test(why)) void this.status(`team-relay: the sign-in did not complete: ${why}.`);
+        if (!why.includes(SUPERSEDED)) void this.status(`team-relay: the sign-in did not complete: ${why}.`);
       }
     );
     const envMode = configValue(this.env.RELAY_AUTH);

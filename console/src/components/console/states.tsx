@@ -90,14 +90,18 @@ export function UnreachableBanner({ conn }: { conn: Extract<Connection, { state:
       <div className="flex min-w-0 flex-col gap-0.5">
         <span className="font-semibold text-foreground">
           {conn.signInRefused
-            ? 'The relay refused your sign-in'
+            ? isHosted()
+              ? 'The console could not sign in to the relay'
+              : 'The relay refused your sign-in'
             : relay
               ? 'The relay is not answering'
               : 'The console server is not answering'}
         </span>
         <span className="text-subtle">
           {conn.signInRefused
-            ? 'You were signed out, your sign-in expired, or you are no longer on the team. Run /team-relay:login in Claude Code, then start the console again.'
+            ? isHosted()
+              ? 'The relay refused the console service itself: a setup problem, not your account. Tell the team owner.'
+              : 'You were signed out, your sign-in expired, or you are no longer on the team. Run /team-relay:login in Claude Code, then start the console again.'
             : relay
             ? isHosted()
               ? 'The console is running, but its calls to the relay fail.'

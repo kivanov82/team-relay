@@ -110,6 +110,17 @@ describe('login tool (M5-SPEC §2, §6)', () => {
     expect(JSON.parse((await call(s, 'whoami')).text).connected).toBe(false);
   });
 
+  it('a cancel on the chooser says so on the channel, and a later login works', async () => {
+    relay.loginCancel = true;
+    const s = await asker();
+    await call(s, 'login', { relay_url: relay.url });
+    const note = await waitFor(() => statusNotes(s).find((n) => /did not complete/.test(n.content)), 10_000, 'the cancel status');
+    expect(note.content).toMatch(/sign-in cancelled in the browser/);
+    relay.loginCancel = false;
+    await call(s, 'login', { relay_url: relay.url });
+    await waitFor(() => statusNotes(s).find((n) => /signed in as alice/.test(n.content)), 10_000, 'the signed-in status');
+  });
+
   it('refuses a relay URL that is not https', async () => {
     const s = await asker();
     const r = await call(s, 'login', { relay_url: 'http://relay.example.com' });

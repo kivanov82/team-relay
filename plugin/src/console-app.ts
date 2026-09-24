@@ -21,9 +21,9 @@
 // - Binds 0.0.0.0; the Host must equal the service's public host exactly.
 // - No console key: every request, static files included, must carry a valid IAP assertion
 //   (x-goog-iap-jwt-assertion); anything else is a bare 401. The viewer's email from it is
-//   sent to the relay as X-Relay-On-Behalf-Of on each of the same routes. A viewer the relay
-//   does not know (M6-SPEC §4: any signed-in Google account reaches the page) gets 403
-//   {"error": "not_on_team", "email"} and no data.
+//   sent to the relay as X-Relay-On-Behalf-Of on each of the same routes. A viewer on no
+//   roster of the team (the relay's 403 not_a_member; M6-SPEC §4: any signed-in Google
+//   account reaches the page) gets 403 {"error": "not_on_team", "email"} and no data.
 
 import { createHash, timingSafeEqual } from 'node:crypto';
 import { existsSync, readFileSync, realpathSync, statSync } from 'node:fs';
@@ -398,9 +398,11 @@ export function createConsoleServer(opts: ConsoleServerOptions): ConsoleServer {
   }
 
   /** A relay (or demo) failure as the console answers it. */
-  function failure(res: ServerResponse, err: unknown, path: string, viewer: string | undefined): void {
-    // M6-SPEC §4: hosted, a signed-in account the relay does not know gets no data, only this.
-    if (hosted && viewer !== undefined && err instanceof RelayError && (err.status === 401 || (err.status === 404 && path === '/api/me'))) {
+  function failure(res: ServerResponse, err: unknown, viewer: string | undefined): void {
+    // M6-SPEC §4: hosted, a signed-in account on no roster of this team (the relay's 403
+    // not_a_member for the delegate's on-behalf-of) gets no data, only this. A plain 401 is
+    // the console's own sign-in to the relay failing: a misconfiguration, passed on as such.
+    if (hosted && viewer !== undefined && err instanceof RelayError && err.status === 403 && err.code === 'not_a_member') {
       return sendJson(res, 403, { error: 'not_on_team', email: viewer });
     }
     if (err instanceof NotFound || (err instanceof RelayError && err.status === 404)) return sendJson(res, 404, { error: 'not_found' });
@@ -486,7 +488,7 @@ export function createConsoleServer(opts: ConsoleServerOptions): ConsoleServer {
     try {
       return sendJson(res, method === 'POST' ? 201 : 200, await call());
     } catch (err) {
-      return failure(res, err, path, viewer);
+      return failure(res, err, viewer);
     }
   }
 
@@ -573,7 +575,7 @@ export function createConsoleServer(opts: ConsoleServerOptions): ConsoleServer {
     try {
       return sendJson(res, 200, await call());
     } catch (err) {
-      return failure(res, err, path, viewer);
+      return failure(res, err, viewer);
     }
   }
 

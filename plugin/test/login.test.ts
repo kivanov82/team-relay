@@ -314,6 +314,22 @@ describe('login flow (M5-SPEC §2 steps 1 and 6)', () => {
     expect(existsSync(credFile())).toBe(false);
   });
 
+  it('stops waiting when the member cancels on the chooser (error=access_denied), and stores nothing', async () => {
+    relay.loginCancel = true;
+    const flow = await startLogin({ relayUrl: relay.url, credentialsFile: credFile(), open: () => {} });
+    expect(await browse(flow.url)).toBe(200);
+    await expect(flow.done).rejects.toThrow(/sign-in cancelled/);
+    expect(existsSync(credFile())).toBe(false);
+    expect(relay.requests.some((r) => r.path === '/v1/login/token')).toBe(false);
+  });
+
+  it('a cancel with the wrong state is a state mismatch, not a cancel', async () => {
+    const flow = await startLogin({ relayUrl: relay.url, credentialsFile: credFile(), open: () => {} });
+    const res = await fetch(`http://127.0.0.1:${flow.port}/callback?error=access_denied&state=${'x'.repeat(43)}`);
+    expect(res.status).toBe(400);
+    await expect(flow.done).rejects.toThrow(/state mismatch/);
+  });
+
   it('refuses an answer that names another relay', async () => {
     relay.loginRelayUrl = 'https://evil.example.com';
     const flow = await startLogin({ relayUrl: relay.url, credentialsFile: credFile(), open: () => {} });

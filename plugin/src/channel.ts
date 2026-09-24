@@ -37,7 +37,7 @@ import {
   removeCredential,
   type StoredCredential,
 } from './credentials.js';
-import { startLogin, type LoginFlow } from './login.js';
+import { SUPERSEDED, startLogin, type LoginFlow } from './login.js';
 import { defaultRelayUrl } from './relay-default.js';
 import { envelopeToNotification, neutraliseDeep, RecentIds } from './notify.js';
 import { findCapability, loadManifest, validateManifest, validateParams, codePointLength, hasLoneSurrogate } from './manifest.js';
@@ -695,7 +695,8 @@ class AskerConnection {
         if (this.pending === flow) this.pending = null;
         const why = describeError(err);
         log(`sign-in ended: ${why}`);
-        if (!/cancelled/.test(why)) void this.status(`team-relay: the sign-in did not complete: ${why}.`);
+        // A sign-in replaced by a newer one (or a logout) is not news; anything else is.
+        if (!why.includes(SUPERSEDED)) void this.status(`team-relay: the sign-in did not complete: ${why}.`);
       },
     );
     const envMode = configValue(this.env.RELAY_AUTH);

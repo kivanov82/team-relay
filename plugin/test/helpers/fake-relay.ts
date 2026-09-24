@@ -79,6 +79,8 @@ export class FakeRelay {
   loginAs = 'alice';
   /** When set, /v1/login/token answers with this status and error instead. */
   loginRefusal: { status: number; error: string } | null = null;
+  /** When set, the member presses Cancel on the chooser: the browser comes home with ?error=access_denied. */
+  loginCancel = false;
   /** When set, /v1/login/token names this relay_url instead of this relay's own. */
   loginRelayUrl: string | null = null;
   readonly logins = new Map<string, { challenge: string; state: string; port: number; device: string; member: string; used: boolean }>();
@@ -414,6 +416,10 @@ export class FakeRelay {
     const device = q.get('device') ?? '';
     if (!(port >= 1024 && port <= 65535) || !/^[A-Za-z0-9_-]{43}$/.test(state) || !/^[A-Za-z0-9_-]{43}$/.test(challenge) || q.get('code_challenge_method') !== 'S256' || !/^[A-Za-z0-9 ._()-]{1,64}$/.test(device)) {
       return this.send(res, 400, { error: 'bad_request' });
+    }
+    if (this.loginCancel) {
+      res.writeHead(303, { Location: `http://127.0.0.1:${port}/callback?error=access_denied&state=${state}`, 'Content-Length': '0' });
+      return res.end();
     }
     const code = randomBytes(32).toString('base64url');
     this.logins.set(code, { challenge, state, port, device, member: this.loginAs, used: false });

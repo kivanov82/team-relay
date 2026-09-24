@@ -254,18 +254,29 @@ describe('roster proxy, hosted (M6-SPEC §3, §4)', () => {
     expect(relayCalls(relay)).toHaveLength(1);
   });
 
-  it('a signed-in account the relay does not know gets not_on_team and no data', async () => {
+  const NOT_A_MEMBER = { error: 'not_a_member', detail: 'not on this team' };
+
+  it('a signed-in account on no roster (the relay\'s 403 not_a_member) gets not_on_team and no data', async () => {
     for (const path of ['/api/me', '/api/directory', '/api/activity', '/api/roster']) {
-      relay.fail((r) => r.path.startsWith('/v1/teams/demo/'), 401, 1);
+      relay.fail((r) => r.path.startsWith('/v1/teams/demo/'), 403, 1, NOT_A_MEMBER);
       const r = await hosted('GET', path);
       expect(r.status, path).toBe(403);
       expect(r.json(), path).toEqual({ error: 'not_on_team', email: VIEWER });
     }
-    relay.fail((r) => r.path === '/v1/teams/demo/me', 404, 1);
-    expect((await hosted('GET', '/api/me')).json()).toEqual({ error: 'not_on_team', email: VIEWER });
-    relay.fail((r) => r.path === '/v1/teams/demo/roster', 401, 1);
+    relay.fail((r) => r.path === '/v1/teams/demo/roster', 403, 1, NOT_A_MEMBER);
     const change = await hosted('POST', '/api/roster', { headers: SAME_ORIGIN, body: JSON.stringify({ member: 'dave', email: 'dave@example.com' }) });
     expect(change.json()).toEqual({ error: 'not_on_team', email: VIEWER });
+  });
+
+  it('a plain 401 from the relay is the console\'s own sign-in failing: passed on, never not_on_team', async () => {
+    relay.fail((r) => r.path === '/v1/teams/demo/me', 401, 1);
+    const r = await hosted('GET', '/api/me');
+    expect(r.status).toBe(502);
+    expect(r.json()).toMatchObject({ error: 'relay_refused', relay_status: 401 });
+    // Another 403 (an owner-only route for a member) is not not_on_team either.
+    relay.fail((r) => r.path === '/v1/teams/demo/roster', 403, 1, { error: 'forbidden' });
+    const f = await hosted('POST', '/api/roster', { headers: SAME_ORIGIN, body: JSON.stringify({ member: 'dave', email: 'dave@example.com' }) });
+    expect(f.json()).toMatchObject({ error: 'relay_refused', relay_status: 403, relay_error: 'forbidden' });
   });
 });
 
