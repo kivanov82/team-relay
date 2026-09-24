@@ -443,8 +443,10 @@ pnpm generate --check # fails when those files are out of date
 ```
 
 `pnpm test` never runs `test/e2e/`. `../scripts/e2e.sh` (Docker and `../relay/.venv` needed)
-starts a Firestore emulator on 127.0.0.1:8682 and the relay with throwaway static tokens,
-builds `dist/`, runs `pnpm test:e2e` with `E2E=1`, and tears everything down on exit.
+starts a Firestore emulator on 127.0.0.1:8682 and the relay with throwaway static tokens and a
+fake Google sign-in (`relay/tests/fake_oauth_app.py`), builds `dist/`, runs `pnpm test:e2e`
+with `E2E=1`, and tears everything down on exit. The sign-in scenarios drive the real login
+tool with a headless stub browser (`test/fixtures/fake-browser.mjs`).
 
 After changing `manifest.yaml`, run `pnpm generate` and commit the result; after changing
 `src/`, run `pnpm build` and commit `dist/`.
