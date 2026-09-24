@@ -8,6 +8,9 @@
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { randomBytes } from 'node:crypto';
+import { mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { DIST, FIXTURES, baseEnv, textOf } from '../helpers/mcp.js';
 
 export const TEAM = 'demo';
@@ -207,7 +210,29 @@ function alive(pid: number): boolean {
  * it to find). Scenario 8 of m1.test.ts overrides it with 0: a session without the channel.
  */
 export function channelEnv(member: Member, role: 'asker' | 'answerer', extra: Record<string, string> = {}): Record<string, string> {
-  return { RELAY_URL: relayUrl(), RELAY_TEAM: TEAM, RELAY_TOKEN: tokenOf(member), RELAY_ROLE: role, TEAM_RELAY_CHANNEL: '1', ...extra };
+  return {
+    RELAY_URL: relayUrl(),
+    RELAY_TEAM: TEAM,
+    RELAY_TOKEN: tokenOf(member),
+    RELAY_ROLE: role,
+    TEAM_RELAY_CHANNEL: '1',
+    // M8: each member is on a computer of their own (the answering lock is per computer), and a
+    // working session answers automatically only in the scenarios about that (m8.test.ts).
+    XDG_CONFIG_HOME: configHomeOf(member),
+    TEAM_RELAY_AUTO_ANSWER: '0',
+    ...extra,
+  };
+}
+
+const configHomes = new Map<Member, string>();
+/** A private config directory per member, for this test process: that member's "computer". */
+export function configHomeOf(member: Member): string {
+  let d = configHomes.get(member);
+  if (!d) {
+    d = mkdtempSync(join(tmpdir(), `e2e-${member}-cfg-`));
+    configHomes.set(member, d);
+  }
+  return d;
 }
 
 /** bob offers staging_db_query with the synthetic runner; nobody else offers anything. */

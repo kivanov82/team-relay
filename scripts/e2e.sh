@@ -29,6 +29,15 @@
 # test/e2e/m7.test.ts runs: a question to a member whose answering session is not running
 # produces the waiting notice in their channel working session (nothing reads their inbox
 # meanwhile), and is delivered once when their answering session starts.
+#
+# M8 (docs/M8-SPEC.md §6): test/e2e/m8.test.ts always runs: bob's channel working session
+# answers on its own from a throwaway folder, with test/fixtures/stub-claude.mjs standing in for
+# the headless answerer (TEAM_RELAY_CLAUDE_BIN; no model is called). A question inside the
+# folder is answered automatically; one that needs a read outside it, a flagged draft and a
+# capability call each wait until bob approves them in an MCP elicitation dialog (played by the
+# test's client); a lapse sends nothing. Each member runs with a config directory of its own (a
+# computer of its own: the answering lock is per computer), and the other scenarios' working
+# sessions do not answer automatically (TEAM_RELAY_AUTO_ANSWER=0).
 # Extra arguments are passed to vitest. The tokens are never printed.
 set -euo pipefail
 

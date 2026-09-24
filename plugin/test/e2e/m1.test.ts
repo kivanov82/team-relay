@@ -122,8 +122,9 @@ describe.skipIf(!ENABLED)('M1 end to end (relay + Firestore emulator + bundled s
       expect(JSON.stringify(caps)).not.toContain('permission');
     }
     const askerTools = (await alice.client.listTools()).tools.map((t) => t.name).sort();
-    // M5-SPEC §6: login and whoami join the asker's tools; §9 item 2: logout is not a tool.
-    expect(askerTools).toEqual(['ask_question', 'invoke_capability', 'list_teammates', 'login', 'login_wait', 'request_status', 'whoami']);
+    // M5-SPEC §6: login and whoami join the asker's tools; §9 item 2: logout is not a tool;
+    // M8-SPEC §4: review_approvals (/team-relay:approvals).
+    expect(askerTools).toEqual(['ask_question', 'invoke_capability', 'list_teammates', 'login', 'login_wait', 'request_status', 'review_approvals', 'whoami']);
     const answererTools = (await bob.client.listTools()).tools.map((t) => t.name).sort();
     expect(answererTools).toEqual(['ack_question', 'reply']);
     expect((await bobCaps.client.listTools()).tools.map((t) => t.name)).toEqual(['staging_db_query']);
