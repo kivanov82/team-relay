@@ -359,3 +359,15 @@ describe('the member id field', () => {
     }
   })
 })
+
+describe('the team map label', () => {
+  it('summarises both sessions like the two rings', async () => {
+    const { presenceSummary } = await import('@/components/console/team-map')
+    expect(presenceSummary('online', null)).toBe('online, not answering')
+    expect(presenceSummary('online', 'offline')).toBe('online, not answering')
+    expect(presenceSummary('offline', 'online')).toBe('online')
+    expect(presenceSummary('idle', 'online')).toBe('online')
+    expect(presenceSummary('idle', 'offline')).toBe('idle, not answering')
+    expect(presenceSummary(null, null)).toBe('offline')
+  })
+})

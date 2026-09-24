@@ -278,9 +278,24 @@ export function TeamMap({
   )
 }
 
+/**
+ * One word or two for both sessions, matching the two rings: the better of the two, and
+ * "not answering" when only the working session is there (the inner ring is green, the
+ * outer one is not).
+ */
+export function presenceSummary(working: Presence | null, answering: Presence | null): string {
+  const rank: Record<Presence, number> = { offline: 0, idle: 1, online: 2 }
+  const w = working ?? 'offline'
+  const a = answering ?? 'offline'
+  const best = rank[w] >= rank[a] ? w : a
+  if (best === 'offline') return 'offline'
+  const label = PRESENCE_LABEL[best].toLowerCase()
+  return a === 'offline' ? `${label}, not answering` : label
+}
+
 /** Right-hand nodes are labelled to their right, so edges between them never cross a label. */
 function NodeLabel({ member: m, side }: { member: MapMember; side: 'right' | 'below' }) {
-  const sub = m.you ? 'you' : m.open > 0 ? `${m.open} open` : PRESENCE_LABEL[m.answering ?? 'offline'].toLowerCase()
+  const sub = m.you ? 'you' : m.open > 0 ? `${m.open} open` : presenceSummary(m.working, m.answering)
   const x = side === 'right' ? OUTER_R + 9 : 0
   const y = side === 'right' ? -3 : OUTER_R + 16
   const anchor = side === 'right' ? 'start' : 'middle'
