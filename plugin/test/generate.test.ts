@@ -24,6 +24,26 @@ describe('generator', () => {
     expect(run({ check: true }).drifted).toEqual([]);
   });
 
+  it('licenses the plugin and its marketplace entry under MIT, as LICENSE says', () => {
+    const plugin = JSON.parse(readFileSync(join(PLUGIN_ROOT, '.claude-plugin', 'plugin.json'), 'utf8'));
+    expect(plugin.license).toBe('MIT');
+    const market = JSON.parse(readFileSync(join(PLUGIN_ROOT, '..', '.claude-plugin', 'marketplace.json'), 'utf8'));
+    expect(market.plugins.find((p: { name: string }) => p.name === 'team-relay').license).toBe('MIT');
+    expect(readFileSync(join(PLUGIN_ROOT, '..', 'LICENSE'), 'utf8')).toMatch(/^MIT License/);
+    // A plugin.json without it gets it back, after author; one with another value is corrected.
+    const dir = copyPlugin();
+    const path = join(dir, '.claude-plugin', 'plugin.json');
+    const { license: _l, ...bare } = plugin;
+    writeFileSync(path, JSON.stringify({ ...bare, license: undefined }, null, 2) + '\n');
+    expect(run({ root: dir, check: true }).drifted).toEqual([path]);
+    run({ root: dir, check: false });
+    const fixed = JSON.parse(readFileSync(path, 'utf8'));
+    expect(Object.keys(fixed).indexOf('license')).toBe(Object.keys(fixed).indexOf('author') + 1);
+    writeFileSync(path, JSON.stringify({ ...fixed, license: 'Apache-2.0' }, null, 2) + '\n');
+    run({ root: dir, check: false });
+    expect(JSON.parse(readFileSync(path, 'utf8')).license).toBe('MIT');
+  });
+
   it('asks no install questions: plugin.json has no userConfig (M5-SPEC §6)', () => {
     const plugin = JSON.parse(readFileSync(join(PLUGIN_ROOT, '.claude-plugin', 'plugin.json'), 'utf8'));
     expect(plugin.userConfig).toBeUndefined();

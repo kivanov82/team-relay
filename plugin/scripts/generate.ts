@@ -2,7 +2,10 @@
 //
 // - .claude-plugin/plugin.json: no `userConfig` at all (M5-SPEC §6: joining asks no install
 //   questions; the relay URL defaults, and capabilities are enabled where they run, in the
-//   answering session's environment). Every other key is left as it is.
+//   answering session's environment), and `"license": "MIT"` (the repository's LICENSE).
+//   Every other key is left as it is.
+// - ../.claude-plugin/marketplace.json (the repository's marketplace, when the plugin sits in
+//   the repository): this plugin's entry says `"license": "MIT"` too; nothing else changes.
 // - .mcp.json: the relay channel in asker role; it signs in with the stored credential.
 // - commands/answering.md: /team-relay:answering, which names each capability of
 //   manifest.yaml with the environment variables that offer it.
@@ -80,6 +83,25 @@ export function renderJson(value: unknown): string {
   return `${JSON.stringify(value, null, 2)}\n`;
 }
 
+/** The project's license (LICENSE at the repository root). */
+export const LICENSE = 'MIT';
+
+/** `obj` with `license` set: where it already is, else right after `after` (else at the end). */
+export function withLicense(obj: Record<string, unknown>, after: string): Record<string, unknown> {
+  if ('license' in obj) return { ...obj, license: LICENSE };
+  const out: Record<string, unknown> = {};
+  let placed = false;
+  for (const [k, v] of Object.entries(obj)) {
+    out[k] = v;
+    if (k === after) {
+      out.license = LICENSE;
+      placed = true;
+    }
+  }
+  if (!placed) out.license = LICENSE;
+  return out;
+}
+
 export type Rendered = { path: string; content: string };
 
 /** What the generator would write, for a plugin rooted at `root`. */
@@ -89,11 +111,22 @@ export function render(root: string = PLUGIN_ROOT): Rendered[] {
   const plugin = JSON.parse(readFileSync(pluginPath, 'utf8')) as Record<string, unknown>;
   // M5-SPEC §6: no install questions. Every other key is untouched, in its order.
   const { userConfig: _dropped, ...next } = plugin;
-  return [
-    { path: pluginPath, content: renderJson(next) },
+  const out: Rendered[] = [
+    { path: pluginPath, content: renderJson(withLicense(next, 'author')) },
     { path: join(root, '.mcp.json'), content: renderJson(buildMcpJson()) },
     { path: join(root, 'commands', 'answering.md'), content: buildAnsweringCommand(manifest) },
   ];
+  const marketplacePath = join(root, '..', '.claude-plugin', 'marketplace.json');
+  if (existsSync(marketplacePath)) {
+    const market = JSON.parse(readFileSync(marketplacePath, 'utf8')) as Record<string, unknown>;
+    const plugins = Array.isArray(market.plugins) ? market.plugins : [];
+    const name = typeof plugin.name === 'string' ? plugin.name : '';
+    market.plugins = plugins.map((p: unknown) =>
+      p && typeof p === 'object' && (p as { name?: unknown }).name === name ? withLicense(p as Record<string, unknown>, 'description') : p,
+    );
+    out.push({ path: marketplacePath, content: renderJson(market) });
+  }
+  return out;
 }
 
 export function run(opts: { root?: string; check: boolean }): { drifted: string[] } {

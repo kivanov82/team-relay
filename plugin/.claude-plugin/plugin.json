@@ -6,6 +6,7 @@
   "author": {
     "name": "Team relay maintainers"
   },
+  "license": "MIT",
   "keywords": [
     "channels",
     "team",
