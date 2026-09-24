@@ -18,6 +18,11 @@
 #
 # These are permission rules, not an OS sandbox: see the plugin README.
 #
+# Optional since M8: a channel working session answers teammates on its own (see the plugin
+# README). Only one answerer reads the inbox per computer (the answering lock in
+# ~/.config/team-relay/answering.lock), so this refuses to start while a working session
+# answers automatically.
+#
 # Environment (none of the relay settings is needed after /team-relay:login, M5-SPEC §6):
 #   RELAY_AUTH                             optional; unset: the credential /team-relay:login
 #                                          stored (see RELAY_CREDENTIALS_FILE) if there is one,
@@ -82,6 +87,24 @@ esac
 
 node_bin="$(command -v node || true)"
 [[ -n "$node_bin" ]] || die "node is required (Node 22 or later)"
+
+# --- One answerer per computer (M8-SPEC §1) ----------------------------------------------
+# A channel working session answers teammates on its own, holding the machine's answering
+# lock; so does this session's channel server once it runs. Two never read the same inbox.
+set +e
+lock_holder="$("$node_bin" "$plugin_root/dist/answering-lock-info.js")"
+lock_status=$?
+set -e
+if [[ $lock_status -eq 3 ]]; then
+  holder_role="$(ANSWERER_INFO="$lock_holder" "$node_bin" -e 'process.stdout.write(String(JSON.parse(process.env.ANSWERER_INFO).role))')"
+  holder_pid="$(ANSWERER_INFO="$lock_holder" "$node_bin" -e 'process.stdout.write(String(JSON.parse(process.env.ANSWERER_INFO).pid))')"
+  if [[ "$holder_role" == "host" ]]; then
+    die "refusing to start: your channel working session (pid $holder_pid) already answers teammates automatically; stop it, or start it with TEAM_RELAY_AUTO_ANSWER=0, to use this answering session instead"
+  fi
+  die "refusing to start: another answering session (pid $holder_pid) is already running on this computer"
+elif [[ $lock_status -ne 0 ]]; then
+  die "cannot check who answers on this computer (dist/answering-lock-info.js failed)"
+fi
 
 [[ -n "${HOME:-}" ]] || die "HOME is required"
 home_phys="$(cd "$HOME" 2>/dev/null && pwd -P)" || die "HOME is not a directory"
