@@ -23,7 +23,17 @@ Who the caller is (M5-SPEC §3, §4; M6-SPEC §1):
 
 A delegate may reach only the GET routes in DELEGATE_ROUTES, and with ``manage-roster`` the
 roster mutations in ROSTER_MUTATIONS (the service then requires the member it names to be an
-owner, as for anyone).
+owner, as for anyone). A delegate with ``team: "*"`` (M9-SPEC §5) acts in the team the URL
+names, for the member of that team its header's email is.
+
+Teams (M9-SPEC §1): a team the API created is a team while its record says so, read on every
+request that names it, so a deleted team is refused (``404``) and its credentials stop
+working (``401``) at once, on every instance.
+
+The account routes (M9-SPEC §2, §4) name no team: ``GET /v1/me/teams``, ``POST /v1/teams``
+and ``/v1/admin/teams``. They take a Google identity only: a Google ID token, or a delegate on
+behalf of an email (``manage-teams`` to create or to act for an admin); never a device
+credential (it is bound to its team) or a static token.
 
 The login pages (M5-SPEC §2) are unauthenticated and live under ``/v1/login``.
 """
@@ -33,7 +43,8 @@ from __future__ import annotations
 import os
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
-from datetime import timedelta
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from fastapi import Depends, FastAPI, Request
@@ -46,15 +57,16 @@ from .clock import Clock, utc_now
 from .config import Delegate, Identity, Settings, normalise_email
 from .credentials import looks_like_credential
 from .errors import ApiError, ConfigError, not_found
-from .jsonutil import BodyError, parse_json
+from .jsonutil import BodyError, parse_json, sha256_hex
 from .log import log_event
-from .login import LoginService
+from .login import LoginService, client_ip
 from .manifest import ManifestValidator
 from .oauth import GoogleOAuthProvider, OAuthProvider
 from .pages import stylesheet_response
 from .roster import email_hash
 from .service import Caller, RelayService
-from .store import Store
+from .store import Quota, Store, TeamGone
+from .teams import ADMIN_LIST_DEFAULT, ADMIN_LIST_MAX, parse_new_team, valid_team_id
 
 MAX_BODY_BYTES = 256 * 1024
 
@@ -93,6 +105,20 @@ _STATUS_CODES = {
     413: "too_large",
     415: "unsupported_media_type",
 }
+
+
+ACCOUNT_WINDOW_SECONDS = 60
+
+
+@dataclass(frozen=True)
+class Account:
+    """Who calls an account route (M9-SPEC §2): a Google account by its lower-cased email,
+    with the ID token's ``sub`` when it came with one; ``delegate`` when a delegate names
+    it."""
+
+    email: str
+    sub: str | None = None
+    delegate: Delegate | None = None
 
 
 def _error(err: ApiError) -> JSONResponse:
@@ -144,6 +170,14 @@ def _audited_action(request: Request) -> str | None:
     return "unknown"
 
 
+def _query_int(raw: str | None, name: str, low: int, high: int, default: int) -> int:
+    if raw is None:
+        return default
+    if not (raw.isascii() and raw.isdigit()) or len(raw) > 6 or not low <= int(raw) <= high:
+        raise ApiError(400, "invalid_query", f"{name} must be {low}..{high}")
+    return int(raw)
+
+
 def create_app(
     settings: Settings,
     store: Store,
@@ -161,6 +195,8 @@ def create_app(
     verifier = verifier if verifier is not None else build_verifier(settings)
     config = settings.team_config
     roster = service.roster
+    teams = service.teams
+    on_cloud_run = bool(os.environ.get("K_SERVICE"))
     login: LoginService | None = None
     if settings.public_url is not None:
         if oauth is None:
@@ -171,10 +207,11 @@ def create_app(
             settings,
             store,
             roster,
+            teams,
             service.credentials,
             oauth,
             service.now,
-            on_cloud_run=bool(os.environ.get("K_SERVICE")),
+            on_cloud_run=on_cloud_run,
         )
 
     @asynccontextmanager
@@ -183,6 +220,7 @@ def create_app(
         # lazily, before its roster is first read.
         try:
             await roster.seed_all()
+            await teams.ensure_seed_records()  # M9-SPEC §1
         except Exception as exc:
             log_event("roster_seed_failed", severity="ERROR", error=type(exc).__name__)
         yield
@@ -227,9 +265,11 @@ def create_app(
     class NotAMember(Unauthenticated):
         """A delegate named a well-formed email that is on no roster of its team."""
 
-    async def on_behalf_of(request: Request, delegate: Delegate) -> Identity:
-        """The member a delegate acts for (M3-SPEC §2): exactly one header naming, by email,
-        a member of the delegate's team on its roster, else 401. The value is never logged."""
+    class NoSuchTeam(Unauthenticated):
+        """A ``team: "*"`` delegate named a team that is not a team (now)."""
+
+    def on_behalf_email(request: Request) -> str:
+        """Exactly one ``X-Relay-On-Behalf-Of`` naming one email, else 401. Never logged."""
         values = request.headers.getlist(ON_BEHALF_HEADER)
         if not values:
             raise Unauthenticated("missing_on_behalf")
@@ -240,6 +280,20 @@ def create_app(
         email = normalise_email(values[0])
         if not email:
             raise Unauthenticated("unknown_on_behalf")
+        return email
+
+    async def on_behalf_of(request: Request, delegate: Delegate, team: str) -> Identity:
+        """The member a delegate acts for (M3-SPEC §2): exactly one header naming, by email,
+        a member of the delegate's team on its roster, else 401. For a ``team: "*"``
+        delegate (M9-SPEC §5) the delegate's team is the URL's, when it is a team."""
+        email = on_behalf_email(request)
+        if delegate.any_team:
+            if await teams.active(team) is None:
+                raise NoSuchTeam("no_such_team")
+            member = (await roster.snapshot(team)).member_for_email(email)
+            if member is None:
+                raise NotAMember("not_a_member")
+            return Identity(team=team, member=member)
         member = await roster.member_for_email(delegate.team, email)
         if member is None:
             # A well-formed email that is simply not on this team's roster (M6-SPEC §4): the
@@ -268,34 +322,58 @@ def create_app(
             return None, False
         return member, False
 
+    async def other_teams(verified: Verified, team: str) -> AsyncIterator[str]:
+        """Every other team the principal may be on: the file's, then (a Google account)
+        the created ones the account index names; looked up only when needed."""
+        for candidate in config.team_ids():
+            if candidate != team:
+                yield candidate
+        if verified.principal.startswith("google:"):
+            email = verified.principal.removeprefix("google:")
+            for candidate in await teams.indexed_teams(email):
+                if candidate != team:
+                    yield candidate
+
     async def resolve(verified: Verified, team: str) -> Identity:
-        """The principal's membership in ``team``, else in the first other team that has
-        one (for the 404), else 401 (M5-SPEC §4, M6-SPEC §7.4). A Google account whose
-        email is bound to another ``sub`` is not that member (M6-SPEC §7.2)."""
-        order = [team] if team in config.teams else []
-        order += [t for t in config.team_ids() if t != team]
+        """The principal's membership in ``team`` (when it is a team), else in the first
+        other team that has one (for the 404), else 401 (M5-SPEC §4, M6-SPEC §7.4). A
+        Google account whose email is bound to another ``sub`` is not that member
+        (M6-SPEC §7.2)."""
         rebound = False
-        for candidate in order:
+        if await teams.active(team) is not None:
+            member, flag = await member_in(verified, team)
+            if member is not None:
+                if flag:
+                    # The email's first use by a Google ID token on its own team binds it.
+                    assert verified.sub is not None
+                    email = verified.principal.removeprefix("google:")
+                    try:
+                        outcome = await roster.bind(team, member, email, verified.sub, retention)
+                    except TeamGone:
+                        raise Unauthenticated("team_deleted") from None
+                    if outcome == "other":
+                        raise Unauthenticated("sub_mismatch")
+                    if outcome == "gone":
+                        raise Unauthenticated("not_on_roster")
+                return Identity(team=team, member=member)
+            rebound = flag
+        async for candidate in other_teams(verified, team):
             member, flag = await member_in(verified, candidate)
             if member is None:
                 rebound = rebound or flag
                 continue
-            if flag and candidate == team:
-                # The email's first use by a Google ID token on its own team binds it.
-                assert verified.sub is not None
-                email = verified.principal.removeprefix("google:")
-                outcome = await roster.bind(team, member, email, verified.sub, retention)
-                if outcome == "other":
-                    raise Unauthenticated("sub_mismatch")
-                if outcome == "gone":
-                    raise Unauthenticated("not_on_roster")
             return Identity(team=candidate, member=member)
         raise Unauthenticated("sub_mismatch" if rebound else "unknown_principal")
 
-    async def from_credential(token: str) -> tuple[Identity, str]:
-        record = await service.credentials.authenticate(token)
+    async def from_credential(token: str, team: str) -> tuple[Identity, str]:
+        record = await service.credentials.authenticate(
+            token, team if valid_team_id(team) else None
+        )
         if record is None:
             raise Unauthenticated("bad_credential")
+        # M9-SPEC §1: a deleted team's credentials stop working at once, on every instance.
+        if await teams.active(record.team) is None:
+            raise Unauthenticated("team_deleted")
         entry = (await roster.snapshot(record.team)).entries.get(record.member)
         # Removed (M5-SPEC §3), or removed and added again since this credential was minted.
         if entry is None or record.created_at < entry.added_at:
@@ -316,13 +394,13 @@ def create_app(
             if token is None:
                 raise Unauthenticated("missing_bearer")
             if looks_like_credential(token):
-                identity, credential = await from_credential(token)
+                identity, credential = await from_credential(token, team)
             else:
                 verified = await verifier.verify(token)
                 # A delegate is never a member (M3-SPEC §2): checked first.
                 delegate = config.delegate(verified.principal)
                 if delegate is not None:
-                    identity = await on_behalf_of(request, delegate)
+                    identity = await on_behalf_of(request, delegate, team)
                 else:
                     identity = await resolve(verified, team)
         except Unauthenticated as exc:
@@ -339,6 +417,8 @@ def create_app(
                 raise ApiError(
                     403, "not_a_member", "This Google account is not a member of this team."
                 ) from None
+            if isinstance(exc, NoSuchTeam):
+                raise not_found() from None
             raise ApiError(401, "unauthenticated") from None
 
         if delegate is None:
@@ -399,6 +479,139 @@ def create_app(
         return caller
 
     CallerDep = Depends(authenticate)
+
+    # M9-SPEC §2, §4: the account routes -----------------------------------------------------
+    async def authenticate_account(request: Request) -> Account:
+        """A Google identity: a Google ID token (its email and ``sub``), or a delegate naming
+        an email in ``X-Relay-On-Behalf-Of``. A device credential is bound to its team and a
+        static token has no email: ``403 google_identity_required``."""
+        token = bearer_token(request.headers.get("authorization"))
+        delegate: Delegate | None = None
+        needs_google = ApiError(
+            403,
+            "google_identity_required",
+            "This needs a Google account: sign in with Google, not a device credential.",
+        )
+        try:
+            if token is None:
+                raise Unauthenticated("missing_bearer")
+            if looks_like_credential(token):
+                if await service.credentials.authenticate(token) is None:
+                    raise Unauthenticated("bad_credential")
+                raise needs_google
+            verified = await verifier.verify(token)
+            delegate = config.delegate(verified.principal)
+            if delegate is not None:
+                account = Account(email=on_behalf_email(request), delegate=delegate)
+            elif verified.principal.startswith("google:"):
+                if ON_BEHALF_HEADER in request.headers:
+                    raise ApiError(
+                        400, "bad_request", "X-Relay-On-Behalf-Of is only accepted from a delegate."
+                    )
+                email = normalise_email(verified.principal.removeprefix("google:"))
+                if email is None:
+                    raise Unauthenticated("bad_email")
+                account = Account(email=email, sub=verified.sub)
+            else:
+                raise needs_google
+        except Unauthenticated as exc:
+            log_event(
+                "auth_rejected",
+                severity="WARNING",
+                reason=exc.reason,
+                method=request.method,
+                path=request.url.path,
+                **({"delegate": delegate.principal} if delegate is not None else {}),
+            )
+            raise ApiError(401, "unauthenticated") from None
+        # Every account route reads several documents: one budget per account and minute.
+        now = service.now()
+        start = int(now.timestamp()) // ACCOUNT_WINDOW_SECONDS * ACCOUNT_WINDOW_SECONDS
+        quota = Quota(
+            key=f"account.{email_hash(account.email)[:32]}.{start}",
+            limit=config.limits.reads_per_minute,
+            expire_at=datetime.fromtimestamp(start + 2 * ACCOUNT_WINDOW_SECONDS, UTC),
+        )
+        if not await store.count_login_quota(quota):
+            log_event("account_rate_limited", severity="WARNING", path=request.url.path)
+            raise ApiError(429, "rate_limited", "Too many requests; wait a minute.")
+        return account
+
+    def refuse_delegate(account: Account, request: Request, detail: str) -> None:
+        assert account.delegate is not None
+        log_event(
+            "delegate_refused",
+            severity="WARNING",
+            delegate=account.delegate.principal,
+            method=request.method,
+            path=request.url.path,
+            status=403,
+        )
+        raise ApiError(403, "forbidden", detail)
+
+    async def admin_account(request: Request) -> Account:
+        """An admin (config ``admins``), by a Google ID token or through a ``manage-teams``
+        delegate. Admin is relay-wide and is not a team role (M9-SPEC §4)."""
+        account = await authenticate_account(request)
+        if account.delegate is not None and not account.delegate.manages_teams:
+            refuse_delegate(account, request, "This delegate may not act for an admin.")
+        if not config.is_admin(account.email):
+            log_event(
+                "admin_refused",
+                severity="WARNING",
+                method=request.method,
+                path=request.url.path,
+                via_delegate=account.delegate is not None,
+            )
+            raise ApiError(403, "forbidden", "Only a relay admin can do this.")
+        return account
+
+    @app.get("/v1/me/teams")
+    async def my_teams(request: Request) -> dict[str, Any]:
+        account = await authenticate_account(request)
+        only = None
+        if account.delegate is not None and not account.delegate.any_team:
+            only = account.delegate.team  # a per-team delegate sees its own team only
+        return await teams.my_teams(account.email, account.sub, only=only)
+
+    @app.post("/v1/teams")
+    async def create_team(request: Request) -> JSONResponse:
+        account = await authenticate_account(request)
+        if account.delegate is not None and not account.delegate.manages_teams:
+            refuse_delegate(account, request, "This delegate may not create teams.")
+        body = parse_new_team(await read_json_body(request))
+        # A delegate's address is the console's own: only the account limits count for it.
+        ip_hash = None
+        if account.delegate is None:
+            ip_hash = sha256_hex(client_ip(request, on_cloud_run))[:32]
+        created = await teams.create(
+            email=account.email,
+            sub=account.sub,
+            body=body,
+            ip_hash=ip_hash,
+            via=account.delegate.principal if account.delegate is not None else None,
+        )
+        return JSONResponse(created, status_code=201)
+
+    @app.get("/v1/admin/teams")
+    async def admin_teams(request: Request) -> dict[str, Any]:
+        await admin_account(request)
+        q = request.query_params
+        after = q.get("after")
+        if after is not None and not valid_team_id(after):
+            raise ApiError(400, "invalid_query", "after must be a team id")
+        limit = _query_int(q.get("limit"), "limit", 1, ADMIN_LIST_MAX, ADMIN_LIST_DEFAULT)
+        return await teams.admin_list(after, limit)
+
+    @app.delete("/v1/admin/teams/{team}")
+    async def admin_delete_team(team: str, request: Request) -> dict[str, Any]:
+        account = await admin_account(request)
+        raw = await read_json_body(request)
+        if not isinstance(raw, dict) or set(raw) != {"confirm"}:
+            raise ApiError(
+                422, "confirm_mismatch", 'Send {"confirm": "<team id>"} to delete the team.'
+            )
+        return await teams.delete(team, actor_email=account.email, confirm=raw["confirm"])
 
     @app.get("/healthz")
     async def healthz() -> dict[str, bool]:
@@ -465,6 +678,10 @@ def create_app(
     @app.post("/v1/login/choose")
     async def login_choose(request: Request) -> Response:
         return await login_service().choose(request)
+
+    @app.post("/v1/login/create")
+    async def login_create(request: Request) -> Response:
+        return await login_service().create(request)
 
     @app.post("/v1/login/token")
     async def login_token(request: Request) -> Response:

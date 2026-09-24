@@ -227,6 +227,7 @@ async def test_an_owner_adds_a_member_who_then_works(api: Api):
     r = await api.client.get(api.url("/me"), headers=cred)
     assert r.json() == {
         "team": api.team,
+        "name": api.team,
         "member": "erin",
         "teammates": ["alice", "bob", "carol"],
         "role": "member",

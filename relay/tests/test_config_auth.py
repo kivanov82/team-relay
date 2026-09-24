@@ -257,12 +257,19 @@ async def test_me(client):
     assert r.status_code == 200
     assert r.json() == {
         "team": "demo",
+        "name": "demo",
         "member": "bob",
         "teammates": ["alice", "carol"],
         "role": "member",
     }
     r = await client.get("/v1/teams/other/me", headers=auth("dave"))
-    assert r.json() == {"team": "other", "member": "dave", "teammates": [], "role": "owner"}
+    assert r.json() == {
+        "team": "other",
+        "name": "other",
+        "member": "dave",
+        "teammates": [],
+        "role": "owner",
+    }
 
 
 async def test_unknown_routes_and_methods(client):

@@ -325,11 +325,15 @@ async def test_the_id_token_is_checked(api: Api, grant: dict[str, Any], title: s
 
 
 async def test_an_account_on_no_team(api: Api, capsys):
+    """M9-SPEC §3: no longer the end of the flow: the page offers to create a team."""
     started = await start(api.client)
     r = await google(api.client, api.fake, started, "Mallory@Example.com")
-    assert r.status_code == 403
-    assert "This Google account is not on any team" in r.text
-    assert "Ask the team owner to add mallory@example.com." in r.text
+    assert r.status_code == 200
+    assert "You're not on a team yet" in r.text
+    assert "Ask a team owner to add" in r.text and "mallory@example.com" in r.text
+    assert 'action="/v1/login/create"' in r.text
+    assert 'name="team" value=""' in r.text  # no team to choose: the create form's field
+    assert 'type="radio"' not in r.text
     assert "mallory@example.com" not in capsys.readouterr().out  # never logged
 
 

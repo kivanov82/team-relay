@@ -64,8 +64,13 @@ class Credentials:
         self._now = now
         self._cache: OrderedDict[str, _Cached] = OrderedDict()
 
-    async def authenticate(self, credential: str) -> CredentialRecord | None:
-        """The live credential, or None (malformed, unknown, revoked, expired)."""
+    async def authenticate(
+        self, credential: str, hint: str | None = None
+    ) -> CredentialRecord | None:
+        """The live credential, or None (malformed, unknown, revoked, expired). ``hint`` is
+        the team the request names (looked in first, with the file's teams); a credential of
+        any other team is found through its pointer (M9-SPEC §1). Whether its team is still
+        a team is the caller's check."""
         if CREDENTIAL_RE.fullmatch(credential) is None:
             return None
         key = credential_key(credential)
@@ -77,7 +82,8 @@ class Credentials:
             record = hit.record
         else:
             self._cache.pop(key, None)
-            record = await self._store.find_credential(self._teams, key)
+            teams = ((hint,) if hint is not None else ()) + self._teams
+            record = await self._store.find_credential(teams, key)
             if record is None:
                 return None
             self._remember(record, now)
@@ -98,6 +104,11 @@ class Credentials:
     def forget(self, keys: Sequence[str]) -> None:
         for key in keys:
             self._cache.pop(key, None)
+
+    def forget_team(self, team: str) -> None:
+        stale = [key for key, cached in self._cache.items() if cached.record.team == team]
+        for key in stale:
+            del self._cache[key]
 
     def forget_member(self, team: str, member: str) -> None:
         stale = [

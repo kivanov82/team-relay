@@ -23,6 +23,13 @@
   recorded (first sign-in) or checked again, in a roster transaction, before a code is
   minted. The credential records the SHA-256 of the email it was minted through (§7.1), and
   the token response names the email (M5-SPEC §9.3).
+- Creating a team (M9-SPEC §3): an account on no team gets "You're not on a team yet" with a
+  form, at step ``choose`` with no choices; the chooser offers the same form. ``POST
+  /v1/login/create`` takes the same cookie, Origin and CSRF checks as the chooser's POST, and
+  the login's step must still be ``choose``: it creates the team with the signed-in account as
+  its owner (bound to its ``sub``), adds the team to the login's choices and shows the
+  chooser with it preselected. A refused creation shows the form again with the reason and
+  the member's own input (escaped). Cancel ends the login as the chooser's Cancel does.
 """
 
 from __future__ import annotations
@@ -42,7 +49,7 @@ from fastapi import Request
 from fastapi.responses import JSONResponse, RedirectResponse, Response
 
 from .clock import format_time
-from .config import Limits, Settings, TeamConfig, normalise_email
+from .config import Limits, Settings, TeamConfig, normalise_email, normalise_team_name
 from .credentials import (
     CREDENTIAL_LIFETIME,
     Credentials,
@@ -51,14 +58,17 @@ from .credentials import (
     new_credential,
     public_id,
 )
+from .errors import ApiError
 from .jsonutil import sha256_hex
 from .log import log_event
 from .oauth import OAuthError, OAuthProvider, pkce_challenge
 from .pages import (
     SECURITY_HEADERS,
+    CreateForm,
     chooser_page,
     html_response,
     message_page,
+    not_on_team_page,
 )
 from .roster import Roster, email_hash
 from .store import (
@@ -71,7 +81,9 @@ from .store import (
     Quota,
     Redemption,
     Store,
+    TeamGone,
 )
+from .teams import NewTeam, Teams, parse_new_team, suggest_member_id, suggest_team_id
 
 COOKIE = "trl"
 COOKIE_PATH = "/v1/login"
@@ -97,6 +109,9 @@ STEP_DONE = "done"
 STEP_CLOSED = "closed"
 
 AGAIN = "Run /team-relay:login in Claude Code to start again."
+CREATE_ACTION = "/v1/login/create"
+CHOOSE_FIELDS = frozenset({"csrf", "team", "action"})
+CREATE_FIELDS = frozenset({"csrf", "name", "team", "member", "action"})
 REBOUND_TITLE = "This email now belongs to a different Google account"
 REBOUND_LINE = "Ask the owner."
 
@@ -160,6 +175,7 @@ class LoginService:
         settings: Settings,
         store: Store,
         roster: Roster,
+        teams: Teams,
         credentials: Credentials,
         oauth: OAuthProvider,
         now: Callable[[], datetime],
@@ -170,6 +186,7 @@ class LoginService:
         self._limits: Limits = settings.team_config.limits
         self._store = store
         self._roster = roster
+        self._teams = teams
         self._credentials = credentials
         self._oauth = oauth
         self._now = now
@@ -347,20 +364,14 @@ class LoginService:
         sub = claims.get("sub")
         if not isinstance(sub, str) or SUB_RE.fullmatch(sub) is None:
             return await fail(400, "no_sub", "Sign-in with Google did not complete", AGAIN)
-        memberships = await self._roster.teams_for_email(email, fresh=True)
-        if not memberships:
-            return await fail(
-                403,
-                "not_on_any_team",
-                "This Google account is not on any team",
-                f"Ask the team owner to add {email}.",
-            )
-        for team, member in memberships:
-            bound = (await self._roster.snapshot(team)).sub_for(member, email)
+        memberships = await self._teams.memberships(email, fresh=True)
+        for found in memberships:
+            bound = (await self._roster.snapshot(found.team)).sub_for(found.member, email)
             if bound is not None and not _same(bound, sub):
                 return await fail(403, "sub_mismatch", REBOUND_TITLE, REBOUND_LINE)
         csrf = b64url(secrets.token_bytes(32))
-        choices = [LoginChoice(team=t, member=m) for t, m in memberships]
+        # M9-SPEC §3: no team is no longer the end: the page offers to create one.
+        choices = [LoginChoice(team=m.team, member=m.member) for m in memberships]
         now = self._now()
 
         def offer(doc: LoginDoc | None) -> LoginChange[LoginDoc | None]:
@@ -376,17 +387,44 @@ class LoginService:
         chosen = await self._store.mutate_login(key, offer)
         if chosen is None:
             return await fail(400, "login_expired", "This sign-in has expired", AGAIN)
-        page = chooser_page(
-            email=email,
-            device=chosen.device,
-            choices=choices,
-            csrf=csrf,
-            action="/v1/login/choose",
-        )
-        return html_response(page)
+        if not choices:
+            log_event("login_no_team", login=key[:12])
+        return await self._choose_page(chosen, csrf, CreateForm(CREATE_ACTION))
+
+    async def _choose_page(
+        self,
+        login: LoginDoc,
+        csrf: str,
+        form: CreateForm,
+        *,
+        status: int = 200,
+        preselect: str | None = None,
+    ) -> Response:
+        """The chooser (with "Create a new team"), or for an account on no team the
+        not-on-team page with the form open (M9-SPEC §3)."""
+        assert login.email is not None
+        if not form.member and not form.name:
+            form = CreateForm(form.action, member=suggest_member_id(login.email))
+        if not login.choices:
+            page = not_on_team_page(email=login.email, device=login.device, csrf=csrf, create=form)
+        else:
+            names = {c.team: await self._teams.name(c.team) for c in login.choices}
+            page = chooser_page(
+                email=login.email,
+                device=login.device,
+                choices=login.choices,
+                csrf=csrf,
+                action="/v1/login/choose",
+                names=names,
+                preselect=preselect,
+                create=form,
+            )
+        return html_response(page, status)
 
     # POST /v1/login/choose --------------------------------------------------------------------
-    async def _read_form(self, request: Request) -> _Form | None:
+    async def _read_form(
+        self, request: Request, allowed: frozenset[str] = CHOOSE_FIELDS
+    ) -> _Form | None:
         media = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
         if media != "application/x-www-form-urlencoded":
             return None
@@ -408,7 +446,7 @@ class LoginService:
             return None
         fields: dict[str, str] = {}
         for name, value in pairs:
-            if name not in ("csrf", "team", "action") or name in fields:
+            if name not in allowed or name in fields:
                 return None
             fields[name] = value
         return _Form(fields=fields)
@@ -466,10 +504,13 @@ class LoginService:
         # Checked again here, in one roster transaction, so a membership that ended since the
         # chooser was shown mints nothing. §7.2: the first sign-in with this email binds it to
         # this Google account; a later one must be the same account, and two first sign-ins
-        # cannot both win.
-        bound = await self._roster.bind(
-            choice.team, choice.member, current.email, current.sub, self._retention
-        )
+        # cannot both win. A team deleted meanwhile (M9-SPEC §1) mints nothing either.
+        try:
+            bound = await self._roster.bind(
+                choice.team, choice.member, current.email, current.sub, self._retention
+            )
+        except TeamGone:
+            bound = "gone"
         if bound == "other":
             await self._close(key)
             self._refused("sub_mismatch", login=key[:12])
@@ -514,6 +555,102 @@ class LoginService:
             )
         log_event("login_chosen", login=key[:12], team=choice.team, member=choice.member)
         return self._loopback(done, {"code": code, "state": done.state})
+
+    # POST /v1/login/create (M9-SPEC §3) ----------------------------------------------------
+    async def create(self, request: Request) -> Response:
+        if not await self._allow(request, "page", self._limits.login_pages_per_minute):
+            return self._busy()
+        origin = request.headers.get("origin")
+        if origin is not None and origin != self.public_url:
+            self._refused("cross_origin_create")
+            return self._page(403, "This request did not come from the sign-in page", AGAIN)
+        cookie = self._cookie_login(request)
+        if cookie is None:
+            self._refused("no_login_cookie")
+            return self._page(400, "This sign-in did not start in this browser", AGAIN)
+        form = await self._read_form(request, CREATE_FIELDS)
+        if form is None:
+            self._refused("bad_form")
+            return self._page(400, "This form could not be read", AGAIN)
+        key = _key(cookie)
+        csrf = form.fields.get("csrf", "")
+        action = form.fields.get("action", "create")
+        if action not in ("create", "cancel"):
+            self._refused("bad_action")
+            return self._page(400, "This form could not be read", AGAIN)
+        now = self._now()
+        current = await self._store.mutate_login(key, lambda doc: LoginChange(result=doc))
+        if current is None or current.step != STEP_CHOOSE or now >= current.expire_at:
+            self._refused("login_not_choosing", login=key[:12])
+            return self._page(
+                400, "This sign-in has expired or was already used", AGAIN, clear=True
+            )
+        if (
+            current.csrf_sha256 is None
+            or TOKEN_RE.fullmatch(csrf) is None
+            or not _same(_key(csrf), current.csrf_sha256)
+        ):
+            self._refused("bad_csrf", login=key[:12])
+            return self._page(403, "This form has expired", AGAIN)
+        if action == "cancel":
+            await self._close(key)
+            log_event("login_cancelled", login=key[:12])
+            return self._loopback(current, {"error": "access_denied", "state": current.state})
+        if current.email is None or current.sub is None:  # a login from before M6 §7.2
+            await self._close(key)
+            self._refused("login_without_sub", login=key[:12])
+            return self._page(400, "This sign-in has expired", AGAIN, clear=True)
+        name = form.fields.get("name", "")
+        team = form.fields.get("team", "").strip()
+        member = form.fields.get("member", "").strip()
+        try:
+            body: NewTeam = parse_new_team(
+                {"name": name, "owner_member_id": member, **({"id": team} if team else {})}
+            )
+            ip_hash = sha256_hex(client_ip(request, self._on_cloud_run))[:32]
+            created = await self._teams.create(
+                email=current.email, sub=current.sub, body=body, ip_hash=ip_hash, via=None
+            )
+        except ApiError as err:
+            self._refused(f"create_{err.code}", login=key[:12])
+            # A left-empty id shows the one made from the name, to edit.
+            valid_name = normalise_team_name(name)
+            suggested = team or (suggest_team_id(valid_name) if valid_name else "")
+            refused = CreateForm(
+                CREATE_ACTION,
+                name=name,
+                team=suggested,
+                member=member,
+                error=err.detail or "The team could not be created.",
+            )
+            return await self._choose_page(current, csrf, refused, status=err.status)
+        choice = LoginChoice(team=created["team"], member=created["member"])
+        now = self._now()
+
+        def offer(doc: LoginDoc | None) -> LoginChange[LoginDoc | None]:
+            if (
+                doc is None
+                or doc.step != STEP_CHOOSE
+                or now >= doc.expire_at
+                or doc.csrf_sha256 != current.csrf_sha256
+            ):
+                return LoginChange(result=None)
+            doc.choices = [*doc.choices, choice]
+            return LoginChange(result=doc, login=doc)
+
+        offered = await self._store.mutate_login(key, offer)
+        if offered is None:
+            self._refused("login_not_choosing", login=key[:12])
+            return self._page(
+                400,
+                "This sign-in has expired",
+                "Your team was created. " + AGAIN,
+                clear=True,
+            )
+        log_event("login_team_created", login=key[:12], team=choice.team, member=choice.member)
+        return await self._choose_page(
+            offered, csrf, CreateForm(CREATE_ACTION), preselect=choice.team
+        )
 
     def _loopback(self, login: LoginDoc, params: Mapping[str, str]) -> Response:
         # The only redirect target there is: the plugin's own listener on this machine.
@@ -589,7 +726,11 @@ class LoginService:
             )
             return Redemption(result=("ok", doc), code=doc, credential=record, audit=[audit])
 
-        outcome = await self._store.redeem_code(_key(code), redeem, now)
+        try:
+            outcome = await self._store.redeem_code(_key(code), redeem, now)
+        except TeamGone:  # M9-SPEC §1: the team was deleted after the chooser
+            self._refused("team_deleted")
+            return JSONResponse({"error": "invalid_grant"}, 400, headers=headers)
         reason, doc = outcome.result
         if outcome.revoked:
             self._credentials.forget([r.key for r in outcome.revoked])

@@ -6,12 +6,17 @@ cobalt accent, the system font stack, light and dark.
 Every page carries a strict CSP. ``form-action`` names ``http://127.0.0.1:*`` besides
 ``'self'`` because browsers apply it to the redirect that follows the chooser's POST, and
 that redirect (to the member's own plugin listener) is the only place the form leads.
+
+M9-SPEC §3: an account on no team sees "You're not on a team yet" with a form to create
+one; the chooser offers the same form under "Create a new team" (a ``<details>``, so no
+script is needed). Team names are shown escaped like everything else.
 """
 
 from __future__ import annotations
 
 import hashlib
 from collections.abc import Sequence
+from dataclasses import dataclass
 from html import escape
 
 from fastapi.responses import HTMLResponse, Response
@@ -171,6 +176,43 @@ button:focus-visible, .choice:focus-within {
   outline-offset: 2px;
 }
 .error h1 { color: var(--bad); }
+.field { display: block; margin: 0 0 12px; }
+.field .label { display: block; font-size: 13px; color: var(--subtle); margin: 0 0 4px; }
+.field .hint { display: block; font-size: 12px; color: var(--subtle); margin: 4px 0 0; }
+input[type="text"] {
+  width: 100%;
+  font: inherit;
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--card);
+  color: var(--text);
+  min-height: 40px;
+}
+input[type="text"]:focus-visible { outline: 2px solid var(--signal); outline-offset: 1px; }
+input[type="text"].mono {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 13px;
+}
+.form-error {
+  margin: 0 0 12px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  border: 1px solid var(--bad);
+  color: var(--bad);
+  font-size: 14px;
+}
+details.create { margin-top: 20px; padding-top: 16px; border-top: 1px solid var(--hairline); }
+details.create summary {
+  cursor: pointer;
+  color: var(--signal);
+  font-weight: 500;
+  list-style: none;
+}
+details.create summary::-webkit-details-marker { display: none; }
+details.create summary:focus-visible { outline: 2px solid var(--signal); outline-offset: 2px; }
+details.create[open] summary { margin-bottom: 12px; }
+.choice .name { font-weight: 600; }
 footer { margin-top: 20px; padding-top: 12px; border-top: 1px solid var(--hairline);
   font-size: 12px; color: var(--subtle); }
 @media (max-width: 480px) {
@@ -217,19 +259,86 @@ def message_page(title: str, lines: Sequence[str], *, error: bool = False) -> st
     )
 
 
+@dataclass(frozen=True)
+class CreateForm:
+    """The create-a-team form (M9-SPEC §3): what to prefill (the member's own input when a
+    creation was refused, else the suggestions) and the refusal to show, if any."""
+
+    action: str
+    name: str = ""
+    team: str = ""
+    member: str = ""
+    error: str | None = None
+
+
+def _identity(email: str, device: str) -> str:
+    return (
+        "<dl>"
+        f'<dt>Account</dt><dd class="mono">{escape(email)}</dd>'
+        f'<dt>Device</dt><dd class="mono">{escape(device)}</dd>'
+        "</dl>\n"
+        '<p class="warning">Only continue if you just ran '
+        '<span class="command">/team-relay:login</span> in your own Claude Code.</p>\n'
+    )
+
+
+def _create_fields(form: CreateForm, csrf: str) -> str:
+    error = f'<p class="form-error" role="alert">{escape(form.error)}</p>\n' if form.error else ""
+    return (
+        f'<form method="post" action="{escape(form.action)}">\n'
+        f'<input type="hidden" name="csrf" value="{escape(csrf)}">\n'
+        f"{error}"
+        '<label class="field"><span class="label">Team name</span>'
+        f'<input type="text" name="name" value="{escape(form.name)}" maxlength="60" required '
+        'autocomplete="off"></label>\n'
+        '<label class="field"><span class="label">Team id</span>'
+        f'<input class="mono" type="text" name="team" value="{escape(form.team)}" '
+        'maxlength="32" pattern="[a-z][a-z0-9\\-]{2,31}" autocomplete="off" '
+        'autocapitalize="off" spellcheck="false">'
+        '<span class="hint">Lower-case letters, digits and dashes. Leave it empty to make one '
+        "from the name.</span></label>\n"
+        '<label class="field"><span class="label">Your member id</span>'
+        f'<input class="mono" type="text" name="member" value="{escape(form.member)}" '
+        'maxlength="32" pattern="[a-z][a-z0-9_]{1,31}" required autocomplete="off" '
+        'autocapitalize="off" spellcheck="false">'
+        '<span class="hint">How your teammates see you.</span></label>\n'
+        '<div class="actions">'
+        '<button class="primary" type="submit" name="action" value="create">Create team</button>'
+        '<button type="submit" name="action" value="cancel" formnovalidate>Cancel</button>'
+        "</div>\n</form>"
+    )
+
+
 def chooser_page(
-    *, email: str, device: str, choices: Sequence[LoginChoice], csrf: str, action: str
+    *,
+    email: str,
+    device: str,
+    choices: Sequence[LoginChoice],
+    csrf: str,
+    action: str,
+    names: dict[str, str] | None = None,
+    preselect: str | None = None,
+    create: CreateForm | None = None,
 ) -> str:
     single = len(choices) == 1
     # M6-SPEC §7.5: preselected only when there is exactly one; with several, the member
-    # picks (the radios are required, and the relay refuses a POST without a team).
-    checked = " checked" if single else ""
+    # picks (the radios are required, and the relay refuses a POST without a team). A team
+    # just created here is preselected (M9-SPEC §3).
+    names = names or {}
     options = []
     for choice in choices:
+        checked = " checked" if single or choice.team == preselect else ""
+        name = names.get(choice.team, choice.team)
+        label = (
+            f'<span class="name">{escape(name)}</span> '
+            f'<span class="member mono">{escape(choice.team)}</span>'
+            if name != choice.team
+            else f'<span class="team mono">{escape(choice.team)}</span>'
+        )
         options.append(
             '<label class="choice">'
             f'<input type="radio" name="team" value="{escape(choice.team)}"{checked} required>'
-            f'<span><span class="team mono">{escape(choice.team)}</span><br>'
+            f"<span>{label}<br>"
             f'<span class="member">as <span class="mono">{escape(choice.member)}</span></span>'
             "</span></label>"
         )
@@ -237,13 +346,8 @@ def chooser_page(
     body = (
         "<h1>Connect Claude Code to your team</h1>\n"
         '<p class="subtle">A Claude Code session asked to sign in with this account.</p>\n'
-        "<dl>"
-        f'<dt>Account</dt><dd class="mono">{escape(email)}</dd>'
-        f'<dt>Device</dt><dd class="mono">{escape(device)}</dd>'
-        "</dl>\n"
-        '<p class="warning">Only continue if you just ran '
-        '<span class="command">/team-relay:login</span> in your own Claude Code.</p>\n'
-        f'<form method="post" action="{escape(action)}">\n'
+        + _identity(email, device)
+        + f'<form method="post" action="{escape(action)}">\n'
         f'<input type="hidden" name="csrf" value="{escape(csrf)}">\n'
         f"<fieldset><legend>{legend}</legend>\n" + "\n".join(options) + "\n</fieldset>\n"
         '<div class="actions">'
@@ -251,7 +355,24 @@ def chooser_page(
         '<button type="submit" name="action" value="cancel" formnovalidate>Cancel</button>'
         "</div>\n</form>"
     )
+    if create is not None:
+        opened = " open" if create.error else ""
+        body += (
+            f'\n<details class="create"{opened}><summary>Create a new team</summary>\n'
+            + _create_fields(create, csrf)
+            + "\n</details>"
+        )
     return _page("Connect", body)
+
+
+def not_on_team_page(*, email: str, device: str, csrf: str, create: CreateForm) -> str:
+    """M9-SPEC §3: the account is on no team yet."""
+    body = (
+        "<h1>You're not on a team yet</h1>\n"
+        f'<p>Ask a team owner to add <span class="mono">{escape(email)}</span>, '
+        "or create one.</p>\n" + _identity(email, device) + _create_fields(create, csrf)
+    )
+    return _page("Create a team", body)
 
 
 def stylesheet_response() -> Response:

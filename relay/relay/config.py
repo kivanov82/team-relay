@@ -1,8 +1,10 @@
 """Team configuration and process settings from env.
 
 The team file (M1-SPEC §2, M6-SPEC §1) holds the list of teams, each team's **seed**
-members (their ids, roles and principals), ``limits``, ``audit_retention_days`` and the
-read-only ``delegates`` (M3-SPEC §2, M6-SPEC §3). Membership itself lives in the roster in
+members (their ids, roles and principals), ``limits``, ``audit_retention_days``, the
+``delegates`` (M3-SPEC §2, M6-SPEC §3, M9-SPEC §5) and the relay-wide ``admins`` (M9-SPEC §4).
+Teams created through the API (M9-SPEC §1) live in the store only; the file's teams are the
+**seed teams**, which the API never deletes. Membership itself lives in the roster in
 the store (:mod:`relay.roster`): the relay upserts the seed into it and from then on a
 principal is a member of a team only while the team's roster says so.
 
@@ -20,6 +22,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import unicodedata
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -32,6 +35,8 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from .errors import ConfigError
 
 TEAM_RE = re.compile(r"^[a-z][a-z0-9_-]{1,31}$")
+# M9-SPEC §1: a team created through the API. Every such id also matches TEAM_RE.
+CREATED_TEAM_RE = re.compile(r"^[a-z][a-z0-9-]{2,31}$")
 MEMBER_RE = re.compile(r"^[a-z][a-z0-9_]{1,31}$")
 EMAIL_RE = re.compile(r"^[^@\s:,;<>\"'`\\]+@[^@\s:,;<>\"'`\\]+\.[^@\s:,;<>\"'`\\]+$")
 GOOGLE_PRINCIPAL_RE = re.compile(r"^google:([^@\s:]+@[^@\s]+\.[^@\s]+)$")
@@ -47,12 +52,24 @@ MAX_EMAILS_PER_MEMBER = 5
 MAX_EMAIL_LENGTH = 254
 # M3-SPEC §2: one console service per deployment; a handful leaves room, not a registry.
 MAX_DELEGATES = 10
+# M9-SPEC §4: relay admins, a handful.
+MAX_ADMINS = 20
+# M9-SPEC §1: a team's display name.
+MAX_TEAM_NAME_LENGTH = 60
+# Unicode categories a display name may not hold: controls, format characters (the bidi
+# overrides among them), surrogates, private use, unassigned, and line/paragraph separators.
+_NAME_FORBIDDEN = frozenset({"Cc", "Cf", "Cs", "Co", "Cn", "Zl", "Zp"})
 
 AuthMode = Literal["google", "static"]
 Role = Literal["owner", "member"]
-DelegateScope = Literal["read", "manage-roster"]
+DelegateScope = Literal["read", "manage-roster", "manage-teams"]
 SCOPE_READ = "read"
 SCOPE_MANAGE_ROSTER = "manage-roster"
+# M9-SPEC §2, §4: create a team on behalf of an email, and the admin endpoints on behalf of
+# an admin. Only for a delegate of every team (``team: "*"``).
+SCOPE_MANAGE_TEAMS = "manage-teams"
+# M9-SPEC §5: a delegate for any team the on-behalf-of email belongs to.
+ANY_TEAM = "*"
 
 # RFC 5321 caps a mailbox at 254 characters; with "google:" in front, well under this.
 MAX_ON_BEHALF_LENGTH = 320
@@ -70,6 +87,20 @@ def normalise_email(raw: Any) -> str | None:
     return raw.lower()
 
 
+def normalise_team_name(raw: Any) -> str | None:
+    """A team's display name (M9-SPEC §1): surrounding whitespace dropped, then 1 to 60
+    characters, none of them a control, format, private-use, unassigned or separator
+    character; else None. Shown escaped everywhere."""
+    if not isinstance(raw, str):
+        return None
+    name = raw.strip()
+    if not 1 <= len(name) <= MAX_TEAM_NAME_LENGTH:
+        return None
+    if any(unicodedata.category(ch) in _NAME_FORBIDDEN for ch in name):
+        return None
+    return name
+
+
 class _Strict(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
@@ -82,6 +113,8 @@ class _MemberFile(_Strict):
 
 class _TeamFile(_Strict):
     id: str
+    # M9-SPEC §1: the display name; the id when absent.
+    name: str | None = None
     members: list[_MemberFile] = Field(min_length=1, max_length=MAX_MEMBERS_PER_TEAM)
 
 
@@ -104,19 +137,29 @@ class _LimitsFile(_Strict):
     login_tokens_per_minute: int = Field(default=20, ge=1, le=10000)
     # M6-SPEC §2: roster mutations per owner and hour.
     roster_mutations_per_hour: int = Field(default=30, ge=1, le=10000)
+    # M9-SPEC §2: teams one Google account has created and not deleted; members per team (at
+    # most 50: a broadcast writes one envelope per member in one transaction); team
+    # creations per account and calendar day (UTC), and per client IP and calendar hour.
+    teams_per_account: int = Field(default=3, ge=1, le=100)
+    members_per_team: int = Field(default=MAX_MEMBERS_PER_TEAM, ge=1, le=MAX_MEMBERS_PER_TEAM)
+    team_creations_per_account_per_day: int = Field(default=10, ge=1, le=1000)
+    team_creations_per_ip_per_hour: int = Field(default=30, ge=1, le=10000)
 
 
 class _DelegateFile(_Strict):
     principal: str
+    # A team of the file, or "*" (M9-SPEC §5): any team the on-behalf-of email belongs to.
     team: str
-    # M3-SPEC §2: `read`; M6-SPEC §3: `[read, manage-roster]`. A bare `read` is kept for the
-    # M3 files; a list must hold `read`.
+    # M3-SPEC §2: `read`; M6-SPEC §3: `[read, manage-roster]`; M9-SPEC: `manage-teams` for a
+    # `team: "*"` delegate. A bare `read` is kept for the M3 files; a list must hold `read`.
     scope: Literal["read"] | list[DelegateScope]
 
 
 class _ConfigFile(_Strict):
     teams: list[_TeamFile] = Field(min_length=1)
     delegates: list[_DelegateFile] = Field(default_factory=list, max_length=MAX_DELEGATES)
+    # M9-SPEC §4: relay-wide admins, `google:<email>`.
+    admins: list[str] = Field(default_factory=list, max_length=MAX_ADMINS)
     limits: _LimitsFile = Field(default_factory=_LimitsFile)
     audit_retention_days: int = Field(default=90, ge=1, le=3650)
 
@@ -134,6 +177,10 @@ class Limits:
     login_pages_per_minute: int = 30
     login_tokens_per_minute: int = 20
     roster_mutations_per_hour: int = 30
+    teams_per_account: int = 3
+    members_per_team: int = MAX_MEMBERS_PER_TEAM
+    team_creations_per_account_per_day: int = 10
+    team_creations_per_ip_per_hour: int = 30
 
 
 @dataclass(frozen=True)
@@ -151,6 +198,11 @@ class SeedMember:
 class Team:
     id: str
     seeds: tuple[SeedMember, ...]
+    name: str = ""
+
+    @property
+    def display_name(self) -> str:
+        return self.name or self.id
 
     @property
     def seed_ids(self) -> frozenset[str]:
@@ -167,7 +219,10 @@ class Identity:
 class Delegate:
     """A service that reads a team's console views on behalf of one member at a time
     (M3-SPEC §2), and with ``manage-roster`` changes the roster for an owner (M6-SPEC §3).
-    It is never a member and never the caller: the member it names is."""
+    It is never a member and never the caller: the member it names is. With ``team: "*"``
+    it acts in whichever team the request names, for a member of that team (M9-SPEC §5), and
+    with ``manage-teams`` it creates teams and calls the admin endpoints for the email it
+    names (M9-SPEC §2, §4)."""
 
     principal: str
     team: str
@@ -176,6 +231,14 @@ class Delegate:
     @property
     def manages_roster(self) -> bool:
         return SCOPE_MANAGE_ROSTER in self.scopes
+
+    @property
+    def manages_teams(self) -> bool:
+        return SCOPE_MANAGE_TEAMS in self.scopes
+
+    @property
+    def any_team(self) -> bool:
+        return self.team == ANY_TEAM
 
 
 @dataclass(frozen=True)
@@ -187,9 +250,14 @@ class TeamConfig:
     limits: Limits = field(default_factory=Limits)
     audit_retention_days: int = 90
     delegates: Mapping[str, Delegate] = field(default_factory=dict)
+    # M9-SPEC §4: the admins' lower-cased emails.
+    admins: frozenset[str] = frozenset()
 
     def team_ids(self) -> tuple[str, ...]:
         return tuple(self.teams)
+
+    def is_admin(self, email: str) -> bool:
+        return email in self.admins
 
     def token_member(self, principal: str, team: str) -> str | None:
         return (self.token_principals.get(principal) or {}).get(team)
@@ -213,12 +281,14 @@ def _normalise_principal(raw: str) -> str:
     raise ConfigError("principal must be 'google:<email>' or 'token:sha256:<64 lowercase hex>'")
 
 
-def _delegate_scopes(index: int, raw: str | list[str]) -> frozenset[str]:
+def _delegate_scopes(index: int, raw: str | list[str], team: str) -> frozenset[str]:
     values = [raw] if isinstance(raw, str) else list(raw)
     if len(set(values)) != len(values):
         raise ConfigError(f"delegates.{index}.scope: a scope is listed twice")
     if SCOPE_READ not in values:
         raise ConfigError(f"delegates.{index}.scope: must include 'read'")
+    if SCOPE_MANAGE_TEAMS in values and team != ANY_TEAM:
+        raise ConfigError(f"delegates.{index}.scope: 'manage-teams' needs team: \"*\"")
     return frozenset(values)
 
 
@@ -276,7 +346,15 @@ def parse_team_config(data: Any) -> TeamConfig:
             )
         if not any(seed.role == "owner" for seed in seeds):
             raise ConfigError(f"team {team.id!r} has no member with role: owner")
-        teams[team.id] = Team(id=team.id, seeds=tuple(seeds))
+        name = ""
+        if team.name is not None:
+            name = normalise_team_name(team.name) or ""
+            if not name:
+                raise ConfigError(
+                    f"team {team.id!r}: name must be 1 to {MAX_TEAM_NAME_LENGTH} characters, "
+                    "no control characters"
+                )
+        teams[team.id] = Team(id=team.id, seeds=tuple(seeds), name=name)
 
     delegates: dict[str, Delegate] = {}
     for index, entry in enumerate(parsed.delegates):
@@ -285,7 +363,7 @@ def parse_team_config(data: Any) -> TeamConfig:
         if email is None:
             raise ConfigError(f"delegates.{index}: principal must be 'google:<email>'")
         principal = "google:" + email
-        if entry.team not in teams:
+        if entry.team != ANY_TEAM and entry.team not in teams:
             raise ConfigError(f"delegates.{index}: team {entry.team!r} is not a team")
         # Not echoing the principal, as for members.
         if email in member_emails:
@@ -293,8 +371,23 @@ def parse_team_config(data: Any) -> TeamConfig:
         if principal in delegates:
             raise ConfigError(f"delegates.{index}: the delegate principal is listed twice")
         delegates[principal] = Delegate(
-            principal=principal, team=entry.team, scopes=_delegate_scopes(index, entry.scope)
+            principal=principal,
+            team=entry.team,
+            scopes=_delegate_scopes(index, entry.scope, entry.team),
         )
+
+    admins: set[str] = set()
+    for index, raw in enumerate(parsed.admins):
+        match = GOOGLE_PRINCIPAL_RE.match(raw)
+        email = normalise_email(match.group(1)) if match else None
+        if email is None:
+            raise ConfigError(f"admins.{index}: must be 'google:<email>'")
+        # Not echoing the email.
+        if email in admins:
+            raise ConfigError(f"admins.{index}: an admin is listed twice")
+        if ("google:" + email) in delegates:
+            raise ConfigError(f"admins.{index}: a delegate principal cannot be an admin")
+        admins.add(email)
 
     return TeamConfig(
         teams=teams,
@@ -302,6 +395,7 @@ def parse_team_config(data: Any) -> TeamConfig:
         limits=Limits(**parsed.limits.model_dump()),
         audit_retention_days=parsed.audit_retention_days,
         delegates=delegates,
+        admins=frozenset(admins),
     )
 
 

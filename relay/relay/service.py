@@ -12,6 +12,7 @@ import re
 import secrets
 import statistics
 import time
+from collections import OrderedDict
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -52,8 +53,10 @@ from .store import (
     RequestDoc,
     Store,
     StreamPage,
+    TeamGone,
     ToolEvent,
 )
+from .teams import Teams
 
 REQUEST_ID_RE = re.compile(r"^rq_[0-9a-f]{32}$")
 MAX_ACK_TIMEOUT = 3600
@@ -92,6 +95,8 @@ STATS_READ_CAP = 500
 # M2-SPEC §7.3: the stats are derived data, not delivery state, so each process keeps a
 # team's for this long and serves every member's directory from it.
 STATS_CACHE_TTL = timedelta(seconds=10)
+# Teams are created at run time (M9-SPEC §1): the stats cache keeps at most this many.
+STATS_CACHE_SIZE = 1024
 
 
 # M7-SPEC §1, the inbox summary: at most this many waiting messages are read (a count at the
@@ -241,12 +246,14 @@ class RelayService:
         # protective, not delivery state; a lost count only ever lasts one process.
         self._polls: dict[tuple[str, str, str], int] = {}
         # In-process only (M2-SPEC §7.3): the directory's stats per team, for
-        # STATS_CACHE_TTL. One entry per configured team, so it is bounded by the config.
-        self._stats_cache: dict[str, _TeamStats] = {}
+        # STATS_CACHE_TTL, the STATS_CACHE_SIZE most recently used teams.
+        self._stats_cache: OrderedDict[str, _TeamStats] = OrderedDict()
         # M6-SPEC §1: membership comes from the roster in the store, cached per team.
         self.roster = Roster(config, store, self.now)
         # M5-SPEC §3: device credentials, cached for at most 60 s.
         self.credentials = Credentials(store, config.team_ids(), self.now)
+        # M9-SPEC §1: which teams exist, creating and deleting them.
+        self.teams = Teams(config, store, self.roster, self.credentials, self.now)
 
     # Helpers -------------------------------------------------------------------------------
     def now(self) -> datetime:
@@ -372,6 +379,8 @@ class RelayService:
         roster = await self.roster.snapshot(caller.team)
         return {
             "team": caller.team,
+            # M9-SPEC §1: the team's display name (the id for a file team without one).
+            "name": await self.teams.name(caller.team),
             "member": caller.member,
             "teammates": [m for m in roster.members() if m != caller.member],
             # M6-SPEC §4: the console shows owners the Members panel.
@@ -479,6 +488,9 @@ class RelayService:
             waiting[m] = len(messages)
         fresh = _TeamStats(at=now, members=members, complete=complete, waiting=waiting)
         self._stats_cache[team] = fresh
+        self._stats_cache.move_to_end(team)
+        while len(self._stats_cache) > STATS_CACHE_SIZE:
+            self._stats_cache.popitem(last=False)
         return fresh
 
     async def _inbox_waiting(
@@ -1331,6 +1343,8 @@ class RelayService:
             outcome = await self.store.mutate_roster(
                 caller.team, fn, now, [self._roster_quota(caller, now)]
             )
+        except TeamGone:
+            raise not_found() from None  # M9-SPEC §1: deleted meanwhile
         except QuotaExceeded as exc:
             raise ApiError(
                 429,
@@ -1346,7 +1360,15 @@ class RelayService:
         async def work() -> dict[str, Any]:
             body = parse_add(raw, self.config)
             now = self.now()
-            fn = plan_add(caller.team, caller.member, body, now, self._retention, caller.delegate)
+            fn = plan_add(
+                caller.team,
+                caller.member,
+                body,
+                now,
+                self._retention,
+                caller.delegate,
+                self.config.limits.members_per_team,
+            )
             entry = await self._change_roster(caller, fn, now)
             return entry_json(entry, show_emails=True)
 
@@ -1371,7 +1393,7 @@ class RelayService:
                 caller.team,
                 caller.member,
                 member,
-                self.config.teams[caller.team].seed_ids,
+                seed.seed_ids if (seed := self.config.teams.get(caller.team)) else frozenset(),
                 now,
                 self._retention,
                 caller.delegate,

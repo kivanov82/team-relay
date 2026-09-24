@@ -26,6 +26,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections import OrderedDict
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
@@ -49,6 +50,8 @@ MEMBER = "member"
 ROLES = (OWNER, MEMBER)
 SEED_ACTOR = "relay"
 ROSTER_CACHE_TTL = timedelta(seconds=30)
+# Teams are created at run time now (M9-SPEC §1): the per-team cache keeps this many.
+ROSTER_CACHE_SIZE = 2048
 # A request lives at most 30 days (service.MAX_TTL), its messages and progress with it.
 RETIRED_ID_LIFETIME = timedelta(days=31)
 
@@ -101,13 +104,15 @@ class Roster:
         self._config = config
         self._store = store
         self._now = now
-        self._cache: dict[str, _Cached] = {}
+        self._cache: OrderedDict[str, _Cached] = OrderedDict()
         self._seeded: set[str] = set()
         self._seed_locks: dict[str, asyncio.Lock] = {}
 
     # Seeding --------------------------------------------------------------------------------
     async def ensure_seeded(self, team: str) -> None:
-        if team in self._seeded:
+        """Upsert the team file's seed into ``team``'s roster, once per process. A team the
+        API created (M9-SPEC §1) has no seed."""
+        if team in self._seeded or team not in self._config.teams:
             return
         lock = self._seed_locks.setdefault(team, asyncio.Lock())
         async with lock:
@@ -129,11 +134,12 @@ class Roster:
     async def snapshot(self, team: str, *, fresh: bool = False) -> TeamRoster:
         """The team's roster: from the cache while it is younger than ROSTER_CACHE_TTL (a
         clock that went back makes it stale), else validated by ``roster_version``. With
-        ``fresh``, always validated. The team must be configured."""
+        ``fresh``, always validated. Whether ``team`` is a team is the caller's check."""
         await self.ensure_seeded(team)
         now = self._now()
         cached = self._cache.get(team)
         if cached is not None:
+            self._cache.move_to_end(team)
             age = now - cached.checked_at
             if not fresh and timedelta(0) <= age < ROSTER_CACHE_TTL:
                 return cached.roster
@@ -142,12 +148,16 @@ class Roster:
                 return cached.roster
         roster = TeamRoster.of(await self._store.read_roster(team))
         self._cache[team] = _Cached(roster=roster, checked_at=now)
+        self._cache.move_to_end(team)
+        while len(self._cache) > ROSTER_CACHE_SIZE:
+            self._cache.popitem(last=False)
         return roster
 
     def invalidate(self, team: str) -> None:
         self._cache.pop(team, None)
 
     async def member_for_email(self, team: str, email: str) -> str | None:
+        """For a team of the file only (a per-team delegate's)."""
         if team not in self._config.teams:
             return None
         return (await self.snapshot(team)).member_for_email(email)
@@ -165,15 +175,6 @@ class Roster:
             self._cache.pop(team, None)
             log_event("roster_bound", team=team, member=member)
         return outcome.result
-
-    async def teams_for_email(self, email: str, *, fresh: bool = False) -> list[tuple[str, str]]:
-        """Every ``(team, member)`` whose roster holds ``email``, in the file's team order."""
-        found = []
-        for team in self._config.team_ids():
-            member = (await self.snapshot(team, fresh=fresh)).member_for_email(email)
-            if member is not None:
-                found.append((team, member))
-        return found
 
 
 # Pure change functions -------------------------------------------------------------------
@@ -200,6 +201,7 @@ def plan_seed(
     never removes, never changes an existing entry. A seed whose email another entry already
     holds, or that would pass 50 members, is skipped (and reported), never forced in."""
     seeds = config.teams[team].seeds
+    limit = config.limits.members_per_team
 
     def fn(state: RosterState) -> RosterChange[tuple[list[str], list[str]]]:
         taken = {email for entry in state.entries.values() for email in entry.emails}
@@ -211,7 +213,7 @@ def plan_seed(
             if seed.id in state.entries:
                 continue
             if (
-                count >= MAX_MEMBERS_PER_TEAM
+                count >= limit
                 or any(email in taken for email in seed.emails)
                 or _retired_for_others(state, seed.id, seed.emails, now)
             ):
@@ -366,7 +368,13 @@ def _parse_email(raw: Any, name: str, config: TeamConfig) -> str:
 
 
 def plan_add(
-    team: str, actor: str, body: AddMember, now: datetime, retention: timedelta, via: str | None
+    team: str,
+    actor: str,
+    body: AddMember,
+    now: datetime,
+    retention: timedelta,
+    via: str | None,
+    max_members: int = MAX_MEMBERS_PER_TEAM,
 ) -> Callable[[RosterState], RosterChange[RosterEntry]]:
     def fn(state: RosterState) -> RosterChange[RosterEntry]:
         _require_owner(state, actor)
@@ -374,8 +382,8 @@ def plan_add(
             raise ApiError(409, "member_exists", "That member id is taken.")
         if _email_holder(state, body.email) is not None:
             raise ApiError(409, "email_taken", "That email is already on this team.")
-        if len(state.entries) >= MAX_MEMBERS_PER_TEAM:
-            raise ApiError(409, "team_full", f"A team has at most {MAX_MEMBERS_PER_TEAM} members.")
+        if len(state.entries) >= max_members:
+            raise ApiError(409, "team_full", f"A team has at most {max_members} members.")
         if _retired_for_others(state, body.member, [body.email], now):
             raise ApiError(
                 409,

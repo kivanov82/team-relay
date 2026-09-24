@@ -91,7 +91,8 @@ async def test_regression_an_owner_cannot_attach_their_account_to_another_member
     # So the second account is on no team, and cannot become bob.
     started = await start(api.client)
     r = await google(api.client, api.fake, started, ALT)
-    assert r.status_code == 403 and "not on any team" in r.text
+    assert r.status_code == 200 and "not on a team yet" in r.text
+    assert 'type="radio"' not in r.text
     r = await api.client.get(api.url(f"/requests/{rid}"), headers=auth("alice"))
     assert r.status_code == 404
     refused = [e for e in await api.store.list_audit(api.team) if e.outcome == "refused"]
