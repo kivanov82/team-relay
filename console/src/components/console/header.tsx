@@ -2,11 +2,11 @@ import { Monitor, Moon, Sun } from 'lucide-react'
 
 import { Button } from '@/components/ui/button'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
-import { useConnection, useInboxSummary, useMe } from '@/hooks/queries'
+import { useApprovalsSummary, useConnection, useInboxSummary, useMe } from '@/hooks/queries'
 import { useNow } from '@/hooks/use-now'
 import { useTheme, type ThemeChoice } from '@/hooks/use-theme'
 import { formatAgo, formatClock } from '@/lib/time'
-import { waitingLine } from '@/lib/waiting'
+import { approvalsLine, waitingLine } from '@/lib/waiting'
 import { cn } from '@/lib/utils'
 import { Avatar, RelayMark, StatusPill } from './primitives'
 
@@ -124,6 +124,31 @@ function InboxWaiting() {
   )
 }
 
+/**
+ * M8 §5: answers the viewer's channel working session holds for their approval (local console
+ * only, from /api/approvals/summary; the hosted console cannot see a laptop's queue).
+ */
+function ApprovalsWaiting() {
+  const summary = useApprovalsSummary()
+  const line = approvalsLine(summary.data)
+  if (line === null) return null
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <span tabIndex={0} className="min-w-0 rounded-full" data-approvals-waiting={summary.data?.pending}>
+          <StatusPill tone="warn" className="tnum max-w-full truncate">
+            {line}
+          </StatusPill>
+        </span>
+      </TooltipTrigger>
+      <TooltipContent side="bottom" className="max-w-72">
+        Your working session answered a teammate but needs your approval before it sends the answer or takes a step. Run
+        /team-relay:approvals in that session.
+      </TooltipContent>
+    </Tooltip>
+  )
+}
+
 export function Header() {
   const me = useMe()
   return (
@@ -147,6 +172,7 @@ export function Header() {
               <span className="text-subtle">(you)</span>
             </span>
             <InboxWaiting />
+            <ApprovalsWaiting />
           </div>
         ) : null}
         <div className="ml-auto flex items-center gap-2 sm:gap-3">

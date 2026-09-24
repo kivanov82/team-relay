@@ -23836,6 +23836,11 @@ function createConsoleServer(opts) {
       if (!opts.join) return sendJson(res, 404, { error: "not_found" });
       return sendJson(res, 200, opts.join);
     }
+    if (path === "/api/approvals/summary") {
+      if (query.length > 0) return sendJson(res, 400, { error: "bad_request", detail: "no query parameters here" });
+      if (hosted2 || !opts.approvals) return sendJson(res, 404, { error: "not_found" });
+      return sendJson(res, 200, opts.approvals());
+    }
     let call;
     if (path === "/api/me" || path === "/api/directory" || path === "/api/roster" || path === "/api/inbox/summary") {
       if (query.length > 0) return sendJson(res, 400, { error: "bad_request", detail: "no query parameters here" });
@@ -24051,6 +24056,51 @@ function openInBrowser(url, opts) {
   return file;
 }
 
+// src/approvals-state.ts
+import { mkdirSync as mkdirSync2, readFileSync as readFileSync6, renameSync as renameSync2, rmSync as rmSync3, writeFileSync as writeFileSync2 } from "node:fs";
+import { join as join5 } from "node:path";
+
+// src/answering-lock.ts
+import { homedir as homedir2 } from "node:os";
+import { isAbsolute as isAbsolute3, join as join4 } from "node:path";
+function configDir(env) {
+  const xdg = env.XDG_CONFIG_HOME?.trim();
+  const base = xdg && isAbsolute3(xdg) ? xdg : join4(env.HOME?.trim() || homedir2(), ".config");
+  return join4(base, "team-relay");
+}
+function pidAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return err.code === "EPERM";
+  }
+}
+
+// src/approvals-state.ts
+var STATE_FILE = "approvals.json";
+function statePath(env) {
+  return join5(configDir(env), STATE_FILE);
+}
+function readApprovalsState(path, alive = pidAlive) {
+  let raw;
+  try {
+    raw = readFileSync6(path, "utf8");
+  } catch {
+    return null;
+  }
+  if (raw.length > 4096) return null;
+  try {
+    const v = JSON.parse(raw);
+    if (typeof v.pending !== "number" || !Number.isInteger(v.pending) || v.pending < 0 || v.pending > 1e4) return null;
+    if (typeof v.pid !== "number" || !alive(v.pid)) return null;
+    return { pending: v.pending, pid: v.pid, updated_at: typeof v.updated_at === "string" ? v.updated_at : "" };
+  } catch {
+    return null;
+  }
+}
+
 // src/log.ts
 function makeLogger(component) {
   return (...parts) => {
@@ -24121,7 +24171,7 @@ async function hosted() {
   let audience;
   let backend;
   let team;
-  let join4;
+  let join6;
   try {
     const repoUrl = checkJoinRepoUrl(env.JOIN_REPO_URL);
     const marketplace = checkJoinMarketplace(env.JOIN_MARKETPLACE);
@@ -24131,14 +24181,14 @@ async function hosted() {
     const client = relayClientFromEnv(env);
     backend = relayBackend(client);
     team = client.team;
-    join4 = joinInfo(configValue(env.RELAY_URL) ?? "", team, repoUrl, marketplace);
+    join6 = joinInfo(configValue(env.RELAY_URL) ?? "", team, repoUrl, marketplace);
   } catch (err) {
     fail(`configuration error: ${describeError(err)}`);
   }
   const keys = new IapKeySet({ log });
   const verify = iapVerifier({ audience, keys, log });
   const staticDir = fileURLToPath3(new URL("./console/", import.meta.url));
-  const app = createConsoleServer({ backend, hosted: { publicHost, verify }, staticDir, join: join4, log });
+  const app = createConsoleServer({ backend, hosted: { publicHost, verify }, staticDir, join: join6, log });
   let bound;
   try {
     bound = await app.listen(port);
@@ -24169,11 +24219,11 @@ async function main() {
   }
   let backend;
   let label;
-  let join4;
+  let join6;
   if (flags.demo) {
     backend = demoBackend(new DemoTeam());
     label = "demo team (synthetic: alice, bob, carol)";
-    join4 = DEMO_JOIN;
+    join6 = DEMO_JOIN;
   } else {
     let client;
     try {
@@ -24184,11 +24234,12 @@ async function main() {
     }
     backend = relayBackend(client);
     label = `team ${client.team}`;
-    join4 = joinInfo(client.url, client.team, repoUrl, marketplace);
+    join6 = joinInfo(client.url, client.team, repoUrl, marketplace);
   }
   const key = randomBytes(32).toString("base64url");
   const staticDir = fileURLToPath3(new URL("./console/", import.meta.url));
-  const app = createConsoleServer({ backend, key, staticDir, join: join4, log });
+  const approvals = flags.demo ? void 0 : () => ({ pending: readApprovalsState(statePath(process.env))?.pending ?? 0 });
+  const app = createConsoleServer({ backend, key, staticDir, join: join6, log, ...approvals ? { approvals } : {} });
   let bound;
   try {
     bound = await app.listen(port);

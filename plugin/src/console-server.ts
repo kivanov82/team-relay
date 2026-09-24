@@ -37,6 +37,7 @@ import {
 } from './console-app.js';
 import { DemoTeam } from './console-demo.js';
 import { openInBrowser } from './console-open.js';
+import { readApprovalsState, statePath } from './approvals-state.js';
 import { IapKeySet, checkIapAudience, iapVerifier } from './iap.js';
 import { makeLogger } from './log.js';
 import { NotConnected, authModeFromEnv, configValue, relayClientFromEnv } from './relay-client.js';
@@ -169,7 +170,11 @@ async function main(): Promise<void> {
 
   const key = randomBytes(32).toString('base64url');
   const staticDir = fileURLToPath(new URL('./console/', import.meta.url));
-  const app = createConsoleServer({ backend, key, staticDir, join, log });
+  // M8-SPEC §5: the local console shows how many answers wait for this member's approval.
+  const approvals = flags.demo
+    ? undefined
+    : () => ({ pending: readApprovalsState(statePath(process.env))?.pending ?? 0 });
+  const app = createConsoleServer({ backend, key, staticDir, join, log, ...(approvals ? { approvals } : {}) });
   let bound: number;
   try {
     bound = await app.listen(port);

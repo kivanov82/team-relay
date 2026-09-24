@@ -131,6 +131,14 @@ export interface InboxSummary {
   answering: SessionPresence
 }
 
+/**
+ * GET /api/approvals/summary (M8 §5, local console only): how many answers wait for the
+ * viewer's approval in their channel working session on this computer.
+ */
+export interface ApprovalsSummary {
+  pending: number
+}
+
 export interface Directory {
   members: DirectoryMember[]
   /**

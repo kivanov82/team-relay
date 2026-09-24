@@ -703,6 +703,31 @@ describe('console --demo backend', () => {
   });
 });
 
+describe('GET /api/approvals/summary (M8-SPEC §5)', () => {
+  it('the local console answers the count itself, behind the key; without a count source it is 404', async () => {
+    let pending = 2;
+    const app = createConsoleServer({ backend: demoBackend(new DemoTeam()), key: KEY, staticDir: join(tmpdir(), 'none'), approvals: () => ({ pending }) });
+    const port = await app.listen(0);
+    try {
+      expect((await req(port, '/api/approvals/summary', { key: null })).status).toBe(401);
+      expect((await api(port, '/api/approvals/summary')).json()).toEqual({ pending: 2 });
+      pending = 0;
+      expect((await api(port, '/api/approvals/summary')).json()).toEqual({ pending: 0 });
+      expect((await api(port, '/api/approvals/summary?x=1')).status).toBe(400);
+      expect((await api(port, '/api/approvals/summary', { method: 'POST', body: '{}', headers: { 'Content-Type': 'application/json' } })).status).toBe(405);
+    } finally {
+      await app.close();
+    }
+    const plain = createConsoleServer({ backend: demoBackend(new DemoTeam()), key: KEY, staticDir: join(tmpdir(), 'none') });
+    const p2 = await plain.listen(0);
+    try {
+      expect((await api(p2, '/api/approvals/summary')).status).toBe(404);
+    } finally {
+      await plain.close();
+    }
+  });
+});
+
 describe('dist/console-server.js', () => {
   function start(args: string[], env: Record<string, string> = {}) {
     const child = spawn(process.execPath, [join(DIST, 'console-server.js'), ...args], {

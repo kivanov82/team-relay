@@ -1,5 +1,5 @@
 import { consoleKey, isHosted } from './key'
-import type { ActivityPage, Directory, InboxSummary, Join, Me, RequestDetail, Roster, RosterRole } from './types'
+import type { ActivityPage, ApprovalsSummary, Directory, InboxSummary, Join, Me, RequestDetail, Roster, RosterRole } from './types'
 
 // Every call goes to the console server's proxy: locally (M2 §4.4) with the key in
 // X-Console-Key; hosted behind IAP (M3 §4) without a key, with the IAP session cookie. The only
@@ -303,6 +303,7 @@ export const api = {
   join: () => getJson<Join>('api/join'),
   roster: () => getJson<Roster>('api/roster'),
   inboxSummary: () => getJson<InboxSummary>('api/inbox/summary'),
+  approvalsSummary: () => getJson<ApprovalsSummary>('api/approvals/summary'),
   addMember: (member: string, email: string) => sendChange<unknown>('POST', 'api/roster', { member, email }),
   setRole: (member: string, role: RosterRole) => sendChange<unknown>('PATCH', `api/roster/${encodeURIComponent(member)}`, { role }),
   removeMember: (member: string) => sendChange<unknown>('DELETE', `api/roster/${encodeURIComponent(member)}`),

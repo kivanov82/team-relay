@@ -1,7 +1,7 @@
 import { QueryClient, useMutation, useQuery, useQueryClient, type Query } from '@tanstack/react-query'
 
 import { ApiError, ChangeError, api } from '@/api/client'
-import type { Directory, InboxSummary, Join, Me, RequestDetail, Roster, RosterRole } from '@/api/types'
+import type { ApprovalsSummary, Directory, InboxSummary, Join, Me, RequestDetail, Roster, RosterRole } from '@/api/types'
 import { emptyActivity, pollActivity, PollError, type ActivityState } from '@/lib/activity'
 
 // Polling cadence (M2 §5): the feed every 3 s, incrementally from `next_since` (less the
@@ -111,6 +111,19 @@ export function useInboxSummary() {
     queryKey: ['inbox-summary'],
     queryFn: () => tracked('inbox-summary', async () => (await api.inboxSummary()).data),
     refetchInterval: (query) => (query.state.error?.kind === 'not_found' ? false : whileVisible<InboxSummary>('inbox-summary', DIRECTORY_INTERVAL_MS)(query)),
+  })
+}
+
+/**
+ * M8 §5: answers waiting for the viewer's approval in their channel working session. Only the
+ * local console answers it; a server without the route (404, the hosted console) is not asked again.
+ */
+export function useApprovalsSummary() {
+  return useQuery<ApprovalsSummary, ApiError>({
+    queryKey: ['approvals-summary'],
+    queryFn: () => tracked('approvals-summary', async () => (await api.approvalsSummary()).data),
+    refetchInterval: (query) =>
+      query.state.error?.kind === 'not_found' ? false : whileVisible<ApprovalsSummary>('approvals-summary', DIRECTORY_INTERVAL_MS)(query),
   })
 }
 

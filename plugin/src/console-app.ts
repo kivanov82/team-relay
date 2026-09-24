@@ -12,6 +12,9 @@
 //   Content-Type: application/json and Sec-Fetch-Site: same-origin, and a body checked here
 //   before it is sent on. Nothing else is proxied, so there is no way to send, ack or reply
 //   from the console.
+// - GET /api/approvals/summary (local mode only, M8-SPEC §5), answered by the console server
+//   itself: {"pending": n}, how many answers wait for this member's approval in their channel
+//   working session on this computer (from ~/.config/team-relay/approvals.json; counts only).
 // - GET /api/join, answered by the console server itself (never proxied): what a new member
 //   needs to install the plugin (relay URL, team, the repository to clone, marketplace and
 //   plugin names). Nothing secret; the same gate as the other /api routes. Hosted, it is
@@ -323,6 +326,11 @@ export type ConsoleServerOptions = {
   staticDir: string;
   /** What GET /api/join answers; without it, /api/join is 404. */
   join?: JoinInfo;
+  /**
+   * M8-SPEC §5, local mode only: how many answers wait for this member's approval in their
+   * channel working session on this computer (GET /api/approvals/summary; 404 without it).
+   */
+  approvals?: () => { pending: number };
   log?: (line: string) => void;
 } & (
   | { /** Local mode: the per-launch key. */ key: string; hosted?: undefined }
@@ -544,6 +552,13 @@ export function createConsoleServer(opts: ConsoleServerOptions): ConsoleServer {
       }
       if (!opts.join) return sendJson(res, 404, { error: 'not_found' });
       return sendJson(res, 200, opts.join);
+    }
+    if (path === '/api/approvals/summary') {
+      // Answered here from the host's count on this computer (counts only), never proxied; the
+      // hosted console cannot see a laptop's queue.
+      if (query.length > 0) return sendJson(res, 400, { error: 'bad_request', detail: 'no query parameters here' });
+      if (hosted || !opts.approvals) return sendJson(res, 404, { error: 'not_found' });
+      return sendJson(res, 200, opts.approvals());
     }
     let call: () => Promise<unknown>;
     if (path === '/api/me' || path === '/api/directory' || path === '/api/roster' || path === '/api/inbox/summary') {
