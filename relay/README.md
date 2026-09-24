@@ -90,23 +90,30 @@ block, all optional:
 | `concurrent_polls` | 2 | long-polls (`wait > 0`) at once per member and stream, per relay instance |
 | `reads_per_minute` | 120 | reads of `/activity`, `/directory` and `/inbox/summary` together, per member and calendar minute (M2-SPEC §7.3, M7-SPEC §1) |
 | `login_starts_per_minute` | 20 | `GET /v1/login/start` per client IP and calendar minute (M5-SPEC §2) |
-| `login_pages_per_minute` | 30 | `GET /v1/login/callback` and `POST /v1/login/choose` together, per client IP and minute |
+| `login_pages_per_minute` | 30 | `GET /v1/login/callback` and `POST /v1/login/choose`, `/create` and `/invitation` together, per client IP and minute |
 | `login_tokens_per_minute` | 20 | `POST /v1/login/token` per client IP and minute |
 | `roster_mutations_per_hour` | 30 | roster changes (add, patch, remove) per owner and calendar hour (M6-SPEC §2); refusals do not count |
 | `teams_per_account` | 3 | teams one Google account has created and not deleted (M9-SPEC §2); deleting one frees the slot |
-| `members_per_team` | 50 | members per team, at most 50 (a broadcast writes one envelope per member in one transaction); the seed obeys it too |
-| `team_creations_per_account_per_day` | 10 | team creations per Google account and calendar day (UTC); refusals do not count |
-| `team_creations_per_ip_per_hour` | 30 | team creations per client IP and calendar hour (not counted for a delegate, whose address is the console's) |
+| `members_per_team` | 50 | roster entries per team, invitations included, at most 50 (a broadcast writes one envelope per member in one transaction); the seed obeys it too |
+| `team_creations_per_account_per_day` | 10 | team creations per Google account and calendar day (UTC), counted by its email and, when known, by its Google `sub` (M9-SPEC §7.6); refusals do not count here |
+| `team_creations_per_ip_per_hour` | 30 | team creations per client IP and calendar hour; for a delegate, per the address the console reports in `X-Relay-Client-IP-Hash` (M9-SPEC §7.6) |
+| `team_create_attempts_per_account_per_hour` | 30 | attempts to create a team, refused ones included (a bad body, a taken id, a limit), per Google account (email and `sub`) and calendar hour (M9-SPEC §7.4) |
+| `team_creations_per_delegate_per_hour` | 60 | team creations through one delegate (the console) per calendar hour (M9-SPEC §7.6) |
+| `admin_deletes_per_delegate_per_hour` | 5 | admin deletions through one delegate per calendar hour; a call that only resumes a removal is not counted (M9-SPEC §7.8) |
+| `non_member_requests_per_minute` | 60 | team-route requests per principal and minute, counted before the membership check while this process has not seen the principal as a member of the URL's team in the last 60 s (M9-SPEC §7.9) |
 
 `reads_per_minute` is also the budget of the account routes (`/v1/me/teams`, `POST
-/v1/teams`, `/v1/admin/teams`), per Google account and minute (M9).
+/v1/teams`, `POST /v1/me/invitations/{team}`, `/v1/admin/teams`), per Google account and
+minute (M9).
 
 ## The team file and the roster (M6-SPEC §1, 24 Sep 2026)
 
 Membership lives in Firestore (`teams/{team}/roster/{member}`: `member`, `emails` (1..5
 lower-cased Google emails), `role` (`owner` or `member`), `added_by`, `added_at`,
-`updated_at`, `subs` (`[{email, sub}]`, the Google account each email is bound to);
-`teams/{team}.roster_version` counts every change). The team file keeps the
+`updated_at`, `subs` (`[{email, sub}]`, the Google account each email is bound to),
+`status` (`active` or `invited`, M9-SPEC §7.2); `teams/{team}.roster_version` counts every
+change). **Only an `active` entry is a member**; an entry an owner added is `invited` until
+its person accepts (see "Invitations" below). The team file keeps the
 teams, each team's **seed** members, `limits`, `audit_retention_days` and `delegates`:
 
 ```yaml
@@ -130,13 +137,15 @@ delegates:
 ```
 
 - **The seed, read this way:** when a team is first used (at startup, and lazily before its
-  roster is first read), every file member whose id the roster does not hold is added with
-  its `role` (default `member`) and the emails of its `google:` principals. An entry already
+  roster is first read), every file member whose id the roster does not hold is added,
+  `active`, with its `role` (default `member`) and the emails of its `google:` principals. An entry already
   on the roster is never changed by the file: never demoted, never re-promoted, its emails
   never merged; nobody is ever removed by it. A seed whose email another entry holds, whose
   id is retired (below) for other emails, or that would pass 50 members is skipped and
   logged (`roster_seeded`). Idempotent: a second start writes nothing.
-- **Startup errors:** a team without a `role: owner`, a role other than `owner`/`member`,
+- **Startup errors:** a file team whose id is a team the API created, active or deleted
+  (M9-SPEC §7.1: the relay refuses to start and logs `seed_team_conflict` with the id; the
+  file's team needs another id), a team without a `role: owner`, a role other than `owner`/`member`,
   more than 5 `google:` principals on a member, a member id twice in one team, a principal
   twice in one team, anything the M1–M3 rules already refused. A principal (and a member
   id) may appear in several teams, once per team (M5-SPEC §4).
@@ -174,16 +183,45 @@ delegates:
   - **Delegates** (the hosted console): the delegate's token is the console's service
     account; `X-Relay-On-Behalf-Of` names the member by email only, so there is no member
     `sub` on that path to bind or check. The console's IAP identity is the check there.
-- **Invariants,** checked inside the transaction that writes: at least one owner; an email
-  in at most one entry of a team; member ids `^[a-z][a-z0-9_]{1,31}$`, unique in the team;
-  at most 50 members; 1..5 emails an entry (a token-only seed member may have none); a
+- **Invariants,** checked inside the transaction that writes: at least one active owner (an
+  invitation to be an owner is not one); an email in at most one entry of a team, active or
+  invited; member ids `^[a-z][a-z0-9_]{1,31}$`, unique in the team; at most 50 entries; 1..5 emails an entry (a token-only seed member may have none); a
   delegate's email is never a member's.
 - **Retired ids:** removing a member retires their id (`teams/{team}/retired/{member}`,
   with the SHA-256 of every email it had, `expire_at` 31 days, longer than any request can
   live). While retired, the id is given again only with one of those emails (the same person
   coming back); anyone else is `409 member_id_retired`. Otherwise a new person under an old
   id would read that id's inbox and requests. Re-adding keeps the record, so a later removal
-  remembers every email the id ever had.
+  remembers every email the id ever had. An invitation withdrawn or declined retires nothing
+  (the id never had a member).
+
+### Invitations (M9-SPEC §7.2)
+
+- **An owner's addition is an invitation.** `POST /roster` (any team, the file's or a created
+  one) writes the entry with `status: "invited"`. It grants nothing anywhere: it resolves no
+  Google ID token, no delegate's email, no static token and no credential; it is not in
+  `/me`'s teammates, the directory, a broadcast or a request's recipients; the login offers
+  no team for it; `/v1/me/teams` lists it under `invitations`, not `teams`. Seed members are
+  `active` from the start.
+- **Migration: none to run.** Every entry stored before the status existed has no `status`
+  field and reads as `active` (both stores); anything but `active` reads as `invited`.
+- **Answering:** `POST /v1/me/invitations/{team}` with exactly `{"accept": true}` or
+  `{"accept": false}` (else `422 invalid_body`), as the invitee: a Google ID token, or a
+  delegate with `manage-roster` on their behalf (a per-team delegate for its own team only,
+  `404` otherwise; a read-only delegate `403`). A device credential or a static token: `403
+  google_identity_required`. One roster transaction; counted against `invitation.<email
+  hash>` at `roster_mutations_per_hour`.
+  - accept → `200 {"team", "name", "member", "role", "status": "active"}`: the entry is
+    active, and with an ID token its email is bound to that Google account (`sub`) at once,
+    as a first sign-in would. Audited `roster.accept` (actor the member, the email's hash,
+    `role …; invited by …`, `via delegate` when so).
+  - decline → `200 {"team", "member", "status": "declined"}`: the entry is removed (audited
+    `roster.decline`).
+  - `404` when that email holds no invitation there, or the team is not a team; `403` when
+    the invitation's email is bound to another Google account.
+- **In the login chooser**, see step 3 of the sign-in below.
+- **Counts:** a team's `members` and `owners` (the admin listing) count active entries only;
+  the 50-entry cap counts invitations too.
 
 ### Roster endpoints (M6-SPEC §2)
 
@@ -193,11 +231,13 @@ transaction reads. Every change is audited (`roster.add`, `roster.email_add`,
 `actor`, the `member` it is about and `email_sha256` (never an email); refusals are audited
 like any refused mutation.
 
-- `GET /v1/teams/{team}/roster` → `{"members": [{member, emails, role, added_by, added_at}],
-  "roster_version"}`, by member id. An owner sees every email; anyone else sees only their
-  own (`emails: null` for the others). Delegates may read it (masked as the member named).
+- `GET /v1/teams/{team}/roster` → `{"members": [{member, emails, role, added_by, added_at,
+  status}], "roster_version"}`, by member id. An owner sees every email and the open
+  invitations (`status: "invited"`) among the members; anyone else sees the active members
+  only, and only their own email (`emails: null` for the others). Delegates may read it
+  (masked as the member named).
 - `POST /v1/teams/{team}/roster` `{member, email, role?}` (`role` defaults to `member`) →
-  `201` with the entry. `409 member_exists`, `409 email_taken`, `409 team_full`,
+  `201` with the entry, `status: "invited"` (audited `roster.add`, outcome `invited`). `409 member_exists`, `409 email_taken`, `409 team_full`,
   `409 member_id_retired`; `422 invalid_body` for a bad id or email, a delegate's email, or any
   other field.
 - `PATCH /v1/teams/{team}/roster/{member}` `{add_email?, remove_email?, role?}` (at least
@@ -217,7 +257,8 @@ like any refused mutation.
     working.
 - `DELETE /v1/teams/{team}/roster/{member}` → `200 {"removed": member}`: the entry is
   deleted, the id retired, and every live device credential of the member revoked, in one
-  transaction. `409 last_owner`, `409 seed_member`, `404`.
+  transaction. For an invitation this withdraws it and retires nothing. `409 last_owner`,
+  `409 seed_member`, `404`.
 - Rate limit: `limits.roster_mutations_per_hour` (30) successful changes per owner and
   calendar hour, counted in the same transaction: `429 rate_limited`.
 - `GET /v1/teams/{team}/me` also returns the caller's `role`.
@@ -265,6 +306,22 @@ authenticates as before.
    its inputs are only the hidden `csrf` and the `team` radios, as before M9, so a client that
    submits every input and the first button still chooses a team. A team's display name is
    shown beside its id when it has one. A fresh CSRF token (only its hash is stored).
+   **Invitations** (M9-SPEC §7.2) are listed after Continue: "<name> <id> — invited by
+   <member>, as <member id>" with **Accept** and **Decline**, buttons of the same form
+   (`<button type="submit" formaction="/v1/login/invitation" formnovalidate name="accept"
+   value="<team id>">`, and `name="decline"`); a button sends only its own name and value,
+   so the page's inputs and Continue's POST are unchanged. An account with invitations and
+   no team sees this page without radios and without Continue ("You're not on a team yet.
+   Accept an invitation, or create a team."); with neither, the create page as before.
+   `POST /v1/login/invitation` (form: `csrf`, optionally `team` (the checked radio,
+   ignored), and exactly one of `accept` or `decline` whose value is the team id; nothing
+   else, each once, at most 4 KiB) takes the chooser's cookie, `Origin`, CSRF and step
+   (`choose`, unexpired) checks (`400`/`403` pages as for the chooser). Accept answers the
+   invitation as `POST /v1/me/invitations/{team}` does (the login's `sub` is bound), adds the
+   team to the login's choices and shows the chooser with it preselected; Decline removes
+   the invitation and shows the chooser again (or the create page). An invitation no longer
+   open shows the page again with "That invitation is no longer open." (`409`); too many
+   answers `429`; an email bound to another account ends the login (`403`).
 4. `POST /v1/login/choose` (`application/x-www-form-urlencoded`: `csrf`, `team`, `action`
    = `continue` | `cancel` | `new`; nothing else, each once, at most 4 KiB): the cookie, step `choose`, the CSRF token, an
    `Origin` (when sent) equal to `RELAY_PUBLIC_URL`, a team from the chooser, and the account
@@ -290,7 +347,8 @@ authenticates as before.
    create page again with the refusal's status (`422`, `409`, `429`), its message and the
    member's own input (escaped; a left-empty id shows the one made from the name, to edit).
    `back` answers the chooser; `cancel` ends the login like the chooser's Cancel. The created
-   team is kept even if the login then expires.
+   team is kept even if the login then expires. Every `create` counts one attempt against
+   the account's hourly quota (M9-SPEC §7.4), before the form is validated.
 5. `POST /v1/login/token` `{"code", "code_verifier"}` (verifier 43..128 RFC 7636 characters):
    the code unused, unexpired and `BASE64URL(SHA256(verifier)) == challenge` → the code is
    marked used and a device credential minted (recording the SHA-256 of the email signed in
@@ -310,8 +368,8 @@ authenticates as before.
   `Referrer-Policy: same-origin` (no Referer leaves the relay; `no-referrer` would make
   browsers send `Origin: null` on the chooser's POST, whose `Origin` the relay checks),
   `Cache-Control: no-store`. The stylesheet is linked as `style.css?v=<content hash>`.
-- **Rate limits** per client IP (`limits.login_*`, defaults: start 20, callback and choose
-  together 30, token 20 a minute), counted in the store
+- **Rate limits** per client IP (`limits.login_*`, defaults: start 20, callback, choose,
+  create and invitation together 30, token 20 a minute), counted in the store
   (`login_limits/{kind}.{sha256(ip)[:32]}.{minute}`; the address itself is never stored):
   `429`.
 - **The client IP.** Off Cloud Run the socket peer. On Cloud Run (`K_SERVICE` set) the
@@ -374,22 +432,33 @@ ordinary teams otherwise, except that the API never deletes them.
 ### What is stored
 
 - `teams/{team}`: `{id, name, status ("active" | "deleted"), seed, created_at,
-  created_by_member, created_by_email_sha256, roster_version, members, owners, deleted_at,
-  deleted_by_email_sha256, reserved_until, purge_complete}`. `members`/`owners` are the
+  created_by_member, created_by_email_sha256, created_by_sub_sha256, roster_version, members,
+  owners, deleted_at, deleted_by_email_sha256, reserved_until, purge_complete}`
+  (`created_by_sub_sha256` is the creator's `sub` account key below, when the creation had
+  a `sub`). `members`/`owners` are the
   roster's counts, written by every roster change. A seed team's record is filled at startup
   (and before the admin listing); a document with only `roster_version` (before M9) reads as
   an active seed team. A seed record the file no longer lists is not a team, as before M9.
   Team documents never expire.
 - `accounts/{sha256(email)}`: `{memberships: [{team, member}], created: [team ids]}`, for the
-  teams the API created only (the file's teams are found from the file). Kept exact in the
+  teams the API created only (the file's teams are found from the file). `memberships`
+  holds invitations too (it says where to look; the roster decides whether it is one).
+  `accounts/{sha256("sub:" + sub)}` holds only `created`, for a creation made with a Google
+  `sub` (M9-SPEC §7.6): the per-account limit takes the larger of the two counts. Kept exact in the
   same transactions: every roster change that moves an email's membership rewrites its
   account document; creating and deleting keep `created`; the removal takes a deleted team's
   memberships off. "Which teams is this email on" is one read, then each named team's roster
   decides.
-- `admin_audit/{auto}`: `{time, actor_email_sha256, action, team, outcome, detail,
+- `admin_audit/{auto}`: `{time, actor_email_sha256, action, team, outcome, detail, via,
   expire_at}` (kept 400 days): `team.create` (`created`, the creator's hash) and
-  `team.delete` (`deleted`, or `resumed` for a follow-up call; the admin's hash). Never an
-  email, never content. It outlives the team; the team's own audit (`team.create`, actor the
+  `team.delete` (`deleted`, or `resumed` for a follow-up call; the admin's or the owner's
+  hash; `detail` `members N; admin` or `members N; owner <member>`), and every refused
+  admin action (M9-SPEC §7.5): `admin.list` (team `*`) or `team.delete`, outcome
+  `refused`, `detail` the status and error code (`403 forbidden`, `422 confirm_mismatch`,
+  `409 seed_team`, `404 not_found`, `429 rate_limited`), at most
+  `audited_refusals_per_minute` per actor (the rest to stdout,
+  `admin_refusal_not_audited`). `via` is `direct` (the person's own Google ID token) or
+  `delegate` (the console) on every entry. Never an email, never content. It outlives the team; the team's own audit (`team.create`, actor the
   owner, the email's hash) goes with the team.
 - `credential_teams/{sha256}`: `{team, expire_at}`, every credential's pointer (below).
 
@@ -413,15 +482,26 @@ ordinary teams otherwise, except that the API never deletes them.
   overrides, zero-width), private-use, unassigned or line/paragraph separator character;
   `owner_member_id` `^[a-z][a-z0-9_]{1,31}$`; nothing else. The owner's email may not be a
   delegate's.
-- **Refusals:** `409 team_id_reserved` for `admin api login v1 health static www team teams
-  relay console demo test`, every id in the team file, and an id deleted less than 31 days
-  ago; `409 team_exists` for a live team (a former file team still in the store included);
-  `409 team_limit` at `teams_per_account` teams created and not deleted; `429 rate_limited`
-  over `team_creations_per_account_per_day` or `team_creations_per_ip_per_hour`.
-- **One transaction** reads the team and the creator's account, then writes the team, its
-  owner entry, the account (`created` and the membership), the counters and both audits. Two
-  creations of one id: one wins, the other is `409 team_exists`; concurrent creations by one
-  account never pass its limit.
+- **Refusals:** `409 team_id_unavailable` (M9-SPEC §7.4: one answer, whatever the reason)
+  for `admin api login v1 health static www team teams relay console demo test`, every id in
+  the team file, an id deleted less than 31 days ago, a live team (a former file team still
+  in the store included), and an id with anything at all stored under it (M9-SPEC §7.1);
+  `409 team_name_unavailable` for a name equal to a file team's name (its id when it has
+  none), compared case-folded with whitespace runs folded; `409 team_limit` at
+  `teams_per_account` teams created and not deleted (by the email or the `sub`); `429
+  rate_limited` over `team_creations_per_account_per_day` (email or `sub`),
+  `team_creations_per_ip_per_hour`, `team_creations_per_delegate_per_hour`, or
+  `team_create_attempts_per_account_per_hour` (every attempt counts, before the body is
+  read; its detail says "attempts").
+- **Through the console** (M9-SPEC §7.6): a delegate's creation needs exactly one
+  `X-Relay-Client-IP-Hash: <64 lower-case hex>` (the console's salted SHA-256 of the
+  viewer's IAP-reported address), else `400 bad_request`; the per-IP limit counts that
+  value (`team_create.ip.console.<value[:32]>.<hour>`), and the delegate's own hourly cap
+  counts too. From anyone else the header is ignored and the socket address counts.
+- **One transaction** reads the team and the creator's accounts (by email and by `sub`),
+  then writes the team, its owner entry, the accounts (`created` and the membership), the
+  counters and both audits. Two creations of one id: one wins, the other is `409
+  team_id_unavailable`; concurrent creations by one account never pass its limit.
 
 ### `GET /v1/me/teams`
 
@@ -430,12 +510,15 @@ only):
 
 ```json
 {"teams": [{"team": "demo", "name": "Demo", "member": "alice", "role": "owner"}],
+ "invitations": [{"team": "ops", "name": "Ops", "member": "alice", "role": "member",
+                  "invited_by_member": "olga"}],
  "admin": false, "teams_created": 1, "max_teams_created": 3, "suggested_member": "alice"}
 ```
 
 The file's teams first (file order), then the created ones by id, each roster validated
-against its version. With an ID token, a team where that email is bound to another Google
-account is left out. `GET /v1/teams/{team}/me` also returns the team's `name`.
+against its version; `invitations` in the same order (M9-SPEC §7.2; `member` and `role` are
+what accepting makes them). With an ID token, a team or an invitation where that email is
+bound to another Google account is left out. `GET /v1/teams/{team}/me` also returns the team's `name`.
 
 ### Admins (M9-SPEC §4)
 
@@ -454,7 +537,9 @@ forbidden`.
 - `DELETE /v1/admin/teams/{team}` with the body `{"confirm": "<team id>"}` → `200 {"team",
   "status": "deleted", "removal": "complete" | "pending", "deleted_at", "reserved_until"}`.
   `422 confirm_mismatch` unless the body is exactly that; `409 seed_team` for a team of the
-  file; `404` for no such team.
+  file; `404` for no such team. Through the delegate, at most
+  `admin_deletes_per_delegate_per_hour` (5) deletions an hour per delegate (`429
+  rate_limited`; a call that only resumes a removal is not counted; M9-SPEC §7.8).
   1. One transaction marks the team deleted (`reserved_until` 31 days on), frees its creator's
      slot and writes the admin audit. From then on every request naming the team is refused,
      on every instance at once: a created team's record is read on each request that names it
@@ -473,6 +558,28 @@ forbidden`.
      continues the old one's, so no instance's cached roster of the old team can pass for the
      new one's.
 
+### An owner deletes their team (M9-SPEC §7.7)
+
+`DELETE /v1/teams/{team}` with the body `{"confirm": "<team id>"}` → the same `200` and the
+same removal as the admin's delete (the creator's slot is freed; audited in the admin audit
+as `team.delete`, `members N; owner <member>`, with `via`). Any active owner of a team the
+API created, with a Google identity: a Google ID token, or the any-team delegate with
+`manage-teams` on the owner's behalf. A device credential or a static token: `403
+google_identity_required`; a member who is not an owner `403 forbidden`; `422
+confirm_mismatch`; `409 seed_team` for a team of the file; someone not on the team `404` or
+`401` as for any team route. Refusals are audited in the team's audit (`team.delete`) like
+any refused mutation.
+
+### Non-members are rate limited first (M9-SPEC §7.9)
+
+On every team route, a principal (a Google ID token's, a static token's, or the email a
+delegate names) that this process has not seen as a member of the URL's team in the last
+60 s counts one against `principal.<sha256(principal)[:32]>.<minute>` in the store
+(`non_member_requests_per_minute`, 60) **before** the membership check: over it, `429
+rate_limited` (logged `principal_rate_limited`), with no roster or team read. A member's
+repeated requests go free after their first; device credentials are team-bound and
+unaffected.
+
 ### The any-team delegate (M9-SPEC §5)
 
 ```yaml
@@ -485,11 +592,15 @@ delegates:
 ```
 
 With `team: "*"` the delegate acts in the team the URL names, for the member of that team its
-`X-Relay-On-Behalf-Of` email is: `403 not_a_member` when the email is not on that team, `404`
-when the team is not a team (or not any more). Everything else is as for a per-team delegate:
+`X-Relay-On-Behalf-Of` email is: `404` both when the email is not a member of that team
+(invited only included) and when the team is not a team, or not any more (M9-SPEC §7.3: the
+answer says nothing about which teams exist). A per-team delegate keeps `403 not_a_member`
+for an email not on its team. Everything else is as for a per-team delegate:
 only the delegate routes, and the roster mutations only with `manage-roster` and only when
 that member is an owner of that team. `manage-teams` (only with `team: "*"`, a startup error
-otherwise) adds `POST /v1/teams` and the admin routes (for an admin's email). A per-team
+otherwise) adds `POST /v1/teams`, the admin routes (for an admin's email) and `DELETE
+/v1/teams/{team}` (for an owner); `manage-roster` also answers invitations for the email it
+names. A per-team
 delegate keeps working as before. A team in the file may carry an optional `name` (1..60
 characters, as above; its id otherwise).
 
