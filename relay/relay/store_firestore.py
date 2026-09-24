@@ -15,6 +15,12 @@ Representation choices:
   queries it with one single-field range or equality filter, ordered by it alone; Firestore
   breaks ties by document id (the request id), which is the order MemoryStore uses. The
   automatic single-field index serves every such query, so no composite index is needed.
+- The roster (M6-SPEC §1) is ``teams/{team}/roster/{member}``; ``teams/{team}`` holds
+  ``roster_version``. Device credentials are ``teams/{team}/credentials/{sha256}``; logins,
+  one-time codes and the per-IP login counters are top-level (``logins``, ``login_codes``,
+  ``login_limits``), since no team is known yet. A removed member's id is kept in
+  ``teams/{team}/retired/{member}`` for a while. Every one of them but the roster carries
+  ``expire_at``. The credential queries filter on ``member`` alone (automatic index).
 - A request document stays well under Firestore's 1 MiB: a question is at most 8000
   characters, each recipient carries at most a 2000-character answer preview and 50 tool
   events, and a team has at most 50 members.
@@ -37,21 +43,35 @@ from google.cloud.firestore_v1.base_query import FieldFilter
 from .jsonutil import canonical_json
 from .store import (
     DELIVERY_SCAN_LIMIT,
+    MAX_LIVE_CREDENTIALS,
     STREAM_SCAN_LIMIT,
     AuditEntry,
     BeyondHead,
     CreateOutcome,
+    CredentialRecord,
     Envelope,
     IdempotencyRecord,
+    LoginChoice,
+    LoginCode,
+    LoginDoc,
+    LoginFn,
     MemberDoc,
     MutateFn,
     ProgressEntry,
     Quota,
     QuotaExceeded,
     RecipientState,
+    RedeemFn,
+    RedeemOutcome,
     RequestDoc,
+    RetiredId,
+    RosterEntry,
+    RosterFn,
+    RosterOutcome,
+    RosterState,
     StreamPage,
     ToolEvent,
+    credentials_over_cap,
     monotonic_updated_at,
     stamp_deliveries,
 )
@@ -282,7 +302,7 @@ def _idem_from_doc(doc: dict[str, Any]) -> IdempotencyRecord:
 
 
 def _audit_to_doc(entry: AuditEntry) -> dict[str, Any]:
-    return {
+    doc = {
         "time": entry.time,
         "team": entry.team,
         "actor": entry.actor,
@@ -297,6 +317,11 @@ def _audit_to_doc(entry: AuditEntry) -> dict[str, Any]:
         "detail": entry.detail,
         "expire_at": entry.expire_at,
     }
+    if entry.member is not None:
+        doc["member"] = entry.member
+    if entry.email_sha256:
+        doc["email_sha256"] = list(entry.email_sha256)
+    return doc
 
 
 def _audit_from_doc(doc: dict[str, Any]) -> AuditEntry:
@@ -314,6 +339,139 @@ def _audit_from_doc(doc: dict[str, Any]) -> AuditEntry:
         content_sha256=doc.get("content_sha256"),
         content_length=doc.get("content_length"),
         detail=doc.get("detail"),
+        member=doc.get("member"),
+        email_sha256=list(doc.get("email_sha256") or []),
+    )
+
+
+def _roster_to_doc(entry: RosterEntry) -> dict[str, Any]:
+    return {
+        "member": entry.member,
+        "emails": list(entry.emails),
+        "role": entry.role,
+        "added_by": entry.added_by,
+        "added_at": entry.added_at,
+        "updated_at": entry.updated_at,
+    }
+
+
+def _roster_from_doc(doc: dict[str, Any]) -> RosterEntry:
+    return RosterEntry(
+        member=doc["member"],
+        emails=list(doc.get("emails") or []),
+        role=doc["role"],
+        added_by=doc["added_by"],
+        added_at=_dt(doc["added_at"]),  # type: ignore[arg-type]
+        updated_at=_dt(doc["updated_at"]),  # type: ignore[arg-type]
+    )
+
+
+def _retired_to_doc(tomb: RetiredId) -> dict[str, Any]:
+    return {
+        "member": tomb.member,
+        "email_sha256": list(tomb.email_sha256),
+        "retired_at": tomb.retired_at,
+        "expire_at": tomb.expire_at,
+    }
+
+
+def _retired_from_doc(doc: dict[str, Any]) -> RetiredId:
+    return RetiredId(
+        member=doc["member"],
+        email_sha256=list(doc.get("email_sha256") or []),
+        retired_at=_dt(doc["retired_at"]),  # type: ignore[arg-type]
+        expire_at=_dt(doc["expire_at"]),  # type: ignore[arg-type]
+    )
+
+
+def _credential_to_doc(record: CredentialRecord) -> dict[str, Any]:
+    return {
+        "team": record.team,
+        "member": record.member,
+        "device": record.device,
+        "created_at": record.created_at,
+        "last_used_at": record.last_used_at,
+        "expire_at": record.expire_at,
+        "revoked": record.revoked,
+        "revoked_at": record.revoked_at,
+    }
+
+
+def _credential_from_doc(key: str, doc: dict[str, Any]) -> CredentialRecord:
+    return CredentialRecord(
+        key=key,
+        team=doc["team"],
+        member=doc["member"],
+        device=doc["device"],
+        created_at=_dt(doc["created_at"]),  # type: ignore[arg-type]
+        last_used_at=_dt(doc["last_used_at"]),  # type: ignore[arg-type]
+        expire_at=_dt(doc["expire_at"]),  # type: ignore[arg-type]
+        revoked=bool(doc.get("revoked")),
+        revoked_at=_dt(doc.get("revoked_at")),
+    )
+
+
+def _login_to_doc(login: LoginDoc) -> dict[str, Any]:
+    return {
+        "port": login.port,
+        "state": login.state,
+        "challenge": login.challenge,
+        "device": login.device,
+        "step": login.step,
+        "nonce": login.nonce,
+        "google_verifier": login.google_verifier,
+        "created_at": login.created_at,
+        "expire_at": login.expire_at,
+        "csrf_sha256": login.csrf_sha256,
+        "email": login.email,
+        "choices": [{"team": c.team, "member": c.member} for c in login.choices],
+    }
+
+
+def _login_from_doc(key: str, doc: dict[str, Any]) -> LoginDoc:
+    return LoginDoc(
+        key=key,
+        port=doc["port"],
+        state=doc["state"],
+        challenge=doc["challenge"],
+        device=doc["device"],
+        step=doc["step"],
+        nonce=doc["nonce"],
+        google_verifier=doc["google_verifier"],
+        created_at=_dt(doc["created_at"]),  # type: ignore[arg-type]
+        expire_at=_dt(doc["expire_at"]),  # type: ignore[arg-type]
+        csrf_sha256=doc.get("csrf_sha256"),
+        email=doc.get("email"),
+        choices=[LoginChoice(team=c["team"], member=c["member"]) for c in doc.get("choices") or []],
+    )
+
+
+def _code_to_doc(code: LoginCode) -> dict[str, Any]:
+    return {
+        "login_key": code.login_key,
+        "team": code.team,
+        "member": code.member,
+        "device": code.device,
+        "challenge": code.challenge,
+        "created_at": code.created_at,
+        "expire_at": code.expire_at,
+        "used": code.used,
+        "credential_key": code.credential_key,
+    }
+
+
+def _code_from_doc(key: str, doc: dict[str, Any]) -> LoginCode:
+    return LoginCode(
+        key=key,
+        login_key=doc["login_key"],
+        team=doc["team"],
+        member=doc["member"],
+        device=doc["device"],
+        challenge=doc["challenge"],
+        created_at=_dt(doc["created_at"]),  # type: ignore[arg-type]
+        expire_at=_dt(doc["expire_at"]),  # type: ignore[arg-type]
+        used=bool(doc.get("used")),
+        credential_key=doc.get("credential_key"),
     )
 
 
@@ -362,6 +520,24 @@ class FirestoreStore:
 
     def _counter(self, team: str, key: str):
         return self._team(team).collection("counters").document(key)
+
+    def _roster_col(self, team: str):
+        return self._team(team).collection("roster")
+
+    def _retired_col(self, team: str):
+        return self._team(team).collection("retired")
+
+    def _credential(self, team: str, key: str):
+        return self._team(team).collection("credentials").document(key)
+
+    def _login(self, key: str):
+        return self._db().collection("logins").document(key)
+
+    def _code(self, key: str):
+        return self._db().collection("login_codes").document(key)
+
+    def _login_counter(self, key: str):
+        return self._db().collection("login_limits").document(key)
 
     # Transactions -------------------------------------------------------------------------
     async def _run[T](self, body: Callable[[AsyncTransaction], Awaitable[T]]) -> T:
@@ -744,6 +920,198 @@ class FirestoreStore:
             except QuotaExceeded:
                 return False
             self._write_quotas(txn, team, [quota], counts)
+            return True
+
+        return await self._run(body)
+
+    # Roster -------------------------------------------------------------------------------
+    async def roster_version(self, team: str) -> int:
+        snap = await self._team(team).get(field_paths=["roster_version"])
+        return _int_field(snap, "roster_version")
+
+    async def _read_roster(self, txn: AsyncTransaction, team: str) -> RosterState:
+        snap = await self._team(team).get(transaction=txn)
+        entries = {
+            doc.id: _roster_from_doc(doc.to_dict() or {})
+            async for doc in self._roster_col(team).stream(transaction=txn)
+        }
+        retired = {
+            doc.id: _retired_from_doc(doc.to_dict() or {})
+            async for doc in self._retired_col(team).stream(transaction=txn)
+        }
+        return RosterState(
+            version=_int_field(snap, "roster_version"), entries=entries, retired=retired
+        )
+
+    async def read_roster(self, team: str) -> RosterState:
+        async def body(txn: AsyncTransaction) -> RosterState:
+            return await self._read_roster(txn, team)
+
+        return await self._run(body)
+
+    async def mutate_roster[T](
+        self, team: str, fn: RosterFn[T], now: datetime, quotas: Sequence[Quota] = ()
+    ) -> RosterOutcome[T]:
+        async def body(txn: AsyncTransaction) -> RosterOutcome[T]:
+            state = await self._read_roster(txn, team)
+            change = fn(state)
+            if not change.changed:
+                return RosterOutcome(result=change.result, version=state.version, revoked=[])
+            counts = await self._read_quotas(txn, team, quotas)  # raising writes nothing
+            to_revoke: list[str] = []
+            for member in change.remove:
+                query = (
+                    self._team(team)
+                    .collection("credentials")
+                    .where(filter=FieldFilter("member", "==", member))
+                )
+                async for snap in query.stream(transaction=txn):
+                    record = _credential_from_doc(snap.id, snap.to_dict() or {})
+                    if record.live(now):
+                        to_revoke.append(record.key)
+            # All reads are done; writes from here on.
+            self._write_quotas(txn, team, quotas, counts)
+            for key in sorted(to_revoke):
+                txn.update(self._credential(team, key), {"revoked": True, "revoked_at": now})
+            for member in change.remove:
+                txn.delete(self._roster_col(team).document(member))
+            for entry in change.put:
+                txn.set(self._roster_col(team).document(entry.member), _roster_to_doc(entry))
+            for tomb in change.retire:
+                txn.set(self._retired_col(team).document(tomb.member), _retired_to_doc(tomb))
+            txn.set(self._team(team), {"roster_version": state.version + 1}, merge=True)
+            self._write_audit(txn, change.audit)
+            return RosterOutcome(
+                result=change.result, version=state.version + 1, revoked=sorted(to_revoke)
+            )
+
+        return await self._run(body)
+
+    # Device credentials -------------------------------------------------------------------
+    async def find_credential(self, teams: Sequence[str], key: str) -> CredentialRecord | None:
+        if not teams:
+            return None
+        found: dict[str, CredentialRecord] = {}
+        async for snap in self._db().get_all([self._credential(t, key) for t in teams]):
+            if snap.exists:
+                record = _credential_from_doc(snap.id, snap.to_dict() or {})
+                found[record.team] = record
+        return next((found[t] for t in teams if t in found), None)
+
+    async def touch_credential(
+        self, team: str, key: str, last_used_at: datetime, expire_at: datetime
+    ) -> None:
+        async def body(txn: AsyncTransaction) -> None:
+            ref = self._credential(team, key)
+            snap = await ref.get(transaction=txn)
+            if not snap.exists or (snap.to_dict() or {}).get("revoked"):
+                return
+            txn.update(ref, {"last_used_at": last_used_at, "expire_at": expire_at})
+
+        await self._run(body)
+
+    async def list_credentials(self, team: str, member: str) -> list[CredentialRecord]:
+        query = (
+            self._team(team)
+            .collection("credentials")
+            .where(filter=FieldFilter("member", "==", member))
+        )
+        return [
+            _credential_from_doc(snap.id, snap.to_dict() or {}) async for snap in query.stream()
+        ]
+
+    async def revoke_credential(
+        self, team: str, key: str, member: str, now: datetime, audit: Sequence[AuditEntry]
+    ) -> CredentialRecord | None:
+        async def body(txn: AsyncTransaction) -> CredentialRecord | None:
+            ref = self._credential(team, key)
+            snap = await ref.get(transaction=txn)
+            if not snap.exists:
+                return None
+            record = _credential_from_doc(key, snap.to_dict() or {})
+            if record.member != member or not record.live(now):
+                return None
+            txn.update(ref, {"revoked": True, "revoked_at": now})
+            self._write_audit(txn, audit)
+            record.revoked, record.revoked_at = True, now
+            return record
+
+        return await self._run(body)
+
+    # Login --------------------------------------------------------------------------------
+    async def create_login(self, login: LoginDoc) -> None:
+        await self._login(login.key).create(_login_to_doc(login))
+
+    async def mutate_login[T](self, key: str, fn: LoginFn[T]) -> T:
+        async def body(txn: AsyncTransaction) -> T:
+            ref = self._login(key)
+            snap = await ref.get(transaction=txn)
+            change = fn(_login_from_doc(key, snap.to_dict() or {}) if snap.exists else None)
+            if change.login is not None:
+                if change.login.key != key:
+                    raise RuntimeError("a login change may only write its own login")
+                txn.set(ref, _login_to_doc(change.login))
+            if change.code is not None:
+                txn.create(self._code(change.code.key), _code_to_doc(change.code))
+            return change.result
+
+        return await self._run(body)
+
+    async def redeem_code[T](self, key: str, fn: RedeemFn[T], now: datetime) -> RedeemOutcome[T]:
+        async def body(txn: AsyncTransaction) -> RedeemOutcome[T]:
+            ref = self._code(key)
+            snap = await ref.get(transaction=txn)
+            plan = fn(_code_from_doc(key, snap.to_dict() or {}) if snap.exists else None)
+            over: list[CredentialRecord] = []
+            reused: CredentialRecord | None = None
+            if plan.code is not None and plan.code.key != key:
+                raise RuntimeError("a redemption may only write its own code")
+            if plan.credential is not None:
+                cred = plan.credential
+                query = (
+                    self._team(cred.team)
+                    .collection("credentials")
+                    .where(filter=FieldFilter("member", "==", cred.member))
+                )
+                existing = [
+                    _credential_from_doc(s.id, s.to_dict() or {})
+                    async for s in query.stream(transaction=txn)
+                ]
+                over = credentials_over_cap(existing, now, MAX_LIVE_CREDENTIALS - 1)
+            if plan.revoke is not None:
+                minted = await self._credential(*plan.revoke).get(transaction=txn)
+                if minted.exists:
+                    record = _credential_from_doc(minted.id, minted.to_dict() or {})
+                    reused = record if record.live(now) else None
+            # All reads are done; writes from here on.
+            revoked: list[CredentialRecord] = []
+            for record in [*over, *([reused] if reused else [])]:
+                txn.update(
+                    self._credential(record.team, record.key),
+                    {"revoked": True, "revoked_at": now},
+                )
+                record.revoked, record.revoked_at = True, now
+                revoked.append(record)
+            if plan.code is not None:
+                txn.set(ref, _code_to_doc(plan.code))
+            if plan.credential is not None:
+                txn.create(
+                    self._credential(plan.credential.team, plan.credential.key),
+                    _credential_to_doc(plan.credential),
+                )
+            self._write_audit(txn, plan.audit)
+            return RedeemOutcome(result=plan.result, revoked=revoked)
+
+        return await self._run(body)
+
+    async def count_login_quota(self, quota: Quota) -> bool:
+        async def body(txn: AsyncTransaction) -> bool:
+            ref = self._login_counter(quota.key)
+            snap = await ref.get(transaction=txn)
+            count = _int_field(snap, "count")
+            if count >= quota.limit:
+                return False
+            txn.set(ref, {"count": count + 1, "expire_at": quota.expire_at})
             return True
 
         return await self._run(body)

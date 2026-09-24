@@ -18,6 +18,17 @@ that need a transaction live in exactly one primitive each:
   audit entries only while the counter is under its limit, atomically.
 - :meth:`Store.count_quota`: count one against a per-minute counter while it is under its
   limit, atomically (the read budget, M2-SPEC §7.3).
+- :meth:`Store.mutate_roster`: read a team's roster version and every roster entry, run a
+  *pure* function over them, count the quotas, and write the entries it changed, delete the
+  members it removed (revoking every live device credential of theirs) and bump the
+  version, in one transaction (M6-SPEC §1). Seeding and the owner endpoints are all this
+  primitive with a different function.
+- :meth:`Store.mutate_login`: read one login, run a pure function, write its new version and
+  the one-time code it minted, in one transaction (M5-SPEC §2).
+- :meth:`Store.redeem_code`: read one login code, run a pure function, then write the used
+  code, the credential it mints (revoking the member's least recently used live credentials
+  beyond MAX_LIVE_CREDENTIALS) or revoke the credential a reused code minted, in one
+  transaction (M5-SPEC §2 step 7, §3).
 
 Every write of an existing request keeps its ``updated_at`` monotonic (M2-SPEC §7.1): the
 store stamps it, inside the transaction that writes the request, as the later of the value
@@ -166,6 +177,189 @@ class AuditEntry:
     content_sha256: str | None = None
     content_length: int | None = None
     detail: str | None = None
+    # M6-SPEC §2: the member a roster change or a credential is about, and the SHA-256 of
+    # every email it touched (never the email itself).
+    member: str | None = None
+    email_sha256: list[str] = field(default_factory=list)
+
+
+# Roster (M6-SPEC §1) ---------------------------------------------------------------------
+
+
+@dataclass
+class RosterEntry:
+    """``teams/{team}/roster/{member}``: who the member is (their lower-cased Google emails)
+    and their role. Never expires."""
+
+    member: str
+    emails: list[str]
+    role: str  # "owner" | "member"
+    added_by: str
+    added_at: datetime
+    updated_at: datetime
+
+
+@dataclass
+class RetiredId:
+    """``teams/{team}/retired/{member}``: a removed member's id, kept until ``expire_at``
+    (past the longest a request and its messages can live) with the SHA-256 of the emails it
+    had, so the id cannot be handed to someone else while its history is still readable."""
+
+    member: str
+    email_sha256: list[str]
+    retired_at: datetime
+    expire_at: datetime
+
+
+@dataclass
+class RosterState:
+    """A team's roster as one transaction read it: ``roster_version`` (0 before the first
+    change), every entry by member id, and the retired ids (expired ones included; the
+    caller compares ``expire_at``)."""
+
+    version: int
+    entries: dict[str, RosterEntry]
+    retired: dict[str, RetiredId] = field(default_factory=dict)
+
+
+@dataclass
+class RosterChange[T]:
+    """What a :meth:`Store.mutate_roster` function asks the store to write. ``put`` entries
+    are written whole; ``remove`` members are deleted and their live credentials revoked.
+    The version is bumped when either is non-empty; nothing is written otherwise, and the
+    quotas are counted only then."""
+
+    result: T
+    put: list[RosterEntry] = field(default_factory=list)
+    remove: list[str] = field(default_factory=list)
+    audit: list[AuditEntry] = field(default_factory=list)
+    # Written with a removal; kept (not deleted) when the id is given back, so the next
+    # removal merges every email the id had. The TTL policy deletes them.
+    retire: list[RetiredId] = field(default_factory=list)
+
+    @property
+    def changed(self) -> bool:
+        return bool(self.put or self.remove or self.retire)
+
+
+@dataclass
+class RosterOutcome[T]:
+    result: T
+    version: int
+    revoked: list[str]  # credential keys revoked with a removal
+
+
+# Device credentials (M5-SPEC §3) ---------------------------------------------------------
+
+# At most this many live (unrevoked, unexpired) credentials per member: minting one more
+# revokes the least recently used beyond it, so a removal revokes a bounded number in its
+# transaction.
+MAX_LIVE_CREDENTIALS = 20
+
+
+@dataclass
+class CredentialRecord:
+    """``teams/{team}/credentials/{key}``, ``key`` the SHA-256 hex of the whole credential.
+    ``expire_at`` rolls forward with use (the TTL field)."""
+
+    key: str
+    team: str
+    member: str
+    device: str
+    created_at: datetime
+    last_used_at: datetime
+    expire_at: datetime
+    revoked: bool = False
+    revoked_at: datetime | None = None
+
+    def live(self, now: datetime) -> bool:
+        return not self.revoked and now < self.expire_at
+
+
+def credentials_over_cap(
+    records: Sequence[CredentialRecord], now: datetime, keep: int
+) -> list[CredentialRecord]:
+    """The live credentials to revoke so that at most ``keep`` stay live: the least recently
+    used first (ties: the oldest, then the key). Pure, for both stores."""
+    live = [r for r in records if r.live(now)]
+    if len(live) <= keep:
+        return []
+    live.sort(key=lambda r: (r.last_used_at, r.created_at, r.key))
+    return live[: len(live) - keep]
+
+
+# Login (M5-SPEC §2) ----------------------------------------------------------------------
+
+
+@dataclass
+class LoginChoice:
+    team: str
+    member: str
+
+
+@dataclass
+class LoginDoc:
+    """``logins/{key}``, ``key`` the SHA-256 hex of the login id (the ``trl`` cookie and
+    Google's ``state``). Steps: ``google`` → ``exchanging`` → ``choose`` → ``done``, or
+    ``closed`` from any of them."""
+
+    key: str
+    port: int
+    state: str  # the plugin's, returned to its listener
+    challenge: str  # the plugin's PKCE challenge
+    device: str
+    step: str
+    nonce: str
+    google_verifier: str  # the relay's own PKCE verifier towards Google
+    created_at: datetime
+    expire_at: datetime
+    csrf_sha256: str | None = None
+    email: str | None = None
+    choices: list[LoginChoice] = field(default_factory=list)
+
+
+@dataclass
+class LoginCode:
+    """``login_codes/{key}``, ``key`` the SHA-256 hex of the one-time code."""
+
+    key: str
+    login_key: str
+    team: str
+    member: str
+    device: str
+    challenge: str
+    created_at: datetime
+    expire_at: datetime
+    used: bool = False
+    credential_key: str | None = None
+
+
+@dataclass
+class LoginChange[T]:
+    """What a :meth:`Store.mutate_login` function asks the store to write."""
+
+    result: T
+    login: LoginDoc | None = None  # the new version, or None to leave it
+    code: LoginCode | None = None  # a code to create
+
+
+@dataclass
+class Redemption[T]:
+    """What a :meth:`Store.redeem_code` function asks the store to write: the code's new
+    version, a credential to create, the ``(team, key)`` of a credential to revoke (the one a
+    reused code minted), and audit entries."""
+
+    result: T
+    code: LoginCode | None = None
+    credential: CredentialRecord | None = None
+    revoke: tuple[str, str] | None = None
+    audit: list[AuditEntry] = field(default_factory=list)
+
+
+@dataclass
+class RedeemOutcome[T]:
+    result: T
+    revoked: list[CredentialRecord]  # revoked in the transaction (reuse, or over the cap)
 
 
 @dataclass
@@ -281,6 +475,9 @@ class QuotaExceeded(Exception):
 
 # Mutation functions receive the current request (None when it does not exist).
 type MutateFn[T] = Callable[[RequestDoc | None], Mutation[T]]
+type RosterFn[T] = Callable[[RosterState], RosterChange[T]]
+type LoginFn[T] = Callable[[LoginDoc | None], LoginChange[T]]
+type RedeemFn[T] = Callable[[LoginCode | None], Redemption[T]]
 
 
 class Store(Protocol):
@@ -401,4 +598,66 @@ class Store(Protocol):
     async def count_quota(self, team: str, quota: Quota) -> bool:
         """Count one against ``quota`` and return True, atomically, if it is under its
         limit; otherwise write nothing and return False."""
+        ...
+
+    # Roster (M6-SPEC §1) -------------------------------------------------------------
+    async def roster_version(self, team: str) -> int:
+        """``teams/{team}.roster_version`` (0 when unset): one small read."""
+        ...
+
+    async def read_roster(self, team: str) -> RosterState:
+        """The version and every entry, read consistently (one transaction)."""
+        ...
+
+    async def mutate_roster[T](
+        self, team: str, fn: RosterFn[T], now: datetime, quotas: Sequence[Quota] = ()
+    ) -> RosterOutcome[T]:
+        """Read the roster and the retired ids, run ``fn`` (pure; raising writes nothing).
+        When it changed something: every quota must be under its limit (else
+        :class:`QuotaExceeded`, nothing written) and is counted; ``put`` entries are
+        written, ``remove`` members deleted with every live credential of theirs revoked
+        (``revoked_at = now``), ``retire`` ids written, ``roster_version`` incremented,
+        the audit written; all in one transaction."""
+        ...
+
+    # Device credentials (M5-SPEC §3) -------------------------------------------------
+    async def find_credential(self, teams: Sequence[str], key: str) -> CredentialRecord | None:
+        """The credential ``key`` in whichever of ``teams`` holds it (revoked or expired
+        ones included; the caller decides), in one batched read."""
+        ...
+
+    async def touch_credential(
+        self, team: str, key: str, last_used_at: datetime, expire_at: datetime
+    ) -> None:
+        """Record a use (the rolling expiry) unless the credential is gone or revoked."""
+        ...
+
+    async def list_credentials(self, team: str, member: str) -> list[CredentialRecord]:
+        """Every credential of the member, revoked and expired ones included, any order."""
+        ...
+
+    async def revoke_credential(
+        self, team: str, key: str, member: str, now: datetime, audit: Sequence[AuditEntry]
+    ) -> CredentialRecord | None:
+        """Revoke the member's live credential ``key`` and write ``audit``, atomically;
+        None (nothing written) when there is no such live credential of that member."""
+        ...
+
+    # Login (M5-SPEC §2) --------------------------------------------------------------
+    async def create_login(self, login: LoginDoc) -> None: ...
+
+    async def mutate_login[T](self, key: str, fn: LoginFn[T]) -> T:
+        """Read login ``key`` (None when absent), run ``fn`` (pure; raising writes
+        nothing), write the new login and create the code it minted, atomically."""
+        ...
+
+    async def redeem_code[T](self, key: str, fn: RedeemFn[T], now: datetime) -> RedeemOutcome[T]:
+        """Read code ``key`` (None when absent), run ``fn`` (pure; raising writes nothing),
+        then atomically: write the code's new version; create the credential (revoking the
+        member's live credentials beyond MAX_LIVE_CREDENTIALS - 1 by
+        :func:`credentials_over_cap`); revoke ``revoke`` when it is live; write the audit."""
+        ...
+
+    async def count_login_quota(self, quota: Quota) -> bool:
+        """:meth:`count_quota` for the login pages, outside any team (M5-SPEC §2)."""
         ...

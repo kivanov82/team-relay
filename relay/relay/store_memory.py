@@ -12,19 +12,32 @@ from typing import Any
 
 from .store import (
     DELIVERY_SCAN_LIMIT,
+    MAX_LIVE_CREDENTIALS,
     STREAM_SCAN_LIMIT,
     AuditEntry,
     BeyondHead,
     CreateOutcome,
+    CredentialRecord,
     Envelope,
     IdempotencyRecord,
+    LoginCode,
+    LoginDoc,
+    LoginFn,
     MemberDoc,
     MutateFn,
     ProgressEntry,
     Quota,
     QuotaExceeded,
+    RedeemFn,
+    RedeemOutcome,
     RequestDoc,
+    RetiredId,
+    RosterEntry,
+    RosterFn,
+    RosterOutcome,
+    RosterState,
     StreamPage,
+    credentials_over_cap,
     monotonic_updated_at,
     stamp_deliveries,
 )
@@ -47,6 +60,13 @@ class MemoryStore:
         self._idempotency: dict[tuple[str, str], IdempotencyRecord] = {}
         self._audit: list[AuditEntry] = []
         self._counters: dict[tuple[str, str], int] = {}
+        self._roster: dict[str, dict[str, RosterEntry]] = {}
+        self._roster_version: dict[str, int] = {}
+        self._retired: dict[str, dict[str, RetiredId]] = {}
+        self._credentials: dict[tuple[str, str], CredentialRecord] = {}
+        self._logins: dict[str, LoginDoc] = {}
+        self._codes: dict[str, LoginCode] = {}
+        self._login_counters: dict[str, int] = {}
 
     async def aclose(self) -> None:
         return None
@@ -283,4 +303,143 @@ class MemoryStore:
                 self._take(team, [quota])
             except QuotaExceeded:
                 return False
+            return True
+
+    # Roster ---------------------------------------------------------------------------
+    async def roster_version(self, team: str) -> int:
+        async with self._lock:
+            return self._roster_version.get(team, 0)
+
+    async def read_roster(self, team: str) -> RosterState:
+        async with self._lock:
+            return self._roster_state(team)
+
+    def _roster_state(self, team: str) -> RosterState:
+        return RosterState(
+            version=self._roster_version.get(team, 0),
+            entries=copy.deepcopy(self._roster.get(team, {})),
+            retired=copy.deepcopy(self._retired.get(team, {})),
+        )
+
+    async def mutate_roster[T](
+        self, team: str, fn: RosterFn[T], now: datetime, quotas: Sequence[Quota] = ()
+    ) -> RosterOutcome[T]:
+        async with self._lock:
+            state = self._roster_state(team)
+            version = state.version
+            change = fn(state)  # raising here leaves everything untouched
+            if not change.changed:
+                return RosterOutcome(result=change.result, version=version, revoked=[])
+            self._take(team, quotas)
+            entries = self._roster.setdefault(team, {})
+            revoked: list[str] = []
+            for member in change.remove:
+                entries.pop(member, None)
+                for (t, key), record in sorted(self._credentials.items()):
+                    if t == team and record.member == member and record.live(now):
+                        record.revoked = True
+                        record.revoked_at = now
+                        revoked.append(key)
+            for entry in change.put:
+                entries[entry.member] = copy.deepcopy(entry)
+            retired = self._retired.setdefault(team, {})
+            for tomb in change.retire:
+                retired[tomb.member] = copy.deepcopy(tomb)
+            self._roster_version[team] = version + 1
+            self._audit.extend(copy.deepcopy(change.audit))
+            return RosterOutcome(result=change.result, version=version + 1, revoked=revoked)
+
+    # Device credentials ---------------------------------------------------------------
+    async def find_credential(self, teams: Sequence[str], key: str) -> CredentialRecord | None:
+        async with self._lock:
+            for team in teams:
+                record = self._credentials.get((team, key))
+                if record is not None:
+                    return copy.deepcopy(record)
+            return None
+
+    async def touch_credential(
+        self, team: str, key: str, last_used_at: datetime, expire_at: datetime
+    ) -> None:
+        async with self._lock:
+            record = self._credentials.get((team, key))
+            if record is not None and not record.revoked:
+                record.last_used_at = last_used_at
+                record.expire_at = expire_at
+
+    async def list_credentials(self, team: str, member: str) -> list[CredentialRecord]:
+        async with self._lock:
+            return copy.deepcopy(
+                [r for (t, _), r in self._credentials.items() if t == team and r.member == member]
+            )
+
+    async def revoke_credential(
+        self, team: str, key: str, member: str, now: datetime, audit: Sequence[AuditEntry]
+    ) -> CredentialRecord | None:
+        async with self._lock:
+            record = self._credentials.get((team, key))
+            if record is None or record.member != member or not record.live(now):
+                return None
+            record.revoked = True
+            record.revoked_at = now
+            self._audit.extend(copy.deepcopy(list(audit)))
+            return copy.deepcopy(record)
+
+    # Login ----------------------------------------------------------------------------
+    async def create_login(self, login: LoginDoc) -> None:
+        async with self._lock:
+            if login.key in self._logins:
+                raise RuntimeError("login id collision")
+            self._logins[login.key] = copy.deepcopy(login)
+
+    async def mutate_login[T](self, key: str, fn: LoginFn[T]) -> T:
+        async with self._lock:
+            change = fn(copy.deepcopy(self._logins.get(key)))
+            if change.code is not None and change.code.key in self._codes:
+                raise RuntimeError("login code collision")
+            if change.login is not None:
+                if change.login.key != key:
+                    raise RuntimeError("a login change may only write its own login")
+                self._logins[key] = copy.deepcopy(change.login)
+            if change.code is not None:
+                self._codes[change.code.key] = copy.deepcopy(change.code)
+            return change.result
+
+    async def redeem_code[T](self, key: str, fn: RedeemFn[T], now: datetime) -> RedeemOutcome[T]:
+        async with self._lock:
+            plan = fn(copy.deepcopy(self._codes.get(key)))
+            revoked: list[CredentialRecord] = []
+            if plan.code is not None:
+                if plan.code.key != key:
+                    raise RuntimeError("a redemption may only write its own code")
+                self._codes[key] = copy.deepcopy(plan.code)
+            if plan.credential is not None:
+                cred = plan.credential
+                existing = [
+                    r
+                    for (t, _), r in self._credentials.items()
+                    if t == cred.team and r.member == cred.member
+                ]
+                for record in credentials_over_cap(existing, now, MAX_LIVE_CREDENTIALS - 1):
+                    record.revoked = True
+                    record.revoked_at = now
+                    revoked.append(copy.deepcopy(record))
+                if (cred.team, cred.key) in self._credentials:
+                    raise RuntimeError("credential collision")
+                self._credentials[(cred.team, cred.key)] = copy.deepcopy(cred)
+            if plan.revoke is not None:
+                record = self._credentials.get(plan.revoke)
+                if record is not None and record.live(now):
+                    record.revoked = True
+                    record.revoked_at = now
+                    revoked.append(copy.deepcopy(record))
+            self._audit.extend(copy.deepcopy(plan.audit))
+            return RedeemOutcome(result=plan.result, revoked=revoked)
+
+    async def count_login_quota(self, quota: Quota) -> bool:
+        async with self._lock:
+            count = self._login_counters.get(quota.key, 0)
+            if count >= quota.limit:
+                return False
+            self._login_counters[quota.key] = count + 1
             return True
