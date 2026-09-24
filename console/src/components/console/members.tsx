@@ -166,14 +166,17 @@ function AddMember({ roster }: { roster: Roster | undefined }) {
   const submit = (e: FormEvent) => {
     e.preventDefault()
     const address = email.trim().toLowerCase()
-    const problem = addProblem(roster, member, address)
+    // An emptied id field falls back to the suggestion from the email.
+    const id = member === '' ? suggestMemberId(address, taken) : member
+    if (id !== member) setMember(id)
+    const problem = addProblem(roster, id, address)
     if (problem) {
       setError(problem)
       return
     }
     setError(null)
     change.mutate(
-      { kind: 'add', member, email: address },
+      { kind: 'add', member: id, email: address },
       {
         onSuccess: () => {
           setAdded(member)
@@ -222,8 +225,13 @@ function AddMember({ roster }: { roster: Roster | undefined }) {
             value={member}
             maxLength={32}
             onChange={(e) => {
-              edited.current = e.target.value !== ''
-              setMember(e.target.value.toLowerCase())
+              // Typed ids are tidied as they go: lower case, and a space, - or . becomes _.
+              const tidy = e.target.value
+                .toLowerCase()
+                .replace(/[\s.-]/g, '_')
+                .replace(/[^a-z0-9_]/g, '')
+              edited.current = tidy !== ''
+              setMember(tidy)
               setError(null)
               setAdded(null)
             }}

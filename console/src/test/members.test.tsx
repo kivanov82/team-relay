@@ -284,7 +284,7 @@ describe('roster rules', () => {
     expect(addProblem(roster, 'dave', 'dave@example.com')).toBeNull()
     expect(addProblem(roster, 'bob', 'dave@example.com')).toMatch(/already a member id/)
     expect(addProblem(roster, 'dave', 'BOB@example.org')).toMatch(/already belongs/)
-    expect(addProblem(roster, 'Dave', 'dave@example.com')).toMatch(/member id is 2 to 32/)
+    expect(addProblem(roster, 'Dave', 'dave@example.com')).toMatch(/Pick a member id like/)
     expect(addProblem(roster, 'dave', 'dave')).toMatch(/Google email/)
     const full: Roster = { members: Array.from({ length: 50 }, (_, i) => ({ member: `m${i}x`, emails: [`m${i}@example.com`], role: 'member' as const })) }
     expect(addProblem(full, 'dave', 'dave@example.com')).toMatch(/at most 50/)
@@ -348,5 +348,14 @@ describe('owner from /me (M6 §2)', () => {
     })
     renderWithClient(<App />)
     await waitFor(() => expect(document.querySelector('[data-invite-hint]')).not.toBeNull())
+  })
+})
+
+describe('the member id field', () => {
+  it('suggests an id that the relay accepts for awkward addresses', async () => {
+    const { suggestMemberId } = await import('@/lib/roster')
+    for (const email of ['Kiril.Ivanov@example.com', '2fast@example.com', 'a@example.com', 'x-y+tag@example.com']) {
+      expect(suggestMemberId(email, ['kiril'])).toMatch(/^[a-z][a-z0-9_]{1,31}$/)
+    }
   })
 })
