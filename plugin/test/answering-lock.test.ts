@@ -4,10 +4,10 @@
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, statSync, utimesSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, statSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { configDir, heldBy, lockPath, pidAlive, readLock, tryAcquire, type Acquired } from '../src/answering-lock.js';
+import { configDir, heldBy, lockPath, pidAlive, readLock, takeAndRemove, tryAcquire, type Acquired } from '../src/answering-lock.js';
 import { FakeRelay, TOKEN_OF } from './helpers/fake-relay.js';
 import { DIST, PLUGIN_ROOT, sleep, spawnServer, type Spawned } from './helpers/mcp.js';
 
@@ -86,6 +86,59 @@ describe('the answering lock', () => {
     writeFileSync(path, JSON.stringify({ pid: 111, role: 'host', started_at: '' }));
     a.release();
     expect(existsSync(path)).toBe(false);
+  });
+
+  describe('M8-SPEC §7 item 11: breaking renames the lock aside and verifies it before removing', () => {
+    const stale = JSON.stringify({ pid: 111, role: 'host', started_at: '' });
+    const live = JSON.stringify({ pid: process.pid, role: 'host', started_at: 'now' });
+    const leftovers = () => readdirSync(join(dir, 'team-relay')).filter((n) => n !== 'answering.lock');
+
+    it('removes the lock when it is still the stale content it saw', () => {
+      mkdirSync(join(dir, 'team-relay'), { recursive: true });
+      writeFileSync(path, stale);
+      expect(takeAndRemove(path, (c) => c === stale)).toBe(true);
+      expect(existsSync(path)).toBe(false);
+      expect(leftovers()).toEqual([]);
+    });
+
+    it('a breaker suspended after its check cannot remove a live lock taken meanwhile: it is put back', () => {
+      mkdirSync(join(dir, 'team-relay'), { recursive: true });
+      // The breaker saw `stale`; meanwhile another process broke it and took the lock (`live`).
+      writeFileSync(path, live);
+      expect(takeAndRemove(path, (c) => c === stale)).toBe(false);
+      expect(readFileSync(path, 'utf8')).toBe(live);
+      expect(leftovers()).toEqual([]);
+      // And the live holder is still the holder.
+      expect(readLock(path)).toMatchObject({ pid: process.pid });
+      expect(tryAcquire(path, 'answerer', { pid: process.pid + 100000, alive: (p) => p === process.pid }).ok).toBe(false);
+    });
+
+    it('never puts a lock back over one taken while it was aside', () => {
+      mkdirSync(join(dir, 'team-relay'), { recursive: true });
+      writeFileSync(path, live);
+      const third = JSON.stringify({ pid: process.pid, role: 'answerer', started_at: 'later' });
+      expect(
+        takeAndRemove(path, () => {
+          writeFileSync(path, third, { flag: 'wx' });
+          return false;
+        }),
+      ).toBe(false);
+      expect(readFileSync(path, 'utf8')).toBe(third);
+      expect(leftovers()).toEqual([]);
+    });
+
+    it('a lock that is already gone counts as removed', () => {
+      mkdirSync(join(dir, 'team-relay'), { recursive: true });
+      expect(takeAndRemove(path, () => true)).toBe(true);
+    });
+
+    it('tryAcquire over a stale lock leaves nothing aside', () => {
+      mkdirSync(join(dir, 'team-relay'), { recursive: true });
+      writeFileSync(path, JSON.stringify({ pid: deadPid(), role: 'host', started_at: '' }));
+      expect(tryAcquire(path, 'host').ok).toBe(true);
+      expect(JSON.parse(readFileSync(path, 'utf8'))).toMatchObject({ pid: process.pid });
+      expect(leftovers()).toEqual([]);
+    });
   });
 });
 

@@ -6,10 +6,15 @@
 // The lock is an exclusively created file (O_CREAT|O_EXCL, mode 600) holding the holder's pid,
 // role and start time as JSON. It is stale when that pid is gone. Breaking a stale lock goes
 // through a second exclusive file (`answering.lock.break`), so two processes that both saw the
-// same stale lock cannot both remove it and each think they won. The holder removes the file
-// when it stops, and only while it still names its own pid.
+// same stale lock cannot both remove it and each think they won; and (M8-SPEC §7 item 11) it
+// never unlinks the lock's name: it renames the lock to a name of its own, checks that what it
+// took is exactly the stale content it saw, and only then removes it. A breaker suspended
+// between its check and its removal therefore cannot remove a live lock taken meanwhile: it
+// finds a different content under its own name and puts it back (link, which never replaces
+// a file). The holder releases the same way, only while the file still names its own pid.
 
-import { closeSync, mkdirSync, openSync, readFileSync, rmSync, statSync, unlinkSync, writeSync } from 'node:fs';
+import { randomBytes } from 'node:crypto';
+import { closeSync, linkSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, statSync, writeSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { isAbsolute, join } from 'node:path';
 
@@ -94,6 +99,39 @@ function ageMs(path: string): number {
 }
 
 /**
+ * Take the lock file at `path` away under a unique name, and remove it only when it holds
+ * exactly what `expected` accepts; otherwise put it back where it was (never over a file that
+ * is there by then). Returns whether it removed it (or it was already gone).
+ */
+export function takeAndRemove(path: string, expected: (content: string) => boolean): boolean {
+  const aside = `${path}.${process.pid}.${randomBytes(6).toString('hex')}.taken`;
+  try {
+    renameSync(path, aside);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return true;
+    throw err;
+  }
+  let content: string | null;
+  try {
+    content = readFileSync(aside, 'utf8');
+  } catch {
+    content = null;
+  }
+  if (content !== null && expected(content)) {
+    rmSync(aside, { force: true });
+    return true;
+  }
+  // Not what was expected (a live lock taken meanwhile): back under its name.
+  try {
+    linkSync(aside, path);
+  } catch {
+    // Someone else holds the name by now; theirs stands, and this one was not ours to keep.
+  }
+  rmSync(aside, { force: true });
+  return false;
+}
+
+/**
  * Remove the lock at `path` when it is still exactly the stale content `seen`, under the
  * breaker file. Returns whether it is gone.
  */
@@ -105,19 +143,7 @@ function breakStale(path: string, seen: string): boolean {
     if (!createExclusive(breaker, String(process.pid))) return false;
   }
   try {
-    let now: string | null;
-    try {
-      now = readFileSync(path, 'utf8');
-    } catch {
-      return true;
-    }
-    if (now !== seen) return false;
-    try {
-      unlinkSync(path);
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
-    }
-    return true;
+    return takeAndRemove(path, (now) => now === seen);
   } finally {
     rmSync(breaker, { force: true });
   }
@@ -139,8 +165,7 @@ export function tryAcquire(
         path,
         release: () => {
           try {
-            const info = parseInfo(readFileSync(path, 'utf8'));
-            if (info?.pid === pid) unlinkSync(path);
+            takeAndRemove(path, (now) => parseInfo(now)?.pid === pid);
           } catch {
             // already gone
           }
