@@ -198,17 +198,27 @@ environment Claude Code starts with turns it off for that session.
 **Who answers.** One answerer per computer: the session that holds
 `~/.config/team-relay/answering.lock` (`$XDG_CONFIG_HOME/team-relay/…` when that is set; an
 exclusively created file holding the pid, stale when that pid is gone, broken under a second
-exclusive file so two sessions cannot both take a stale one). Only the holder reads your
-`inbox` stream. A second channel session does not answer (its `whoami` says who does) and
+exclusive file so two sessions cannot both take a stale one; a breaker renames the stale lock
+to a name of its own and checks its content before removing it, so one suspended mid-break
+cannot remove a live lock taken meanwhile: it puts that one back). Only the holder reads your
+`inbox` stream. Taking over is announced: the session gets a status event ("This session now
+answers teammates automatically from <folder>; reads inside it are automatic.") and you get a
+desktop notification. A second channel session does not answer (its `whoami` says who does) and
 takes over within 30 s of the first one ending. `bin/answerer` refuses to start while a
 working session answers, and its channel server takes the same lock, so the two never both
 consume your inbox.
 
 **The scope folder** is the session's working directory, resolved (symlinks). Its name is
-published as your shared folder while the session answers. It must not be `/`, `$HOME` or
-above it, nor inside the credential deny list, `~/.claude`, `$CLAUDE_CONFIG_DIR`,
-`~/.claude-team-relay` or the team relay's config directory; then the session still answers,
-but reads nothing without asking, and shares no folder.
+published as your shared folder while the session answers, and withdrawn (the manifest
+re-published without it) when the session stops. Reads inside it are automatic only when it
+qualifies: it is inside a git work tree (a `.git`, directory or file, in it or in a folder
+above it that is below `$HOME`: your home's own repository, or one above home, does not count;
+outside `$HOME`, any folder above it but `/`); it is not `/`, `$HOME`, above `$HOME` or a
+folder directly in `$HOME`; it is not under `~/Library` or any `~/.*` entry, and does not
+contain one (symlinks resolved both ways); and it is not inside the credential deny list,
+`~/.claude`, `$CLAUDE_CONFIG_DIR`, `~/.claude-team-relay` or the team relay's config
+directory. Otherwise the session still answers, but reads nothing without asking, and shares
+no folder; the announcement says why.
 
 **One question, one short-lived answerer.** For each question the host acks at the relay at
 once (the asker sees "acknowledged"), then, one at a time, runs:
@@ -260,34 +270,58 @@ environment your working session starts with). `settings.json` allows `mcp__host
 `mcp__host__request_approval` and `Read(//<scope>/**)` (when the folder qualifies), and denies
 the tools above plus the whole credential deny list of `bin/answerer` (it applies inside the
 folder too: `.env`, `*.pem`, `credentials.json` …), the host's private directory, the relay
-credential and `$CLAUDE_CONFIG_DIR`. Its only hooks post tool events (name, outcome,
-duration) for the asker's console. A run has 10 minutes of its own time (time spent waiting
-for you does not count) and ends with the question's answer deadline.
+credential and `$CLAUDE_CONFIG_DIR`. Its hooks are the plugin's own: the read trail (below)
+and tool events (name, outcome, duration) for the asker's console. A run has 10 minutes of its
+own time (time spent waiting for you does not count) and is stopped at the question's answer
+deadline plus 60 s whatever it is doing.
+
+**The read trail.** The host learns which files the answerer read, from hooks in its
+`settings.json` that report over the private socket (`node dist/read-trail.js --config
+<run>/read-trail.json`, the run's token in a mode-600 file the answerer cannot read):
+PreToolUse for Read and Grep reports the path about to be read or searched, and blocks the
+tool when the report cannot be made; PostToolUse and PostToolUseFailure for Grep report the
+files a search matched. An answer written after reading or matching a file whose name
+suggests secrets (`*.tfstate`, `secrets.*`, `*.properties`, `docker-compose*`, `kubeconfig`,
+`*service-account*.json`, `.npmrc`, `.netrc`, `.git-credentials`, `.dev.vars`, `id_ecdsa*`,
+`id_dsa*`, `*.ppk`, `*.pem`, `*.key`, `*.p12`), or while a search's matches were never
+reported, waits for you.
 
 **What ships on its own, and what waits for you** (§3), decided by the host, not the model:
 
 | Ships automatically | Waits for your approval |
 |---|---|
 | Reading files inside the scope folder (minus the deny list) | Any read outside it, and every capability tool: the `permission` tool holds the call |
-| An answer the answerer did not flag, that passes the secret screen, when nothing needed approval during the run | An answer the answerer flags (`needs_approval`: people, customers, credentials, infrastructure, production, not grounded, unsure) or asks approval for (`request_approval`) |
-| | An answer the secret screen flags (private keys; provider tokens and API keys by prefix and entropy; `.env`-style `KEY=value` with secret-like keys; connection strings with a password) |
+| An answer the answerer did not flag, that passes the secret screen and the read trail, when nothing needed approval during the run | An answer the answerer flags (`needs_approval`: people, customers, credentials, infrastructure, production, not grounded, unsure) or asks approval for (`request_approval`) |
+| | An answer the secret screen flags: private keys and key bodies; provider tokens and API keys by prefix and entropy; hex strings of 32 or more characters (hashes too) and padded base64; `KEY=value`, `key: value` and JSON pairs whose key names a secret (`password`, `secret`, `token`, `pass`, `pwd`, `pw` …); prose that states one ("the password for staging is …"); URLs with credentials in any form (`user:pass@`, `:pass@`, a token as the user, `?access_token=`, signed-URL parameters). Secrets split across lines, spaced out, or spelled with invisible characters, full-width or look-alike letters are found too |
+| | An answer after reading a file whose name suggests secrets, or while a search was not recorded (the read trail) |
 | | An answer produced after anything needed approval during the run |
+| | Any question past the volume limits: more than 3 from one teammate waiting to be answered, or more than 20 automatic answers in the last hour; it waits for your approval to be answered at all (Answer it / Don't answer / Decline politely) |
 
-Denied without asking you: credential paths (even when the model names them), any other
-built-in tool, a capability tool for a question (capabilities run only for a capability call,
-with exactly its params and request id). A capability call therefore asks you twice: before
-it runs, and before its result is sent.
+Denied without asking you: credential paths (even when the model names them, or a Glob
+pattern or Grep glob names them: a pattern's fixed prefix, and the pattern itself, are checked
+against the deny list first), any other built-in tool, a capability tool for a question
+(capabilities run only for a capability call, with exactly its params and request id). A
+capability call therefore asks you twice: before it runs, and before its result is sent. A
+path that resolves elsewhere is shown with where it really leads (`…/proj/link →
+/elsewhere/x`).
 
 **Deciding.** When something starts waiting, the working session gets a status event
 (`team-relay: alice asked: "…" — an answer is waiting for your approval (1 pending). Run
 /team-relay:approvals.`; the question is quoted as teammate data, on one line, neutralised
 and cut at 200 characters), a desktop notification with a fixed text, and the asker's console
-a `waiting` tool event ("waiting for bob"). `/team-relay:approvals` then shows each item as a
+a `waiting` tool event ("waiting for bob"). They are grouped: at most one desktop
+notification every 5 minutes, and within 5 minutes of a status event that quoted a teammate
+the next ones carry counts only (`team-relay: another item is waiting for your approval (2
+pending).`). `/team-relay:approvals` then shows each item as a
 dialog (MCP elicitation: Claude Code 2.1.282 advertises it and renders flat forms of strings,
 numbers, booleans and single-choice enums): the teammate's text quoted, what is asked (the
-path, the capability and its params, or the draft exactly as it would be sent), and one
-choice: Allow / Deny, or Send / Don't send / Decline politely ("I couldn't answer this
-automatically; <you> hasn't approved it."). The dialog's own Decline or Esc leaves it pending.
+path, the capability and its params, or the draft exactly as it would be sent, each line
+marked with `> `), why it waits (what the answerer wrote is labelled as its own words), and
+one choice: Allow / Deny, or Send / Don't send / Decline politely ("I couldn't answer this
+automatically; <you> hasn't approved it."). Send is offered only when the dialog shows the
+whole draft exactly: the length measured is the length shown, and a draft with control,
+direction or invisible characters (shown escaped) or a channel tag cannot be sent from a
+dialog or the page. The dialog's own Decline or Esc leaves it pending.
 The decision is yours, in the dialog: the model that runs the command only gets the counts.
 A Claude Code without elicitation gets the approvals on a local page instead (127.0.0.1, a
 random port and a per-launch key, the console server's rules), opened in your browser through
@@ -295,6 +329,18 @@ the same private redirect file as `bin/console --open`; the command says so. Any
 not decided is denied when the question's answer deadline passes or after 30 minutes,
 whichever is sooner; a lapse sends nothing (the relay's "acknowledged but not answered"
 applies).
+
+**Nothing lost on stop.** The host moves your inbox cursor past a question only once it is
+fully handled (answered, declined or lapsed), never past one still open. A question in flight
+or waiting for you when the session closes is withdrawn, not decided, and the next host
+receives it again (at least once); one the relay says is already answered is skipped.
+
+**What approvals rely on.** Your decision is yours only while nothing else can answer the
+dialog for you. The working session must have no `Elicitation` or `ElicitationResult` hook
+(in your settings, a project's or a plugin's) that could accept a dialog, and no
+auto-allowed `Bash` (an allow rule, auto mode or `--dangerously-skip-permissions`) with which
+its model could answer the page or run the plugin's tools as you. The plugin cannot see or
+change that session's settings; this is a documented limit.
 
 **Seeing it.** `whoami` adds `answering_automatically`, `answering_folder`,
 `approvals_pending` and `approvals_notice`; the SessionStart line of any session says "N
