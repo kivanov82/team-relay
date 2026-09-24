@@ -1,17 +1,22 @@
-// The plugin's half of the login flow (M5-SPEC §2 steps 1 and 6): loopback + PKCE, in the
-// style of RFC 8252.
+// The plugin's half of the login flow (M5-SPEC §2 steps 1 and 6, with the corrections of
+// §9): loopback + PKCE, in the style of RFC 8252.
 //
+// 0. The relay is the configured one (RELAY_URL, else the plugin's default; never the
+//    model's choice, §9 item 1). A stored credential issued by a different relay is never
+//    replaced: the member signs out first (/team-relay:logout). Checked again just before
+//    the new credential is written.
 // 1. A PKCE verifier (64 base64url chars) and its S256 challenge, a random state (32 bytes),
-//    and an HTTP listener on 127.0.0.1 only, on a free port, for exactly one request, for at
-//    most 5 minutes.
+//    and an HTTP listener on 127.0.0.1 only, on a free port, for at most 5 minutes.
 // 2. The browser is opened on {relay}/v1/login/start?... through a private redirect file (the
 //    URL is never in a process argument, M2-SPEC §7.7); the URL is also handed back to the
 //    caller, in case no browser opens.
-// 3. The one request must be GET /callback with Host 127.0.0.1:<port>, one code and one
-//    state; the state must match (compared in constant time). The browser gets a small page;
-//    then the code and the verifier are exchanged at POST {relay}/v1/login/token.
-// 4. The answer is checked (a trc_ credential, the team, the member, the same relay) and
-//    stored in the credential file (credentials.ts: dir 700, file 600, atomic).
+// 3. Only GET /callback with Host 127.0.0.1:<port> and exactly one state equal to ours
+//    (compared in constant time) ends the wait (§9 item 4); anything else gets a 404 and the
+//    listener keeps waiting. The browser gets a small page; then the code and the verifier
+//    are exchanged at POST {relay}/v1/login/token.
+// 4. The answer is checked (a trc_ credential, the team, the member, the same relay, the
+//    Google account's email when the relay gives one) and stored in the credential file
+//    (credentials.ts: dir 700, file 600, atomic). The result says whom it replaced.
 //
 // Nothing here logs or returns the verifier, the code or the credential.
 
@@ -19,7 +24,15 @@ import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { hostname } from 'node:os';
-import { CREDENTIAL_RE, normaliseRelayUrl, writeCredential, type StoredCredential } from './credentials.js';
+import {
+  CREDENTIAL_RE,
+  CredentialFileError,
+  EMAIL_RE,
+  normaliseRelayUrl,
+  readCredential,
+  writeCredential,
+  type StoredCredential,
+} from './credentials.js';
 import { openInBrowser } from './console-open.js';
 import { MEMBER_RE, TEAM_RE, parseRelayUrl } from './relay-client-core.js';
 
@@ -83,8 +96,8 @@ function respond(res: ServerResponse, status: number, body: string): void {
   res.end(body);
 }
 
-/** Why `done` rejects when this sign-in is replaced by a new one or by a logout. */
-export const SUPERSEDED = 'the sign-in was replaced by a newer one or a logout';
+/** Why `done` rejects when this sign-in is replaced by a new one (or the session ends). */
+export const SUPERSEDED = 'the sign-in was replaced by a newer one';
 
 export class LoginError extends Error {
   constructor(message: string) {
@@ -93,8 +106,61 @@ export class LoginError extends Error {
   }
 }
 
+/** Who this computer was signed in as before a sign-in replaced it. */
+export type Previous = { relay_url: string; team: string; member: string; email?: string };
+
+export type LoginResult = {
+  /** What was stored. */
+  stored: StoredCredential;
+  /** The credential it replaced, or null when there was none. */
+  replaced: Previous | null;
+};
+
+/** "Connected as alice (alice@example.com) on team demo" (the email only when the relay gave it). */
+export function connectedAs(c: { member: string; team: string; email?: string | null }): string {
+  return `Connected as ${c.member}${c.email ? ` (${c.email})` : ''} on team ${c.team}`;
+}
+
+/**
+ * Said plainly when a sign-in changed who this computer is (M5-SPEC §9 item 3): another
+ * member, another team, or both. Null when it is the same member of the same team.
+ */
+export function identityChange(stored: StoredCredential, replaced: Previous | null): string | null {
+  if (!replaced) return null;
+  const member = replaced.member !== stored.member;
+  const team = replaced.team !== stored.team;
+  if (!member && !team) return null;
+  const what = member && team ? 'a different member of a different team' : member ? 'a different member' : 'a different team';
+  return (
+    `This is ${what} than before: this computer was signed in as ${replaced.member} on team ${replaced.team}, ` +
+    `and is now ${stored.member} on team ${stored.team}. If you did not mean to switch, run /team-relay:logout.`
+  );
+}
+
+/**
+ * The credential a sign-in to `relayNorm` would replace. Refuses (LoginError) when the stored
+ * one was issued by another relay, or cannot be read: the member signs out first.
+ */
+export function replaceableCredential(credentialsFile: string, relayNorm: string): Previous | null {
+  let existing: StoredCredential | null;
+  try {
+    existing = readCredential(credentialsFile);
+  } catch (err) {
+    const why = err instanceof CredentialFileError ? err.message : 'it cannot be read';
+    throw new LoginError(`the stored sign-in on this computer cannot be used (${why}); nothing was changed. Run /team-relay:logout, then /team-relay:login.`);
+  }
+  if (!existing) return null;
+  if (existing.relay_url !== relayNorm) {
+    throw new LoginError(
+      `this computer is signed in to another relay (${existing.relay_url}) than the one configured for this session (${relayNorm}); ` +
+        'nothing was changed. To switch relays, run /team-relay:logout first, then /team-relay:login.',
+    );
+  }
+  return { relay_url: existing.relay_url, team: existing.team, member: existing.member, ...(existing.email ? { email: existing.email } : {}) };
+}
+
 export type LoginOptions = {
-  /** The relay to sign in to (https; plain http only to localhost). */
+  /** The configured relay to sign in to (https; plain http only to localhost). */
   relayUrl: string;
   /** Where the credential is stored (credentialsPath()). */
   credentialsFile: string;
@@ -114,17 +180,22 @@ export type LoginFlow = {
   url: string;
   /** The listener's port on 127.0.0.1. */
   port: number;
-  /** Resolves with what was stored; rejects with a LoginError. */
-  done: Promise<StoredCredential>;
-  /** Stop waiting (a new login, or a logout, replaces this one). */
+  /** Resolves with what was stored and what it replaced; rejects with a LoginError. */
+  done: Promise<LoginResult>;
+  /** Stop waiting (a new login replaces this one). */
   cancel(): void;
 };
 
-/** Start a login: the listener is up and the browser asked to open when this resolves. */
+/**
+ * Start a login: the listener is up and the browser asked to open when this resolves. Throws
+ * a LoginError, before anything is opened, when a stored credential from another relay (or
+ * an unreadable one) is in the way.
+ */
 export async function startLogin(opts: LoginOptions): Promise<LoginFlow> {
   const log = opts.log ?? (() => {});
   const relay = parseRelayUrl(opts.relayUrl);
   const relayNorm = normaliseRelayUrl(opts.relayUrl);
+  replaceableCredential(opts.credentialsFile, relayNorm);
   const base = new URL(relay.toString());
   if (!base.pathname.endsWith('/')) base.pathname += '/';
   const device = opts.device ?? deviceLabel();
@@ -134,8 +205,8 @@ export async function startLogin(opts: LoginOptions): Promise<LoginFlow> {
   const challenge = codeChallenge(verifier);
   const doFetch = opts.fetch ?? ((u: string, i: RequestInit) => fetch(u, i));
 
-  let settle!: { resolve: (v: StoredCredential) => void; reject: (e: Error) => void };
-  const done = new Promise<StoredCredential>((resolve, reject) => {
+  let settle!: { resolve: (v: LoginResult) => void; reject: (e: Error) => void };
+  const done = new Promise<LoginResult>((resolve, reject) => {
     settle = { resolve, reject };
   });
   // A caller that never awaits `done` must not see an unhandled rejection.
@@ -158,7 +229,7 @@ export async function startLogin(opts: LoginOptions): Promise<LoginFlow> {
     shut();
     settle.reject(new LoginError(message));
   };
-  const succeed = (v: StoredCredential) => {
+  const succeed = (v: LoginResult) => {
     if (finished) return;
     finished = true;
     shut();
@@ -167,6 +238,19 @@ export async function startLogin(opts: LoginOptions): Promise<LoginFlow> {
 
   let port = 0;
   let used = false;
+
+  /** A credential minted but not stored is revoked at the relay it came from (best effort). */
+  const discard = (credential: string, team: string) => {
+    void doFetch(new URL(`v1/teams/${team}/credentials/self`, base).toString(), {
+      method: 'DELETE',
+      headers: { Authorization: `Bearer ${credential}`, Accept: 'application/json', 'User-Agent': 'team-relay-plugin/0.1.0' },
+      redirect: 'error',
+      signal: AbortSignal.timeout(10_000),
+    }).then(
+      (r) => void r.body?.cancel().catch(() => {}),
+      () => log('could not revoke the unused credential at the relay; it expires on its own'),
+    );
+  };
 
   const exchange = async (code: string): Promise<void> => {
     let res: Response;
@@ -199,7 +283,7 @@ export async function startLogin(opts: LoginOptions): Promise<LoginFlow> {
     } catch {
       return fail('the relay answered the sign-in with something that is not JSON');
     }
-    const { credential, team, member, relay_url, expires_at } = body;
+    const { credential, team, member, relay_url, expires_at, email } = body;
     if (typeof credential !== 'string' || !CREDENTIAL_RE.test(credential)) return fail('the relay did not return a device credential');
     if (typeof team !== 'string' || !TEAM_RE.test(team)) return fail('the relay did not return a valid team');
     if (typeof member !== 'string' || !MEMBER_RE.test(member)) return fail('the relay did not return a valid member id');
@@ -213,48 +297,63 @@ export async function startLogin(opts: LoginOptions): Promise<LoginFlow> {
       }
       if (!same) return fail('the relay named a different relay URL than the one you signed in to; nothing was stored');
     }
+    // M5-SPEC §9 item 3: the Google account, when the relay says (older relays do not).
+    if (email !== undefined && email !== null && (typeof email !== 'string' || email.length > 254 || !EMAIL_RE.test(email))) {
+      discard(credential, team);
+      return fail('the relay returned an invalid email for the signed-in account; nothing was stored');
+    }
     const stored: StoredCredential = {
       relay_url: relayNorm,
       team,
       member,
       credential,
       expires_at: typeof expires_at === 'string' ? expires_at : null,
+      ...(typeof email === 'string' ? { email } : {}),
     };
+    let replaced: Previous | null;
+    try {
+      // Again, now: a sign-in to another relay may have been stored meanwhile.
+      replaced = replaceableCredential(opts.credentialsFile, relayNorm);
+    } catch (err) {
+      discard(credential, team);
+      return fail(`signed in, but nothing was stored: ${(err as Error).message}`);
+    }
     try {
       writeCredential(opts.credentialsFile, stored);
     } catch (err) {
+      discard(credential, team);
       return fail(`signed in, but the credential could not be stored: ${(err as Error).message}`);
     }
-    succeed(stored);
+    succeed({ stored, replaced });
   };
 
   const handle = (req: IncomingMessage, res: ServerResponse) => {
     req.resume();
-    // One request, whatever it is: the listener closes after it.
     if (used || finished) {
       respond(res, 410, page('Sign-in link used', 'This sign-in has finished. You can close this tab.'));
       return;
     }
-    used = true;
-    const bad = (why: string, logLine: string) => {
-      respond(res, 400, page('Sign-in did not complete', `${why} Run /team-relay:login again in Claude Code.`));
-      log(logLine);
-      fail(`the sign-in did not complete (${logLine}); run /team-relay:login again`);
+    // M5-SPEC §9 item 4: a request with the wrong Host, path or state is not ours. It gets a
+    // 404 and the listener keeps waiting; only the request with the right state ends it.
+    const notOurs = (logLine: string) => {
+      respond(res, 404, page('Not found', 'There is nothing here.'));
+      log(`ignored a request to the sign-in listener (${logLine}); still waiting`);
     };
     const host = req.headers.host;
-    if (host !== `127.0.0.1:${port}`) return bad('This page was reached under an unexpected address.', 'unexpected Host on the callback');
+    if (host !== `127.0.0.1:${port}`) return notOurs('unexpected Host');
     let url: URL;
     try {
       url = new URL(req.url ?? '/', `http://127.0.0.1:${port}`);
     } catch {
-      return bad('The sign-in answer could not be read.', 'unreadable callback');
+      return notOurs('unreadable request');
     }
-    if (req.method !== 'GET' || url.pathname !== '/callback') return bad('The sign-in answer came to the wrong place.', 'not GET /callback');
-    const codes = url.searchParams.getAll('code');
+    if (req.method !== 'GET' || url.pathname !== '/callback') return notOurs('not GET /callback');
     const states = url.searchParams.getAll('state');
-    if (states.length !== 1 || !STATE_RE.test(states[0]!) || !sameSecret(states[0]!, state)) {
-      return bad('This answer does not belong to the sign-in Claude Code started.', 'state mismatch');
-    }
+    if (states.length !== 1 || !STATE_RE.test(states[0]!) || !sameSecret(states[0]!, state)) return notOurs('wrong state');
+
+    // The right state: this request ends the wait, whatever it carries.
+    used = true;
+    const codes = url.searchParams.getAll('code');
     // Cancel on the relay's team chooser comes back as ?error=access_denied&state=… (with the
     // right state): stop waiting and say so.
     const errors = url.searchParams.getAll('error');
@@ -263,7 +362,11 @@ export async function startLogin(opts: LoginOptions): Promise<LoginFlow> {
       log(`the sign-in was cancelled in the browser (${/^[a-z_]{1,40}$/.test(errors[0]!) ? errors[0] : 'error'})`);
       return fail('sign-in cancelled in the browser; run /team-relay:login to try again');
     }
-    if (codes.length !== 1 || !CODE_RE.test(codes[0]!)) return bad('The sign-in answer carried no code.', 'no code');
+    if (codes.length !== 1 || !CODE_RE.test(codes[0]!)) {
+      respond(res, 400, page('Sign-in did not complete', 'The sign-in answer carried no code. Run /team-relay:login again in Claude Code.'));
+      log('the sign-in answer carried no code');
+      return fail('the sign-in did not complete (no code); run /team-relay:login again');
+    }
     respond(res, 200, page('Connected', 'Connected. You can close this tab.'));
     void exchange(codes[0]!);
   };

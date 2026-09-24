@@ -25129,6 +25129,7 @@ function parseRelayUrl(raw) {
 
 // src/credentials.ts
 var CREDENTIAL_RE = /^trc_[A-Za-z0-9_-]{43}$/;
+var EMAIL_RE = /^[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9-]{1,63}(\.[A-Za-z0-9-]{1,63})+$/;
 var CREDENTIALS_DIR = "team-relay";
 var CREDENTIALS_FILE = "credentials.json";
 var MAX_FILE_BYTES = 16 * 1024;
@@ -25172,7 +25173,7 @@ function normaliseRelayUrl(raw) {
 function parseStoredCredential(raw) {
   if (typeof raw !== "object" || raw === null || Array.isArray(raw)) throw new CredentialFileError("the credential file is not a JSON object");
   const c = raw;
-  const { relay_url, team, member, credential, expires_at } = c;
+  const { relay_url, team, member, credential, expires_at, email: email2 } = c;
   if (typeof relay_url !== "string") throw new CredentialFileError("the credential file has no relay_url");
   let url;
   try {
@@ -25186,7 +25187,17 @@ function parseStoredCredential(raw) {
   if (expires_at !== void 0 && expires_at !== null && (typeof expires_at !== "string" || !RFC3339.test(expires_at))) {
     throw new CredentialFileError("the credential file has an invalid expires_at");
   }
-  return { relay_url: url, team, member, credential, expires_at: typeof expires_at === "string" ? expires_at : null };
+  if (email2 !== void 0 && email2 !== null && (typeof email2 !== "string" || email2.length > 254 || !EMAIL_RE.test(email2))) {
+    throw new CredentialFileError("the credential file has an invalid email");
+  }
+  return {
+    relay_url: url,
+    team,
+    member,
+    credential,
+    expires_at: typeof expires_at === "string" ? expires_at : null,
+    ...typeof email2 === "string" ? { email: email2 } : {}
+  };
 }
 function readCredential(path) {
   let st;
@@ -25279,15 +25290,6 @@ function writeCredential(path, value) {
       closeSync(dfd);
     }
   } catch {
-  }
-}
-function removeCredential(path) {
-  try {
-    unlinkSync(path);
-    return true;
-  } catch (err) {
-    if (err.code === "ENOENT") return false;
-    throw new CredentialFileError(`cannot remove the credential file (${err.code ?? "error"})`);
   }
 }
 
@@ -25526,7 +25528,9 @@ function connectionFromEnv(env, gcloud = {}) {
       } catch {
         same = false;
       }
-      if (!same) throw new Error("RELAY_URL is not the relay you signed in to: unset it, or run /team-relay:login <relay-url>");
+      if (!same) {
+        throw new Error("RELAY_URL is not the relay you signed in to: unset it, or run /team-relay:logout and then /team-relay:login to sign in to it");
+      }
     }
     const envTeam = configValue(env.RELAY_TEAM);
     if (envTeam !== void 0 && envTeam !== stored.team) {
@@ -25888,18 +25892,46 @@ function respond(res, status, body) {
   });
   res.end(body);
 }
-var SUPERSEDED = "the sign-in was replaced by a newer one or a logout";
+var SUPERSEDED = "the sign-in was replaced by a newer one";
 var LoginError = class extends Error {
   constructor(message) {
     super(message);
     this.name = "LoginError";
   }
 };
+function connectedAs(c) {
+  return `Connected as ${c.member}${c.email ? ` (${c.email})` : ""} on team ${c.team}`;
+}
+function identityChange(stored, replaced) {
+  if (!replaced) return null;
+  const member = replaced.member !== stored.member;
+  const team = replaced.team !== stored.team;
+  if (!member && !team) return null;
+  const what = member && team ? "a different member of a different team" : member ? "a different member" : "a different team";
+  return `This is ${what} than before: this computer was signed in as ${replaced.member} on team ${replaced.team}, and is now ${stored.member} on team ${stored.team}. If you did not mean to switch, run /team-relay:logout.`;
+}
+function replaceableCredential(credentialsFile, relayNorm) {
+  let existing;
+  try {
+    existing = readCredential(credentialsFile);
+  } catch (err) {
+    const why = err instanceof CredentialFileError ? err.message : "it cannot be read";
+    throw new LoginError(`the stored sign-in on this computer cannot be used (${why}); nothing was changed. Run /team-relay:logout, then /team-relay:login.`);
+  }
+  if (!existing) return null;
+  if (existing.relay_url !== relayNorm) {
+    throw new LoginError(
+      `this computer is signed in to another relay (${existing.relay_url}) than the one configured for this session (${relayNorm}); nothing was changed. To switch relays, run /team-relay:logout first, then /team-relay:login.`
+    );
+  }
+  return { relay_url: existing.relay_url, team: existing.team, member: existing.member, ...existing.email ? { email: existing.email } : {} };
+}
 async function startLogin(opts) {
   const log2 = opts.log ?? (() => {
   });
   const relay = parseRelayUrl(opts.relayUrl);
   const relayNorm = normaliseRelayUrl(opts.relayUrl);
+  replaceableCredential(opts.credentialsFile, relayNorm);
   const base = new URL(relay.toString());
   if (!base.pathname.endsWith("/")) base.pathname += "/";
   const device = opts.device ?? deviceLabel();
@@ -25939,6 +25971,18 @@ async function startLogin(opts) {
   };
   let port = 0;
   let used = false;
+  const discard = (credential, team) => {
+    void doFetch(new URL(`v1/teams/${team}/credentials/self`, base).toString(), {
+      method: "DELETE",
+      headers: { Authorization: `Bearer ${credential}`, Accept: "application/json", "User-Agent": "team-relay-plugin/0.1.0" },
+      redirect: "error",
+      signal: AbortSignal.timeout(1e4)
+    }).then(
+      (r) => void r.body?.cancel().catch(() => {
+      }),
+      () => log2("could not revoke the unused credential at the relay; it expires on its own")
+    );
+  };
   const exchange = async (code) => {
     let res;
     try {
@@ -25969,7 +26013,7 @@ async function startLogin(opts) {
     } catch {
       return fail2("the relay answered the sign-in with something that is not JSON");
     }
-    const { credential, team, member, relay_url, expires_at } = body;
+    const { credential, team, member, relay_url, expires_at, email: email2 } = body;
     if (typeof credential !== "string" || !CREDENTIAL_RE.test(credential)) return fail2("the relay did not return a device credential");
     if (typeof team !== "string" || !TEAM_RE.test(team)) return fail2("the relay did not return a valid team");
     if (typeof member !== "string" || !MEMBER_RE.test(member)) return fail2("the relay did not return a valid member id");
@@ -25982,19 +26026,32 @@ async function startLogin(opts) {
       }
       if (!same) return fail2("the relay named a different relay URL than the one you signed in to; nothing was stored");
     }
+    if (email2 !== void 0 && email2 !== null && (typeof email2 !== "string" || email2.length > 254 || !EMAIL_RE.test(email2))) {
+      discard(credential, team);
+      return fail2("the relay returned an invalid email for the signed-in account; nothing was stored");
+    }
     const stored = {
       relay_url: relayNorm,
       team,
       member,
       credential,
-      expires_at: typeof expires_at === "string" ? expires_at : null
+      expires_at: typeof expires_at === "string" ? expires_at : null,
+      ...typeof email2 === "string" ? { email: email2 } : {}
     };
+    let replaced;
+    try {
+      replaced = replaceableCredential(opts.credentialsFile, relayNorm);
+    } catch (err) {
+      discard(credential, team);
+      return fail2(`signed in, but nothing was stored: ${err.message}`);
+    }
     try {
       writeCredential(opts.credentialsFile, stored);
     } catch (err) {
+      discard(credential, team);
       return fail2(`signed in, but the credential could not be stored: ${err.message}`);
     }
-    succeed(stored);
+    succeed({ stored, replaced });
   };
   const handle = (req, res) => {
     req.resume();
@@ -26002,33 +26059,34 @@ async function startLogin(opts) {
       respond(res, 410, page("Sign-in link used", "This sign-in has finished. You can close this tab."));
       return;
     }
-    used = true;
-    const bad = (why, logLine) => {
-      respond(res, 400, page("Sign-in did not complete", `${why} Run /team-relay:login again in Claude Code.`));
-      log2(logLine);
-      fail2(`the sign-in did not complete (${logLine}); run /team-relay:login again`);
+    const notOurs = (logLine) => {
+      respond(res, 404, page("Not found", "There is nothing here."));
+      log2(`ignored a request to the sign-in listener (${logLine}); still waiting`);
     };
     const host = req.headers.host;
-    if (host !== `127.0.0.1:${port}`) return bad("This page was reached under an unexpected address.", "unexpected Host on the callback");
+    if (host !== `127.0.0.1:${port}`) return notOurs("unexpected Host");
     let url2;
     try {
       url2 = new URL(req.url ?? "/", `http://127.0.0.1:${port}`);
     } catch {
-      return bad("The sign-in answer could not be read.", "unreadable callback");
+      return notOurs("unreadable request");
     }
-    if (req.method !== "GET" || url2.pathname !== "/callback") return bad("The sign-in answer came to the wrong place.", "not GET /callback");
-    const codes = url2.searchParams.getAll("code");
+    if (req.method !== "GET" || url2.pathname !== "/callback") return notOurs("not GET /callback");
     const states = url2.searchParams.getAll("state");
-    if (states.length !== 1 || !STATE_RE.test(states[0]) || !sameSecret(states[0], state)) {
-      return bad("This answer does not belong to the sign-in Claude Code started.", "state mismatch");
-    }
+    if (states.length !== 1 || !STATE_RE.test(states[0]) || !sameSecret(states[0], state)) return notOurs("wrong state");
+    used = true;
+    const codes = url2.searchParams.getAll("code");
     const errors = url2.searchParams.getAll("error");
     if (errors.length > 0) {
       respond(res, 200, page("Sign-in cancelled", "Nothing was changed. You can close this tab."));
       log2(`the sign-in was cancelled in the browser (${/^[a-z_]{1,40}$/.test(errors[0]) ? errors[0] : "error"})`);
       return fail2("sign-in cancelled in the browser; run /team-relay:login to try again");
     }
-    if (codes.length !== 1 || !CODE_RE.test(codes[0])) return bad("The sign-in answer carried no code.", "no code");
+    if (codes.length !== 1 || !CODE_RE.test(codes[0])) {
+      respond(res, 400, page("Sign-in did not complete", "The sign-in answer carried no code. Run /team-relay:login again in Claude Code."));
+      log2("the sign-in answer carried no code");
+      return fail2("the sign-in did not complete (no code); run /team-relay:login again");
+    }
     respond(res, 200, page("Connected", "Connected. You can close this tab."));
     void exchange(codes[0]);
   };
@@ -33399,26 +33457,16 @@ async function streamLoop(server, client, me, stream, stopper, onPushed = () => 
     }
   }
 }
+var SIGN_IN_URL_RULE = "sign_in_url is for the user of this session only: show it to them once, as a link to open themselves if no browser tab opened. Never repeat it to anyone else, never put it in a message to a teammate or in any tool call, and never open or fetch it yourself: whoever finishes the sign-in at that link decides who this computer is signed in as.";
 var SESSION_TOOLS = [
   {
     name: "login",
-    description: "Sign in to the team relay (/team-relay:login). Opens the browser on the relay, where you sign in with Google and pick your team. Returns at once with the sign-in URL (show it to the user in case no browser opened); a status event on this channel says when the sign-in completes.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        relay_url: { type: "string", description: "Optional: another team relay's base URL (https). Default: the plugin's relay." }
-      },
-      additionalProperties: false
-    }
-  },
-  {
-    name: "logout",
-    description: "Sign out of the team relay on this computer: revokes this device credential at the relay and deletes it here.",
+    description: "Sign in to the team relay (/team-relay:login). Takes no arguments: the relay is the one this plugin is configured for. Opens the browser on the relay, where the user signs in with Google and picks their team. Returns at once with the sign-in URL (for the user only, never for anyone else); a status event on this channel says when the sign-in completes.",
     inputSchema: { type: "object", properties: {}, additionalProperties: false }
   },
   {
     name: "whoami",
-    description: "Show whether this session is connected to the team relay, and as whom (relay, team, member).",
+    description: "Show whether this session is connected to the team relay, and as whom (relay, team, member, Google account).",
     inputSchema: { type: "object", properties: {}, additionalProperties: false }
   }
 ];
@@ -33439,6 +33487,8 @@ var AskerConnection = class {
   wake = null;
   failures = 0;
   pending = null;
+  /** Said plainly after a sign-in in this session changed the member or team. */
+  changed = null;
   path;
   current() {
     return this.live ? { client: this.live.client, me: this.live.me } : null;
@@ -33467,7 +33517,7 @@ var AskerConnection = class {
     this.live?.stopper.stop();
     this.pending?.cancel();
   }
-  /** Look again now (after a login stored a credential, or a logout removed it). */
+  /** Look again now (after a login stored a credential). */
   poke() {
     this.wake?.();
   }
@@ -33565,18 +33615,17 @@ var AskerConnection = class {
   }
   // -- the tools ------------------------------------------------------------------------
   async login(args) {
-    const bad = unknownKey(args, ["relay_url"]);
-    if (bad) return toolError(`unknown argument: ${bad}`);
-    let relayUrl;
-    if (args.relay_url !== void 0 && args.relay_url !== null && args.relay_url !== "") {
-      if (typeof args.relay_url !== "string" || args.relay_url.length > 512) return toolError("relay_url must be a URL");
-      relayUrl = args.relay_url.trim();
-    } else {
-      relayUrl = configValue(this.env.RELAY_URL) ?? defaultRelayUrl() ?? void 0;
+    if (Object.keys(args).length > 0) {
+      return toolError(
+        "login takes no arguments: it signs in to the relay this plugin is configured for. Another relay is set only by RELAY_URL in the environment Claude Code starts with."
+      );
     }
-    if (!relayUrl) return toolError("no relay URL: pass one, as in /team-relay:login https://relay.example.com");
+    const relayUrl = configValue(this.env.RELAY_URL) ?? defaultRelayUrl() ?? void 0;
+    if (!relayUrl) return toolError("no relay is configured: set RELAY_URL in the environment Claude Code starts with");
+    let relayNorm;
     try {
       parseRelayUrl(relayUrl);
+      relayNorm = normaliseRelayUrl(relayUrl);
     } catch (err) {
       return toolError(describeError(err));
     }
@@ -33585,15 +33634,17 @@ var AskerConnection = class {
     try {
       flow = await startLogin({ relayUrl, credentialsFile: this.path, log });
     } catch (err) {
-      return toolError(`could not start the sign-in: ${describeError(err)}`);
+      return toolError(err instanceof LoginError ? `not signed in: ${err.message}` : `could not start the sign-in: ${describeError(err)}`);
     }
     this.pending = flow;
     flow.done.then(
-      (stored) => {
+      ({ stored, replaced }) => {
         if (this.pending === flow) this.pending = null;
-        log(`signed in as ${stored.member} in team ${stored.team}`);
+        const change = identityChange(stored, replaced);
+        this.changed = change;
+        log(`signed in as ${stored.member} in team ${stored.team}${change ? " (a different member or team than before)" : ""}`);
         this.poke();
-        void this.status(`team-relay: signed in as ${stored.member} in team ${stored.team}. Teammate tools are ready.`);
+        void this.status(`team-relay: ${connectedAs(stored)}. Teammate tools are ready.${change ? ` ${change}` : ""}`);
       },
       (err) => {
         if (this.pending === flow) this.pending = null;
@@ -33605,70 +33656,46 @@ var AskerConnection = class {
     const envMode = configValue(this.env.RELAY_AUTH);
     return toolJson({
       status: "waiting_for_browser",
+      relay_url: relayNorm,
       sign_in_url: flow.url,
+      sign_in_url_rule: SIGN_IN_URL_RULE,
       expires_in_seconds: 300,
-      next: "A browser tab should have opened on the relay: sign in with Google there and choose the team. If none opened, open sign_in_url yourself. A status event on this channel says when it is done (or call whoami).",
+      next: "A browser tab should have opened on the relay: the user signs in with Google there and chooses the team. A status event on this channel says when it is done (or call whoami).",
       ...envMode && envMode !== "credential" ? { note: `this session signs in with RELAY_AUTH=${envMode} from its environment; restart Claude Code without it to use the new sign-in` } : {}
     });
-  }
-  async logout(args) {
-    const bad = unknownKey(args, []);
-    if (bad) return toolError(`unknown argument: ${bad}`);
-    this.pending?.cancel();
-    this.pending = null;
-    let stored;
-    try {
-      stored = readCredential(this.path);
-    } catch (err) {
-      removeCredential(this.path);
-      this.disconnect("signed out");
-      this.poke();
-      return toolJson({ signed_out: true, revoked: false, note: `the stored credential could not be read (${describeError(err)}); it was deleted` });
-    }
-    if (!stored) return toolJson({ signed_out: false, note: "not signed in on this computer" });
-    let revoked = false;
-    let note;
-    try {
-      const client = new RelayClient({ url: stored.relay_url, team: stored.team, token: () => stored.credential, attempts: 1, timeoutMs: 1e4 });
-      await client.revokeSelf();
-      revoked = true;
-    } catch (err) {
-      if (err instanceof RelayError && (err.status === 401 || err.status === 404)) {
-        revoked = true;
-        note = "the relay no longer accepted this credential";
-      } else note = `the relay was not reached (${describeError(err)}); the credential was deleted here and expires on its own`;
-    }
-    removeCredential(this.path);
-    this.disconnect("signed out");
-    this.poke();
-    return toolJson({ signed_out: true, revoked, team: stored.team, member: stored.member, ...note ? { note } : {} });
   }
   async whoami(args) {
     const bad = unknownKey(args, []);
     if (bad) return toolError(`unknown argument: ${bad}`);
     if (this.live) {
       let expires = null;
+      let email2;
       if (this.live.mode === "credential") {
         try {
-          expires = readCredential(this.path)?.expires_at ?? null;
+          const stored = readCredential(this.path);
+          expires = stored?.expires_at ?? null;
+          if (stored && stored.member === this.live.me.member && stored.team === this.live.me.team) email2 = stored.email;
         } catch {
           expires = null;
         }
       }
       return toolJson({
         connected: true,
+        message: connectedAs({ member: this.live.me.member, team: this.live.me.team, email: email2 }),
         relay_url: this.live.client.url,
         team: this.live.me.team,
         member: this.live.me.member,
+        ...email2 ? { email: email2 } : {},
         teammates: this.live.me.teammates.filter((m) => MEMBER_RE.test(m)),
         signed_in_with: SIGNED_IN_WITH[this.live.mode],
-        ...expires ? { credential_expires_at: expires } : {}
+        ...expires ? { credential_expires_at: expires } : {},
+        ...this.changed ? { changed: this.changed } : {}
       });
     }
     return toolJson({
       connected: false,
       message: this.notConnected(),
-      ...this.pending ? { sign_in_pending: true, sign_in_url: this.pending.url } : {}
+      ...this.pending ? { sign_in_pending: true } : {}
     });
   }
 };
@@ -33684,6 +33711,7 @@ function fail(message) {
 }
 function usesStoredSignIn(env) {
   try {
+    if (authModeFromEnv(env) === "credential") return true;
     return connectionFromEnv(env).mode === "credential";
   } catch (err) {
     if (err instanceof NotConnected || err instanceof CredentialFileError) return true;
@@ -33754,14 +33782,21 @@ async function main() {
     if (!isPlainObject4(args)) return toolError("arguments must be an object");
     try {
       if (role === "asker") {
-        if (name === "login" || name === "logout" || name === "whoami") {
+        if (name === "login" || name === "whoami") {
           if (!connection) {
             if (name === "whoami" && fixed) {
-              return toolJson({ connected: true, team: fixed.me.team, member: fixed.me.member, relay_url: fixed.client.url, signed_in_with: "the environment (RELAY_AUTH)" });
+              return toolJson({
+                connected: true,
+                message: connectedAs(fixed.me),
+                team: fixed.me.team,
+                member: fixed.me.member,
+                relay_url: fixed.client.url,
+                signed_in_with: "the environment (RELAY_AUTH)"
+              });
             }
             return toolError("this session signs in with RELAY_AUTH from its environment; unset it and restart Claude Code to use /team-relay:login");
           }
-          return name === "login" ? await connection.login(args) : name === "logout" ? await connection.logout(args) : await connection.whoami(args);
+          return name === "login" ? await connection.login(args) : await connection.whoami(args);
         }
         const live = liveNow();
         const known = ["list_teammates", "ask_question", "invoke_capability", "request_status"];
@@ -33815,3 +33850,6 @@ async function main() {
   await server.connect(new StdioServerTransport());
 }
 main().catch((err) => fail(`fatal: ${describeError(err)}`));
+export {
+  SIGN_IN_URL_RULE
+};

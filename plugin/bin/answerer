@@ -127,7 +127,7 @@ if [[ "$relay_auth" == "credential" ]]; then
   stored_url="$(read_info relay_url)"
   stored_team="$(read_info team)"
   if [[ -n "${RELAY_URL:-}" && "${RELAY_URL%/}" != "$stored_url" ]]; then
-    die "RELAY_URL is not the relay you signed in to ($stored_url): unset it, or run /team-relay:login <relay-url>"
+    die "RELAY_URL is not the relay you signed in to ($stored_url): unset it, or run /team-relay:logout and then /team-relay:login to sign in to it"
   fi
   if [[ -n "${RELAY_TEAM:-}" && "$RELAY_TEAM" != "$stored_team" ]]; then
     die "RELAY_TEAM is not the team you signed in to ($stored_team): unset it, or run /team-relay:login again"

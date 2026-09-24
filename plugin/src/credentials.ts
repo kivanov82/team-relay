@@ -3,7 +3,10 @@
 // answering session and the local console) reads by default.
 //
 //   $XDG_CONFIG_HOME/team-relay/credentials.json   (XDG_CONFIG_HOME absolute, else ~/.config)
-//   {relay_url, team, member, credential, expires_at}
+//   {relay_url, team, member, credential, expires_at, email?}
+//
+// `email` is the Google account the relay says signed in (M5-SPEC §9 item 3); older files
+// and relays without it simply lack it.
 //
 // The directory is mode 700 and the file mode 600, both owned by the current user; a file
 // or directory with wider permissions, owned by someone else, or reached through a symlink
@@ -32,6 +35,8 @@ import { basename, dirname, isAbsolute, join } from 'node:path';
 import { MEMBER_RE, TEAM_RE, parseRelayUrl } from './relay-client-core.js';
 
 export const CREDENTIAL_RE = /^trc_[A-Za-z0-9_-]{43}$/;
+/** A plain email address: what the relay reports as the signed-in Google account. */
+export const EMAIL_RE = /^[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9-]{1,63}(\.[A-Za-z0-9-]{1,63})+$/;
 export const CREDENTIALS_DIR = 'team-relay';
 export const CREDENTIALS_FILE = 'credentials.json';
 const MAX_FILE_BYTES = 16 * 1024;
@@ -42,6 +47,8 @@ export type StoredCredential = {
   member: string;
   credential: string;
   expires_at: string | null;
+  /** The Google account the relay said signed in (absent when the relay did not say). */
+  email?: string;
 };
 
 /** Something is wrong with the credential file: it is not used. The message names no secret. */
@@ -100,7 +107,7 @@ export function normaliseRelayUrl(raw: string): string {
 export function parseStoredCredential(raw: unknown): StoredCredential {
   if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) throw new CredentialFileError('the credential file is not a JSON object');
   const c = raw as Record<string, unknown>;
-  const { relay_url, team, member, credential, expires_at } = c;
+  const { relay_url, team, member, credential, expires_at, email } = c;
   if (typeof relay_url !== 'string') throw new CredentialFileError('the credential file has no relay_url');
   let url: string;
   try {
@@ -114,7 +121,17 @@ export function parseStoredCredential(raw: unknown): StoredCredential {
   if (expires_at !== undefined && expires_at !== null && (typeof expires_at !== 'string' || !RFC3339.test(expires_at))) {
     throw new CredentialFileError('the credential file has an invalid expires_at');
   }
-  return { relay_url: url, team, member, credential, expires_at: typeof expires_at === 'string' ? expires_at : null };
+  if (email !== undefined && email !== null && (typeof email !== 'string' || email.length > 254 || !EMAIL_RE.test(email))) {
+    throw new CredentialFileError('the credential file has an invalid email');
+  }
+  return {
+    relay_url: url,
+    team,
+    member,
+    credential,
+    expires_at: typeof expires_at === 'string' ? expires_at : null,
+    ...(typeof email === 'string' ? { email } : {}),
+  };
 }
 
 /**

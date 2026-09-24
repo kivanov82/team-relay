@@ -283,13 +283,12 @@ describe('channel server: asker tools', () => {
   it('lists exactly the asker tools', async () => {
     const s = await channel('alice', 'asker');
     const { tools } = await s.client.listTools();
-    // M5-SPEC §6: login, logout and whoami join the asker's tools.
+    // M5-SPEC §6: login and whoami join the asker's tools; §9 item 2: logout is not a tool.
     expect(tools.map((t) => t.name).sort()).toEqual([
       'ask_question',
       'invoke_capability',
       'list_teammates',
       'login',
-      'logout',
       'request_status',
       'whoami',
     ]);

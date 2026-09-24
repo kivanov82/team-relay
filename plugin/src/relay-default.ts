@@ -1,6 +1,6 @@
 // The relay the plugin talks to when nothing else is said (M5-SPEC §6): read at run time
 // from plugin/relay.default.json, the one place the default lives, so no bundle carries a
-// copy. `/team-relay:login <relay-url>` (and RELAY_URL) override it.
+// copy. RELAY_URL in the environment overrides it (never the login tool's caller: M5-SPEC §9).
 
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';

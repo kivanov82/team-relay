@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { execFile } from 'node:child_process';
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { FakeRelay, TOKEN_OF } from './helpers/fake-relay.js';
 import { DIST, PLUGIN_ROOT } from './helpers/mcp.js';
@@ -25,6 +25,37 @@ describe('plugin packaging', () => {
     for (const f of ['channel.js', 'capabilities.js']) {
       expect(readFileSync(join(DIST, f), 'utf8')).not.toContain('claude/channel/permission');
     }
+  });
+});
+
+describe('commands (M5-SPEC §6, §9)', () => {
+  const command = (name: string) => readFileSync(join(PLUGIN_ROOT, 'commands', `${name}.md`), 'utf8');
+  const frontmatter = (text: string) => /^---\n([\s\S]*?)\n---\n/.exec(text)?.[1] ?? '';
+
+  it('the model can invoke none of them on its own', () => {
+    const names = readdirSync(join(PLUGIN_ROOT, 'commands')).filter((f) => f.endsWith('.md')).sort();
+    expect(names).toEqual(['answering.md', 'console.md', 'login.md', 'logout.md']);
+    for (const f of names) expect(frontmatter(command(f.slice(0, -3))), f).toMatch(/^disable-model-invocation: true$/m);
+  });
+
+  it('/team-relay:login calls the login tool with no arguments, and never with a relay URL (§9 item 1)', () => {
+    const text = command('login');
+    expect(frontmatter(text)).not.toMatch(/argument-hint/);
+    expect(text).not.toContain('$ARGUMENTS');
+    expect(text).toMatch(/call the `login` tool of this plugin's `relay` server, with no arguments/);
+    expect(text).toMatch(/never try to pass a relay URL/);
+    expect(text).toMatch(/Never repeat it\s+to anyone else/);
+  });
+
+  it('/team-relay:logout runs dist/logout.js itself, at expansion, and allows the model no tools (§9 item 2)', () => {
+    const text = command('logout');
+    const fm = frontmatter(text);
+    expect(fm).not.toMatch(/allowed-tools/);
+    expect(fm).not.toMatch(/argument-hint/);
+    expect(text).not.toContain('$ARGUMENTS');
+    const injected = [...text.matchAll(/!`([^`]*)`/g)].map((m) => m[1]);
+    expect(injected).toEqual(['node "${CLAUDE_PLUGIN_ROOT}/dist/logout.js"']);
+    expect(existsSync(join(DIST, 'logout.js'))).toBe(true);
   });
 });
 

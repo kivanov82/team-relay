@@ -16,7 +16,8 @@
 # provider on the same 127.0.0.1 port; static tokens still work), the team file names alice
 # as the seed owner and gives each member a synthetic Google email, and test/e2e/m5.test.ts
 # runs when the relay answers GET /v1/login/start with 400: the whole sign-in through the real
-# login tool with a stub browser, streams with the stored credential, logout, an owner adding
+# login tool (no arguments; RELAY_URL names the relay) with a stub browser, streams with the
+# stored credential, /team-relay:logout (dist/logout.js), an owner adding
 # a member through the console server, the new member signing in and appearing in the
 # directory, and removal refusing them within 30 s.
 # Extra arguments are passed to vitest. The tokens are never printed.

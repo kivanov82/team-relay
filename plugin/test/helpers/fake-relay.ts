@@ -83,6 +83,12 @@ export class FakeRelay {
   loginCancel = false;
   /** When set, /v1/login/token names this relay_url instead of this relay's own. */
   loginRelayUrl: string | null = null;
+  /**
+   * The Google account /v1/login/token reports (M5-SPEC §9 item 3): by default the member's
+   * first roster email; null leaves the field out (a relay from before it); a string is sent
+   * as it is.
+   */
+  loginEmail: string | null | undefined = undefined;
   readonly logins = new Map<string, { challenge: string; state: string; port: number; device: string; member: string; used: boolean }>();
   /** Device credentials: token → member (revoked ones are removed). */
   readonly credentials = new Map<string, string>();
@@ -437,12 +443,14 @@ export class FakeRelay {
     if (s256 !== login.challenge) return this.send(res, 400, { error: 'invalid_grant' });
     login.used = true;
     const credential = this.mintCredential(login.member);
+    const email = this.loginEmail === undefined ? (this.roster.find((r) => r.member === login.member)?.emails[0] ?? null) : this.loginEmail;
     return this.send(res, 200, {
       credential,
       team: TEAM,
       member: login.member,
       relay_url: this.loginRelayUrl ?? this.url,
       expires_at: iso(90 * 86_400_000),
+      ...(email !== null ? { email } : {}),
     });
   }
 }

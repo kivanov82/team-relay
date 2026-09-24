@@ -9,7 +9,8 @@
 //
 // FAKE_BROWSER_LOG (optional): a file to append one JSON line to: {argv, url, steps, done}.
 // FAKE_BROWSER_MODE (optional): "ignore" does nothing (a browser that never opened);
-// "wrong-state" goes to the callback with another state; "twice" repeats the callback.
+// "wrong-state" goes to the callback with another state (the listener answers 404 and keeps
+// waiting); "twice" repeats the callback.
 // FAKE_BROWSER_TEAM (optional): the team to choose on the chooser page.
 // FAKE_BROWSER_EMAIL (optional): the Google account to sign in as at a fake provider's
 // consent page (any URL whose path ends in /authorize gets &email=<it>, which the relay's

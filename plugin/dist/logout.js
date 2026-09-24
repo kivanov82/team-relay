@@ -1,16 +1,5 @@
 import { createRequire as __teamRelayCreateRequire } from 'node:module'; const require = __teamRelayCreateRequire(import.meta.url);
 
-// src/tool-event.ts
-import { readFileSync as readFileSync4 } from "node:fs";
-
-// src/active.ts
-import { mkdirSync as mkdirSync2, readFileSync as readFileSync3, renameSync as renameSync2, rmSync as rmSync2, writeFileSync } from "node:fs";
-import { isAbsolute as isAbsolute2, join as join2 } from "node:path";
-
-// src/relay-client.ts
-import { execFile } from "node:child_process";
-import { readFileSync as readFileSync2 } from "node:fs";
-
 // src/credentials.ts
 import {
   chmodSync,
@@ -25,6 +14,7 @@ import {
   unlinkSync,
   writeSync
 } from "node:fs";
+import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join } from "node:path";
 
 // src/relay-client-core.ts
@@ -49,6 +39,8 @@ function parseRelayUrl(raw) {
 // src/credentials.ts
 var CREDENTIAL_RE = /^trc_[A-Za-z0-9_-]{43}$/;
 var EMAIL_RE = /^[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9-]{1,63}(\.[A-Za-z0-9-]{1,63})+$/;
+var CREDENTIALS_DIR = "team-relay";
+var CREDENTIALS_FILE = "credentials.json";
 var MAX_FILE_BYTES = 16 * 1024;
 var CredentialFileError = class extends Error {
   constructor(message) {
@@ -56,6 +48,16 @@ var CredentialFileError = class extends Error {
     this.name = "CredentialFileError";
   }
 };
+function credentialsPath(env = process.env) {
+  const explicit = env.RELAY_CREDENTIALS_FILE?.trim();
+  if (explicit) {
+    if (!isAbsolute(explicit)) throw new CredentialFileError("RELAY_CREDENTIALS_FILE must be an absolute path");
+    return explicit;
+  }
+  const xdg = env.XDG_CONFIG_HOME?.trim();
+  const base = xdg && isAbsolute(xdg) ? xdg : join(env.HOME?.trim() || homedir(), ".config");
+  return join(base, CREDENTIALS_DIR, CREDENTIALS_FILE);
+}
 function uid() {
   return typeof process.getuid === "function" ? process.getuid() : null;
 }
@@ -131,6 +133,15 @@ function readCredential(path) {
   }
   return parseStoredCredential(json);
 }
+function removeCredential(path) {
+  try {
+    unlinkSync(path);
+    return true;
+  } catch (err) {
+    if (err.code === "ENOENT") return false;
+    throw new CredentialFileError(`cannot remove the credential file (${err.code ?? "error"})`);
+  }
+}
 
 // src/relay-client.ts
 var REQUEST_ID_RE = /^rq_[0-9a-f]{32}$/;
@@ -162,120 +173,10 @@ function backoffDelay(attempt, b = DEFAULT_BACKOFF, random = Math.random) {
   const exp = Math.min(b.maxMs, b.baseMs * 2 ** Math.min(attempt, 30));
   return Math.round(exp / 2 + random() * (exp / 2));
 }
-function configValue(v) {
-  if (v === void 0) return void 0;
-  const t = v.trim();
-  if (!t || /^\$\{user_config\.[A-Za-z0-9_]+\}$/.test(t)) return void 0;
-  return t;
-}
-function tokenProviderFromEnv(env) {
-  const file = configValue(env.RELAY_TOKEN_FILE);
-  if (file) {
-    return () => {
-      let raw;
-      try {
-        raw = readFileSync2(file, "utf8");
-      } catch (err) {
-        throw new Error(`cannot read RELAY_TOKEN_FILE (${err.code ?? "error"})`);
-      }
-      const token2 = raw.replace(/[\r\n]+$/, "");
-      if (!token2) throw new Error("RELAY_TOKEN_FILE is empty");
-      return token2;
-    };
-  }
-  const token = configValue(env.RELAY_TOKEN);
-  if (!token) throw new Error('RELAY_AUTH is "token", so RELAY_TOKEN or RELAY_TOKEN_FILE must be set');
-  return () => token;
-}
 var TOKEN_REFRESH_MARGIN_MS = 5 * 6e4;
-var JWT_RE = /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/;
-var ACCOUNT_RE = /^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+$/;
 var GCLOUD_OUTPUT_LIMIT = 64 * 1024;
-function checkGcloudAccount(account) {
-  if (account.length > 254 || !ACCOUNT_RE.test(account)) {
-    throw new Error("RELAY_GCLOUD_ACCOUNT must be an account email address");
-  }
-  return account;
-}
-function jwtExpiryMs(token) {
-  const payload = token.split(".")[1];
-  if (!payload) return null;
-  try {
-    const claims = JSON.parse(Buffer.from(payload, "base64url").toString("utf8"));
-    return typeof claims.exp === "number" && Number.isFinite(claims.exp) ? claims.exp * 1e3 : null;
-  } catch {
-    return null;
-  }
-}
-function scrub(text) {
-  return text.replace(/[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/g, "[redacted]").replace(/ya29\.[A-Za-z0-9_.-]+/g, "[redacted]").replace(/[\x00-\x1f\x7f]+/g, " ").trim().slice(0, 200);
-}
-function gcloudTokenProvider(opts = {}) {
-  const now = opts.now ?? Date.now;
-  const env = opts.env ?? process.env;
-  const timeoutMs = opts.timeoutMs ?? 3e4;
-  const args = ["auth", "print-identity-token"];
-  if (opts.account !== void 0) args.push(`--account=${checkGcloudAccount(opts.account)}`);
-  let cached = null;
-  let inflight = null;
-  const mint = () => new Promise((resolve, reject) => {
-    execFile(
-      "gcloud",
-      args,
-      { env, timeout: timeoutMs, maxBuffer: GCLOUD_OUTPUT_LIMIT, shell: false, windowsHide: true, encoding: "utf8" },
-      (err, stdout, stderr) => {
-        if (err) {
-          const e = err;
-          if (e.code === "ENOENT") return reject(new Error("gcloud was not found on PATH (RELAY_AUTH=google needs the Google Cloud CLI)"));
-          if (e.killed) return reject(new Error("gcloud auth print-identity-token timed out"));
-          const why = scrub(String(stderr ?? "").split("\n").find((l) => l.trim()) ?? "");
-          return reject(new Error(`gcloud auth print-identity-token failed${why ? `: ${why}` : ""}`));
-        }
-        const token = String(stdout).trim();
-        if (!JWT_RE.test(token)) return reject(new Error("gcloud auth print-identity-token did not print an ID token"));
-        resolve(token);
-      }
-    );
-  });
-  const provider = Object.assign(async () => {
-    if (cached && now() < cached.until) return cached.token;
-    inflight ??= mint().then((token) => {
-      const exp = jwtExpiryMs(token);
-      cached = exp !== null && exp - TOKEN_REFRESH_MARGIN_MS > now() ? { token, until: exp - TOKEN_REFRESH_MARGIN_MS } : null;
-      return token;
-    }).finally(() => {
-      inflight = null;
-    });
-    return inflight;
-  }, {
-    invalidate: () => {
-      cached = null;
-    }
-  });
-  return provider;
-}
 var METADATA_OUTPUT_LIMIT = 16 * 1024;
-var NotConnected = class extends Error {
-  constructor(message = "Not connected: run /team-relay:login") {
-    super(message);
-    this.name = "NotConnected";
-  }
-};
 var SIGN_IN_AGAIN = "the relay refused your sign-in (signed out, expired, or no longer on the team): run /team-relay:login again";
-function credentialTokenProvider(path, bound) {
-  const relay = normaliseRelayUrl(bound.relay_url);
-  return Object.assign(
-    () => {
-      const stored = readCredential(path);
-      if (!stored) throw new NotConnected();
-      if (stored.relay_url !== relay || stored.team !== bound.team) {
-        throw new NotConnected("you signed in to another relay or team since this started: restart it");
-      }
-      return stored.credential;
-    },
-    { kind: "credential", path }
-  );
-}
 function isCredentialProvider(p) {
   return p.kind === "credential";
 }
@@ -490,110 +391,6 @@ var RelayClient = class {
   }
 };
 
-// src/active.ts
-var ACTIVE_FILE = "active.json";
-var READ_LIMIT = 64 * 1024;
-var RFC33392 = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,9})?(Z|[+-]\d{2}:\d{2})$/;
-function deadlineOf(value) {
-  if (typeof value !== "string" || value.length > 40 || !RFC33392.test(value)) return null;
-  return Number.isFinite(Date.parse(value)) ? value : null;
-}
-function readActive(stateDir, now = Date.now()) {
-  let raw;
-  try {
-    raw = readFileSync3(join2(stateDir, ACTIVE_FILE), "utf8");
-  } catch {
-    return [];
-  }
-  if (raw.length > READ_LIMIT) return [];
-  let parsed;
-  try {
-    parsed = JSON.parse(raw);
-  } catch {
-    return [];
-  }
-  const open = parsed?.open;
-  if (!Array.isArray(open)) return [];
-  return open.filter(
-    (e) => typeof e === "object" && e !== null && typeof e.request_id === "string" && REQUEST_ID_RE.test(e.request_id) && typeof e.acked_at === "string" && deadlineOf(e.answer_deadline) !== null && Date.parse(e.answer_deadline) > now
-  );
-}
-function mostRecentOpen(stateDir, now = Date.now()) {
-  return readActive(stateDir, now).at(-1)?.request_id ?? null;
-}
-
-// src/log.ts
-function makeLogger(component) {
-  return (...parts) => {
-    const text = parts.map((p) => p instanceof Error ? p.message : typeof p === "string" ? p : JSON.stringify(p)).join(" ");
-    process.stderr.write(`[team-relay ${component}] ${text}
-`);
-  };
-}
-
-// src/tool-event-core.ts
-var TOOL_NAME_RE = /^[A-Za-z0-9_.:-]{1,64}$/;
-var MAX_DURATION_MS = 36e5;
-var RELAY_OWN_TOOLS = /* @__PURE__ */ new Set(["ack_question", "reply"]);
-function splitToolName(name) {
-  const m = /^mcp__(.+?)__(.+)$/.exec(name);
-  return m ? { server: m[1], tool: m[2] } : { server: null, tool: name };
-}
-function isRelayServer(server) {
-  return server === null || server === "relay" || server.endsWith("_relay");
-}
-function toolEventFromPayload(payload) {
-  if (typeof payload !== "object" || payload === null || Array.isArray(payload)) return null;
-  const p = payload;
-  let status;
-  if (p.hook_event_name === "PostToolUse") status = "ok";
-  else if (p.hook_event_name === "PostToolUseFailure") status = "error";
-  else if (p.hook_event_name === "PermissionRequest") status = "waiting";
-  else return null;
-  if (typeof p.tool_name !== "string") return null;
-  const { server, tool } = splitToolName(p.tool_name);
-  if (RELAY_OWN_TOOLS.has(tool) && isRelayServer(server)) return null;
-  if (!TOOL_NAME_RE.test(tool)) return null;
-  let duration = null;
-  if (status !== "waiting" && typeof p.duration_ms === "number" && Number.isFinite(p.duration_ms) && p.duration_ms >= 0) {
-    const ms = Math.round(p.duration_ms);
-    duration = ms <= MAX_DURATION_MS ? ms : null;
-  }
-  return { tool, status, duration_ms: duration };
-}
-function parseToolEventConfig(raw) {
-  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) throw new Error("config is not an object");
-  const c = raw;
-  const str = (k) => {
-    const v = c[k];
-    if (v === void 0 || v === null || v === "") return void 0;
-    if (typeof v !== "string") throw new Error(`config ${k} is not a string`);
-    return v;
-  };
-  const relay_url = str("relay_url");
-  const relay_team = str("relay_team");
-  const state_dir = str("state_dir");
-  const relay_auth = str("relay_auth") ?? "google";
-  if (!relay_url || !relay_team || !state_dir) throw new Error("config needs relay_url, relay_team and state_dir");
-  if (relay_auth !== "credential" && relay_auth !== "google" && relay_auth !== "token") {
-    throw new Error("config relay_auth must be credential, google or token");
-  }
-  const gcloud_account = str("gcloud_account");
-  const token_file = str("token_file");
-  const credentials_file = str("credentials_file");
-  if (relay_auth === "token" && !token_file) throw new Error("config needs token_file when relay_auth is token");
-  if (relay_auth === "credential" && !credentials_file) throw new Error("config needs credentials_file when relay_auth is credential");
-  return {
-    relay_url,
-    relay_team,
-    relay_auth,
-    state_dir,
-    ...gcloud_account !== void 0 ? { gcloud_account } : {},
-    ...token_file !== void 0 ? { token_file } : {},
-    ...credentials_file !== void 0 ? { credentials_file } : {}
-  };
-}
-
 // src/tool-util.ts
 function describeError(err) {
   if (err instanceof RelayError) {
@@ -604,62 +401,69 @@ function describeError(err) {
   return "unexpected error";
 }
 
-// src/tool-event.ts
-var CAP_MS = 3e3;
-var STDIN_LIMIT = 16 * 1024 * 1024;
-var started = Date.now();
-var log = makeLogger("tool-event");
-setTimeout(() => process.exit(0), CAP_MS);
-var remaining = () => Math.max(50, CAP_MS - 250 - (Date.now() - started));
-function readStdin() {
-  return new Promise((resolve) => {
-    const chunks = [];
-    let size = 0;
-    process.stdin.on("data", (c) => {
-      size += c.length;
-      if (size > STDIN_LIMIT) {
-        process.stdin.destroy();
-        resolve(null);
-        return;
-      }
-      chunks.push(c);
-    });
-    process.stdin.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
-    process.stdin.on("error", () => resolve(null));
-  });
-}
-function configPath(argv) {
-  if (argv.length !== 2 || argv[0] !== "--config" || !argv[1]) throw new Error("usage: tool-event.js --config <file>");
-  return argv[1];
-}
-async function run() {
-  const path = configPath(process.argv.slice(2));
-  const raw = await readStdin();
-  if (raw === null) return;
-  let payload;
+// src/logout.ts
+async function logout(env = process.env, opts = {}) {
+  let path;
   try {
-    payload = JSON.parse(raw);
-  } catch {
-    return;
+    path = credentialsPath(env);
+  } catch (err) {
+    return { exitCode: 1, line: `team-relay: cannot sign out: ${describeError(err)}` };
   }
-  const event = toolEventFromPayload(payload);
-  if (!event) return;
-  const config = parseToolEventConfig(JSON.parse(readFileSync4(path, "utf8")));
-  const requestId = mostRecentOpen(config.state_dir);
-  if (!requestId) return;
-  let token;
-  if (config.relay_auth === "token") {
-    token = tokenProviderFromEnv({ RELAY_TOKEN_FILE: config.token_file });
-  } else if (config.relay_auth === "credential") {
-    token = credentialTokenProvider(config.credentials_file, { relay_url: config.relay_url, team: config.relay_team });
-  } else {
-    token = gcloudTokenProvider({
-      env: process.env,
-      timeoutMs: remaining(),
-      ...config.gcloud_account !== void 0 ? { account: config.gcloud_account } : {}
-    });
+  const remove = () => {
+    try {
+      removeCredential(path);
+      return null;
+    } catch (err) {
+      return describeError(err);
+    }
+  };
+  let stored;
+  try {
+    stored = readCredential(path);
+  } catch (err) {
+    const why = err instanceof CredentialFileError ? err.message : describeError(err);
+    const failed2 = remove();
+    if (failed2) return { exitCode: 1, line: `team-relay: the stored sign-in cannot be used (${why}), and it could not be deleted: ${failed2}` };
+    return {
+      exitCode: 0,
+      line: `team-relay: signed out on this computer. The stored sign-in could not be used (${why}), so it was deleted here without asking the relay; it expires on its own.`
+    };
   }
-  const client = new RelayClient({ url: config.relay_url, team: config.relay_team, token, attempts: 1, timeoutMs: remaining() });
-  await client.toolEvent(requestId, event, { timeoutMs: remaining() });
+  if (!stored) return { exitCode: 0, line: "team-relay: not signed in on this computer; nothing to do." };
+  const who = `${stored.member}${stored.email ? ` (${stored.email})` : ""}`;
+  let revoked;
+  try {
+    const credential = stored.credential;
+    const client = new RelayClient({ url: stored.relay_url, team: stored.team, token: () => credential, attempts: 1, timeoutMs: opts.timeoutMs ?? 1e4 });
+    await client.revokeSelf();
+    revoked = "The relay revoked this computer's credential";
+  } catch (err) {
+    if (err instanceof RelayError && (err.status === 401 || err.status === 404)) revoked = "The relay no longer accepted this credential";
+    else revoked = `The relay did not revoke it (${describeError(err)}), so the credential expires on its own`;
+  }
+  const failed = remove();
+  if (failed) return { exitCode: 1, line: `team-relay: ${revoked}, but the credential file could not be deleted: ${failed}` };
+  return { exitCode: 0, line: `team-relay: signed out of team ${stored.team} as ${who}. ${revoked}, and it was deleted here. Run /team-relay:login to sign in again.` };
 }
-run().catch((err) => log(`tool event not recorded: ${describeError(err)}`)).finally(() => process.exit(0));
+if (process.argv[1] && /logout\.[jt]s$/.test(process.argv[1])) {
+  if (process.argv.length > 2) {
+    process.stderr.write("usage: logout.js (no arguments)\n");
+    process.exitCode = 2;
+  } else {
+    void logout().then(
+      ({ exitCode, line }) => {
+        process.stdout.write(`${line}
+`);
+        process.exitCode = exitCode;
+      },
+      (err) => {
+        process.stdout.write(`team-relay: cannot sign out: ${describeError(err)}
+`);
+        process.exitCode = 1;
+      }
+    );
+  }
+}
+export {
+  logout
+};

@@ -16,6 +16,7 @@ import {
   RelayClient,
   RelayError,
   SIGN_IN_AGAIN,
+  authModeFromEnv,
   backoffDelay,
   configValue,
   connectionFromEnv,
@@ -29,15 +30,8 @@ import {
   type Me,
   type StreamName,
 } from './relay-client.js';
-import {
-  CredentialFileError,
-  credentialFingerprint,
-  credentialsPath,
-  readCredential,
-  removeCredential,
-  type StoredCredential,
-} from './credentials.js';
-import { SUPERSEDED, startLogin, type LoginFlow } from './login.js';
+import { CredentialFileError, credentialFingerprint, credentialsPath, normaliseRelayUrl, readCredential } from './credentials.js';
+import { LoginError, SUPERSEDED, connectedAs, identityChange, startLogin, type LoginFlow } from './login.js';
 import { defaultRelayUrl } from './relay-default.js';
 import { envelopeToNotification, neutraliseDeep, RecentIds } from './notify.js';
 import { findCapability, loadManifest, validateManifest, validateParams, codePointLength, hasLoneSurrogate } from './manifest.js';
@@ -464,29 +458,28 @@ async function streamLoop(
 }
 
 // ---------------------------------------------------------------------------------------
-// Signing in (M5-SPEC §2, §6): the asker channel's login, logout and whoami tools
+// Signing in (M5-SPEC §2, §6, §9): the asker channel's login and whoami tools. There is no
+// logout tool: /team-relay:logout runs dist/logout.js, so the model can never be steered
+// into signing the member out (§9 item 2).
+
+/** What the login tool's result says about the sign-in URL (M5-SPEC §9 item 3). */
+export const SIGN_IN_URL_RULE =
+  'sign_in_url is for the user of this session only: show it to them once, as a link to open themselves if no browser tab opened. ' +
+  'Never repeat it to anyone else, never put it in a message to a teammate or in any tool call, and never open or fetch it yourself: ' +
+  'whoever finishes the sign-in at that link decides who this computer is signed in as.';
 
 const SESSION_TOOLS = [
   {
     name: 'login',
     description:
-      'Sign in to the team relay (/team-relay:login). Opens the browser on the relay, where you sign in with Google and pick your team. Returns at once with the sign-in URL (show it to the user in case no browser opened); a status event on this channel says when the sign-in completes.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        relay_url: { type: 'string', description: "Optional: another team relay's base URL (https). Default: the plugin's relay." },
-      },
-      additionalProperties: false,
-    },
-  },
-  {
-    name: 'logout',
-    description: 'Sign out of the team relay on this computer: revokes this device credential at the relay and deletes it here.',
+      'Sign in to the team relay (/team-relay:login). Takes no arguments: the relay is the one this plugin is configured for. ' +
+      'Opens the browser on the relay, where the user signs in with Google and picks their team. Returns at once with the sign-in URL ' +
+      '(for the user only, never for anyone else); a status event on this channel says when the sign-in completes.',
     inputSchema: { type: 'object', properties: {}, additionalProperties: false },
   },
   {
     name: 'whoami',
-    description: 'Show whether this session is connected to the team relay, and as whom (relay, team, member).',
+    description: 'Show whether this session is connected to the team relay, and as whom (relay, team, member, Google account).',
     inputSchema: { type: 'object', properties: {}, additionalProperties: false },
   },
 ] as const;
@@ -500,7 +493,8 @@ type Live = { client: RelayClient; me: Me };
  * The asker's connection (M5-SPEC §6). With no stored sign-in it waits quietly, looking for
  * the credential file every 2 s, and connects as soon as one appears (a login from this
  * session or another). A credential the relay refuses is not retried: it waits until the
- * file changes (a new login). A logout stops the stream and returns to waiting.
+ * file changes (a new login). A logout (/team-relay:logout deletes the file) stops the
+ * stream and returns to waiting.
  */
 class AskerConnection {
   private live: (Live & { stopper: Stopper; fingerprint: string | null; mode: AuthMode }) | null = null;
@@ -511,6 +505,8 @@ class AskerConnection {
   private wake: (() => void) | null = null;
   private failures = 0;
   private pending: LoginFlow | null = null;
+  /** Said plainly after a sign-in in this session changed the member or team. */
+  private changed: string | null = null;
   private readonly path: string;
 
   constructor(
@@ -554,7 +550,7 @@ class AskerConnection {
     this.pending?.cancel();
   }
 
-  /** Look again now (after a login stored a credential, or a logout removed it). */
+  /** Look again now (after a login stored a credential). */
   poke() {
     this.wake?.();
   }
@@ -661,18 +657,18 @@ class AskerConnection {
   // -- the tools ------------------------------------------------------------------------
 
   async login(args: Record<string, unknown>): Promise<ToolResult> {
-    const bad = unknownKey(args, ['relay_url']);
-    if (bad) return toolError(`unknown argument: ${bad}`);
-    let relayUrl: string | undefined;
-    if (args.relay_url !== undefined && args.relay_url !== null && args.relay_url !== '') {
-      if (typeof args.relay_url !== 'string' || args.relay_url.length > 512) return toolError('relay_url must be a URL');
-      relayUrl = args.relay_url.trim();
-    } else {
-      relayUrl = configValue(this.env.RELAY_URL) ?? defaultRelayUrl() ?? undefined;
+    // M5-SPEC §9 item 1: the relay is not the model's to choose.
+    if (Object.keys(args).length > 0) {
+      return toolError(
+        'login takes no arguments: it signs in to the relay this plugin is configured for. Another relay is set only by RELAY_URL in the environment Claude Code starts with.',
+      );
     }
-    if (!relayUrl) return toolError('no relay URL: pass one, as in /team-relay:login https://relay.example.com');
+    const relayUrl = configValue(this.env.RELAY_URL) ?? defaultRelayUrl() ?? undefined;
+    if (!relayUrl) return toolError('no relay is configured: set RELAY_URL in the environment Claude Code starts with');
+    let relayNorm: string;
     try {
       parseRelayUrl(relayUrl);
+      relayNorm = normaliseRelayUrl(relayUrl);
     } catch (err) {
       return toolError(describeError(err));
     }
@@ -681,31 +677,35 @@ class AskerConnection {
     try {
       flow = await startLogin({ relayUrl, credentialsFile: this.path, log });
     } catch (err) {
-      return toolError(`could not start the sign-in: ${describeError(err)}`);
+      return toolError(err instanceof LoginError ? `not signed in: ${err.message}` : `could not start the sign-in: ${describeError(err)}`);
     }
     this.pending = flow;
     flow.done.then(
-      (stored) => {
+      ({ stored, replaced }) => {
         if (this.pending === flow) this.pending = null;
-        log(`signed in as ${stored.member} in team ${stored.team}`);
+        const change = identityChange(stored, replaced);
+        this.changed = change;
+        log(`signed in as ${stored.member} in team ${stored.team}${change ? ' (a different member or team than before)' : ''}`);
         this.poke();
-        void this.status(`team-relay: signed in as ${stored.member} in team ${stored.team}. Teammate tools are ready.`);
+        void this.status(`team-relay: ${connectedAs(stored)}. Teammate tools are ready.${change ? ` ${change}` : ''}`);
       },
       (err: unknown) => {
         if (this.pending === flow) this.pending = null;
         const why = describeError(err);
         log(`sign-in ended: ${why}`);
-        // A sign-in replaced by a newer one (or a logout) is not news; anything else is.
+        // A sign-in replaced by a newer one is not news; anything else is.
         if (!why.includes(SUPERSEDED)) void this.status(`team-relay: the sign-in did not complete: ${why}.`);
       },
     );
     const envMode = configValue(this.env.RELAY_AUTH);
     return toolJson({
       status: 'waiting_for_browser',
+      relay_url: relayNorm,
       sign_in_url: flow.url,
+      sign_in_url_rule: SIGN_IN_URL_RULE,
       expires_in_seconds: 300,
       next:
-        'A browser tab should have opened on the relay: sign in with Google there and choose the team. If none opened, open sign_in_url yourself. ' +
+        'A browser tab should have opened on the relay: the user signs in with Google there and chooses the team. ' +
         'A status event on this channel says when it is done (or call whoami).',
       ...(envMode && envMode !== 'credential'
         ? { note: `this session signs in with RELAY_AUTH=${envMode} from its environment; restart Claude Code without it to use the new sign-in` }
@@ -713,66 +713,39 @@ class AskerConnection {
     });
   }
 
-  async logout(args: Record<string, unknown>): Promise<ToolResult> {
-    const bad = unknownKey(args, []);
-    if (bad) return toolError(`unknown argument: ${bad}`);
-    this.pending?.cancel();
-    this.pending = null;
-    let stored: StoredCredential | null;
-    try {
-      stored = readCredential(this.path);
-    } catch (err) {
-      // An unusable file is still removed: signing out must always be possible.
-      removeCredential(this.path);
-      this.disconnect('signed out');
-      this.poke();
-      return toolJson({ signed_out: true, revoked: false, note: `the stored credential could not be read (${describeError(err)}); it was deleted` });
-    }
-    if (!stored) return toolJson({ signed_out: false, note: 'not signed in on this computer' });
-    let revoked = false;
-    let note: string | undefined;
-    try {
-      const client = new RelayClient({ url: stored.relay_url, team: stored.team, token: () => stored.credential, attempts: 1, timeoutMs: 10_000 });
-      await client.revokeSelf();
-      revoked = true;
-    } catch (err) {
-      if (err instanceof RelayError && (err.status === 401 || err.status === 404)) {
-        revoked = true;
-        note = 'the relay no longer accepted this credential';
-      } else note = `the relay was not reached (${describeError(err)}); the credential was deleted here and expires on its own`;
-    }
-    removeCredential(this.path);
-    this.disconnect('signed out');
-    this.poke();
-    return toolJson({ signed_out: true, revoked, team: stored.team, member: stored.member, ...(note ? { note } : {}) });
-  }
-
   async whoami(args: Record<string, unknown>): Promise<ToolResult> {
     const bad = unknownKey(args, []);
     if (bad) return toolError(`unknown argument: ${bad}`);
     if (this.live) {
       let expires: string | null = null;
+      let email: string | undefined;
       if (this.live.mode === 'credential') {
         try {
-          expires = readCredential(this.path)?.expires_at ?? null;
+          const stored = readCredential(this.path);
+          expires = stored?.expires_at ?? null;
+          // The email belongs to this sign-in only if the file still names the same member.
+          if (stored && stored.member === this.live.me.member && stored.team === this.live.me.team) email = stored.email;
         } catch {
           expires = null;
         }
       }
       return toolJson({
         connected: true,
+        message: connectedAs({ member: this.live.me.member, team: this.live.me.team, email }),
         relay_url: this.live.client.url,
         team: this.live.me.team,
         member: this.live.me.member,
+        ...(email ? { email } : {}),
         teammates: this.live.me.teammates.filter((m) => MEMBER_RE.test(m)),
         signed_in_with: SIGNED_IN_WITH[this.live.mode],
         ...(expires ? { credential_expires_at: expires } : {}),
+        ...(this.changed ? { changed: this.changed } : {}),
       });
     }
     return toolJson({
       connected: false,
       message: this.notConnected(),
-      ...(this.pending ? { sign_in_pending: true, sign_in_url: this.pending.url } : {}),
+      ...(this.pending ? { sign_in_pending: true } : {}),
     });
   }
 }
@@ -795,6 +768,9 @@ function fail(message: string): never {
 /** An asker that signs in with the stored credential, or waits for one (M5-SPEC §6). */
 function usesStoredSignIn(env: NodeJS.ProcessEnv): boolean {
   try {
+    // A stored sign-in that does not match RELAY_URL / RELAY_TEAM waits too: whoami says
+    // why, and login refuses to replace a credential from another relay (M5-SPEC §9 item 1).
+    if (authModeFromEnv(env) === 'credential') return true;
     return connectionFromEnv(env).mode === 'credential';
   } catch (err) {
     // No sign-in yet, or a credential file that must not be used: wait for /team-relay:login.
@@ -878,14 +854,21 @@ async function main(): Promise<void> {
     if (!isPlainObject(args)) return toolError('arguments must be an object');
     try {
       if (role === 'asker') {
-        if (name === 'login' || name === 'logout' || name === 'whoami') {
+        if (name === 'login' || name === 'whoami') {
           if (!connection) {
             if (name === 'whoami' && fixed) {
-              return toolJson({ connected: true, team: fixed.me.team, member: fixed.me.member, relay_url: fixed.client.url, signed_in_with: 'the environment (RELAY_AUTH)' });
+              return toolJson({
+                connected: true,
+                message: connectedAs(fixed.me),
+                team: fixed.me.team,
+                member: fixed.me.member,
+                relay_url: fixed.client.url,
+                signed_in_with: 'the environment (RELAY_AUTH)',
+              });
             }
             return toolError('this session signs in with RELAY_AUTH from its environment; unset it and restart Claude Code to use /team-relay:login');
           }
-          return name === 'login' ? await connection.login(args) : name === 'logout' ? await connection.logout(args) : await connection.whoami(args);
+          return name === 'login' ? await connection.login(args) : await connection.whoami(args);
         }
         const live = liveNow();
         const known = ['list_teammates', 'ask_question', 'invoke_capability', 'request_status'];

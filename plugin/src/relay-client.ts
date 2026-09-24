@@ -426,7 +426,9 @@ export function connectionFromEnv(env: NodeJS.ProcessEnv, gcloud: Omit<GcloudOpt
       } catch {
         same = false;
       }
-      if (!same) throw new Error('RELAY_URL is not the relay you signed in to: unset it, or run /team-relay:login <relay-url>');
+      if (!same) {
+        throw new Error('RELAY_URL is not the relay you signed in to: unset it, or run /team-relay:logout and then /team-relay:login to sign in to it');
+      }
     }
     const envTeam = configValue(env.RELAY_TEAM);
     if (envTeam !== undefined && envTeam !== stored.team) {

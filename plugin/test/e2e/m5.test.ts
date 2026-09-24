@@ -4,7 +4,9 @@
 //   A. the whole sign-in through the real login tool, the browser a headless stub
 //      (test/fixtures/fake-browser.mjs, via TEAM_RELAY_OPEN_COMMAND) that follows the relay's
 //      redirects, the fake consent and the team chooser; the credential stored with the right
-//      modes; both streams working with it; logout revoking it;
+//      modes; both streams working with it; /team-relay:logout (dist/logout.js) revoking it;
+//      the login tool taking no arguments (M5-SPEC §9 item 1), the status naming the Google
+//      account when the relay reports it (§9 item 3);
 //   B. the owner (alice) adding a member through the console server's roster proxy; the new
 //      member signing in with the M5 flow and appearing in the directory;
 //   C. the owner removing that member, and the relay refusing them within 30 s.
@@ -14,7 +16,7 @@
 // removed in C, so the M1 and M2 suites are unaffected whichever file runs first.
 
 import { afterAll, describe, expect, it } from 'vitest';
-import { spawn, type ChildProcess } from 'node:child_process';
+import { execFile, spawn, type ChildProcess } from 'node:child_process';
 import { lstatSync, mkdtempSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -42,6 +44,8 @@ async function freshAsker(label: string, email: string): Promise<Signed> {
   const party = await Party.start(`${label}-asker`, 'channel.js', {
     RELAY_ROLE: 'asker',
     RELAY_AUTH: '',
+    // The one way to configure a relay other than the plugin's default (M5-SPEC §9 item 1).
+    RELAY_URL: relayUrl(),
     XDG_CONFIG_HOME: xdg,
     TEAM_RELAY_OPEN_COMMAND: join(FIXTURES, 'fake-browser.mjs'),
     FAKE_BROWSER_LOG: log,
@@ -51,12 +55,19 @@ async function freshAsker(label: string, email: string): Promise<Signed> {
   return { party, xdg, file: join(xdg, 'team-relay', 'credentials.json'), log };
 }
 
+/** The status line a sign-in ends with: the email only once the relay reports it (§9 item 3). */
+function connectedLine(member: string): RegExp {
+  return new RegExp(`^team-relay: Connected as ${member}( \\(${member}@example\\.com\\))? on team demo\\. Teammate tools are ready\\.$`);
+}
+
 async function signIn(s: Signed, member: string): Promise<string> {
-  const r = await s.party.ok('login', { relay_url: relayUrl() });
+  const r = await s.party.ok('login', {});
   expect(r.status).toBe('waiting_for_browser');
+  expect(r.relay_url).toBe(relayUrl());
   expect(String(r.sign_in_url).startsWith(`${relayUrl()}/v1/login/start?`)).toBe(true);
+  expect(String(r.sign_in_url_rule)).toMatch(/Never repeat it to anyone else/);
   const note = await s.party
-    .waitNote((n) => n.meta.type === 'status' && /signed in|did not complete/.test(n.content), 30_000, 'the sign-in status')
+    .waitNote((n) => n.meta.type === 'status' && /Connected as|did not complete/.test(n.content), 30_000, 'the sign-in status')
     .catch((err: unknown) => {
       const browser = (() => {
         try {
@@ -67,11 +78,30 @@ async function signIn(s: Signed, member: string): Promise<string> {
       })();
       throw new Error(`${String(err)}; browser: ${browser.slice(0, 1500)}; stderr: ${s.party.stderr().slice(-1500)}`);
     });
-  expect(note.content).toBe(`team-relay: signed in as ${member} in team demo. Teammate tools are ready.`);
-  const stored = JSON.parse(readFileSync(s.file, 'utf8')) as { credential: string; team: string; member: string; relay_url: string };
+  expect(note.content).toMatch(connectedLine(member));
+  const stored = JSON.parse(readFileSync(s.file, 'utf8')) as { credential: string; team: string; member: string; relay_url: string; email?: string };
   expect(stored).toMatchObject({ team: 'demo', member, relay_url: relayUrl() });
   expect(stored.credential).toMatch(CREDENTIAL_RE);
+  if (stored.email !== undefined) {
+    expect(stored.email).toBe(`${member}@example.com`);
+    expect(note.content).toContain(`(${member}@example.com)`);
+  } else {
+    // Tolerated until the relay reports it (M5-SPEC §9 item 3); said, so the run shows it.
+    console.warn(`e2e: the relay did not report the Google account for ${member} at sign-in (no email in /v1/login/token)`);
+  }
   return stored.credential;
+}
+
+/** /team-relay:logout: `node dist/logout.js`, as the command runs it. */
+function logout(xdg: string): Promise<{ status: number; stdout: string }> {
+  return new Promise((resolve) => {
+    execFile(
+      process.execPath,
+      [join(DIST, 'logout.js')],
+      { env: { PATH: process.env.PATH ?? '', HOME: xdg, XDG_CONFIG_HOME: xdg }, encoding: 'utf8', timeout: 20_000 },
+      (err, stdout) => resolve({ status: err ? ((err as { code?: number }).code ?? 1) : 0, stdout }),
+    );
+  });
 }
 
 async function whoami(p: Party): Promise<Record<string, unknown>> {
@@ -122,6 +152,9 @@ describe.skipIf(!M5)('M5: sign in with the login tool', () => {
     const bob = await freshAsker('bob', 'bob@example.com');
     // Before the sign-in: waiting quietly.
     expect((await bob.party.call('list_teammates', {})).text).toBe('Not connected: run /team-relay:login');
+    // The relay is not the model's to choose: login takes no arguments.
+    const steered = await bob.party.call('login', { relay_url: 'https://evil.example.com' });
+    expect(steered.text).toMatch(/login takes no arguments/);
 
     const credential = await signIn(bob, 'bob');
     // Modes: the directory 700, the file 600.
@@ -140,6 +173,7 @@ describe.skipIf(!M5)('M5: sign in with the login tool', () => {
 
     const who = await connected(bob.party);
     expect(who).toMatchObject({ connected: true, team: 'demo', member: 'bob', relay_url: relayUrl() });
+    expect(String(who.message)).toMatch(/^Connected as bob( \(bob@example\.com\))? on team demo$/);
     expect(JSON.stringify(who)).not.toContain(credential);
     // The relay knows the credential as bob.
     const me = await api(credential, 'GET', teamPath('me'));
@@ -176,12 +210,19 @@ describe.skipIf(!M5)('M5: sign in with the login tool', () => {
     await aliceAsker.waitNote((n) => n.meta.request_id === qid && n.meta.type === 'answer', DELIVERY_MS, 'the answer at alice');
     await bobAnswerer.close();
 
-    // Logout: revoked at the relay, deleted here, and the session is back to waiting.
-    const out = await bob.party.ok('logout', {});
-    expect(out).toMatchObject({ signed_out: true, revoked: true, team: 'demo', member: 'bob' });
+    // Logout is not a tool (§9 item 2); /team-relay:logout runs dist/logout.js: revoked at the
+    // relay, deleted here, and the session is back to waiting.
+    expect((await bob.party.call('logout', {})).text).toBe('unknown tool: logout');
+    const out = await logout(bob.xdg);
+    expect(out.status).toBe(0);
+    expect(out.stdout).toMatch(/^team-relay: signed out of team demo as bob( \(bob@example\.com\))?\. The relay revoked this computer's credential, and it was deleted here\./);
     expect(() => lstatSync(bob.file)).toThrow();
     expect((await api(credential, 'GET', teamPath('me'))).status).toBe(401);
-    expect((await bob.party.call('list_teammates', {})).text).toBe('Not connected: run /team-relay:login');
+    await until(
+      async () => ((await bob.party.call('list_teammates', {})).text === 'Not connected: run /team-relay:login' ? true : null),
+      15_000,
+      'bob back to waiting',
+    );
   }, 120_000);
 });
 

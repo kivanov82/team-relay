@@ -38,6 +38,7 @@ function parseRelayUrl(raw) {
 
 // src/credentials.ts
 var CREDENTIAL_RE = /^trc_[A-Za-z0-9_-]{43}$/;
+var EMAIL_RE = /^[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9-]{1,63}(\.[A-Za-z0-9-]{1,63})+$/;
 var CREDENTIALS_DIR = "team-relay";
 var CREDENTIALS_FILE = "credentials.json";
 var MAX_FILE_BYTES = 16 * 1024;
@@ -81,7 +82,7 @@ function normaliseRelayUrl(raw) {
 function parseStoredCredential(raw) {
   if (typeof raw !== "object" || raw === null || Array.isArray(raw)) throw new CredentialFileError("the credential file is not a JSON object");
   const c = raw;
-  const { relay_url, team, member, credential, expires_at } = c;
+  const { relay_url, team, member, credential, expires_at, email } = c;
   if (typeof relay_url !== "string") throw new CredentialFileError("the credential file has no relay_url");
   let url;
   try {
@@ -95,7 +96,17 @@ function parseStoredCredential(raw) {
   if (expires_at !== void 0 && expires_at !== null && (typeof expires_at !== "string" || !RFC3339.test(expires_at))) {
     throw new CredentialFileError("the credential file has an invalid expires_at");
   }
-  return { relay_url: url, team, member, credential, expires_at: typeof expires_at === "string" ? expires_at : null };
+  if (email !== void 0 && email !== null && (typeof email !== "string" || email.length > 254 || !EMAIL_RE.test(email))) {
+    throw new CredentialFileError("the credential file has an invalid email");
+  }
+  return {
+    relay_url: url,
+    team,
+    member,
+    credential,
+    expires_at: typeof expires_at === "string" ? expires_at : null,
+    ...typeof email === "string" ? { email } : {}
+  };
 }
 function readCredential(path) {
   let st;
