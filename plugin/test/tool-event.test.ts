@@ -1,5 +1,6 @@
 // M2-SPEC §4.3: the answering session's open requests (active.json, written by the answerer
-// channel) and the PostToolUse / PostToolUseFailure hook script (dist/tool-event.js).
+// channel) and the PostToolUse / PostToolUseFailure hook script (dist/tool-event.js), which
+// is also the PermissionRequest hook (M4-SPEC §2: a `waiting` event).
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { spawn, spawnSync } from 'node:child_process';
@@ -96,7 +97,30 @@ const failure = (tool_name: string, extra: Record<string, unknown> = {}) => ({
   ...extra,
 });
 
+/** Claude Code's PermissionRequest hook input (code.claude.com/docs/en/hooks, 24 Sep 2026). */
+const permission = (tool_name: string, extra: Record<string, unknown> = {}) => ({
+  session_id: 's1',
+  transcript_path: '/tmp/t.jsonl',
+  cwd: '/tmp/work',
+  permission_mode: 'default',
+  hook_event_name: 'PermissionRequest',
+  tool_name,
+  tool_input: { file_path: SECRET_INPUT },
+  permission_suggestions: [
+    { type: 'addRules', rules: [{ toolName: 'Read', ruleContent: `/${SECRET_INPUT}/**` }], behavior: 'allow', destination: 'session' },
+  ],
+  ...extra,
+});
+
 describe('tool event from a hook payload', () => {
+  it('turns a PermissionRequest into a waiting event: the name only, no duration (M4-SPEC §2)', () => {
+    expect(toolEventFromPayload(permission('Read'))).toEqual({ tool: 'Read', status: 'waiting', duration_ms: null });
+    expect(toolEventFromPayload(permission('Grep', { duration_ms: 50 }))).toEqual({ tool: 'Grep', status: 'waiting', duration_ms: null });
+    expect(toolEventFromPayload(permission('mcp__capabilities__staging_db_query'))).toMatchObject({ tool: 'staging_db_query', status: 'waiting' });
+    expect(toolEventFromPayload(permission('mcp__relay__reply'))).toBeNull();
+    expect(JSON.stringify(toolEventFromPayload(permission('Read')))).not.toMatch(/SECRET/);
+  });
+
   it('strips mcp__<server>__ prefixes, keeps built-in names', () => {
     expect(splitToolName('mcp__capabilities__staging_db_query')).toEqual({ server: 'capabilities', tool: 'staging_db_query' });
     expect(splitToolName('mcp__plugin_team-relay_relay__reply')).toEqual({ server: 'plugin_team-relay_relay', tool: 'reply' });
@@ -330,6 +354,23 @@ describe('dist/tool-event.js', () => {
     expect(run.stderr).not.toMatch(/SECRET/);
   });
 
+  it('posts waiting for a permission request, without the path or the suggested rule (M4-SPEC §2)', async () => {
+    const id = openRequest();
+    await new ActiveRequests(stateDir).add(id, LATER);
+    const run = await runHook(permission('Read'));
+    expect(run.code).toBe(0);
+    expect(run.stdout).toBe('');
+    expect(relay.toolEvents.map((e) => [e.request_id, e.body])).toEqual([[id, { tool: 'Read', status: 'waiting', duration_ms: null }]]);
+    for (const r of relay.requests) expect(r.raw + r.path).not.toMatch(/SECRET/);
+    expect(run.stderr).not.toMatch(/SECRET/);
+  });
+
+  it('sends nothing for a permission request outside any open request', async () => {
+    const run = await runHook(permission('Read'));
+    expect(run.code).toBe(0);
+    expect(relay.requests).toHaveLength(0);
+  });
+
   it('reports a failure as status error, without the error text', async () => {
     const id = openRequest();
     await new ActiveRequests(stateDir).add(id, LATER);
@@ -430,16 +471,18 @@ describe('dist/tool-event.js', () => {
     const settings = JSON.parse(readFileSync(join(home, 'settings.json'), 'utf8'));
     const id = openRequest();
     await new ActiveRequests(join(home, 'state')).add(id, LATER);
-    for (const event of ['PostToolUse', 'PostToolUseFailure'] as const) {
+    for (const event of ['PermissionRequest', 'PostToolUse', 'PostToolUseFailure'] as const) {
       const hook = settings.hooks[event][0].hooks[0];
       const code = await new Promise<number | null>((resolve) => {
         const child = spawn(hook.command, hook.args, { env: { PATH: process.env.PATH ?? '' }, stdio: ['pipe', 'ignore', 'ignore'] });
         child.on('close', resolve);
-        child.stdin.end(JSON.stringify(event === 'PostToolUse' ? post('Glob') : failure('Glob')));
+        const payload = event === 'PostToolUse' ? post('Glob') : event === 'PostToolUseFailure' ? failure('Glob') : permission('Glob');
+        child.stdin.end(JSON.stringify(payload));
       });
       expect(code).toBe(0);
     }
     expect(relay.toolEvents.map((e) => [e.request_id, e.body])).toEqual([
+      [id, { tool: 'Glob', status: 'waiting', duration_ms: null }],
       [id, { tool: 'Glob', status: 'ok', duration_ms: 1234 }],
       [id, { tool: 'Glob', status: 'error', duration_ms: 7 }],
     ]);

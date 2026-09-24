@@ -11,7 +11,7 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
-export const ENTRIES = ['channel', 'capabilities', 'session-start', 'tool-event', 'console-server'] as const;
+export const ENTRIES = ['channel', 'capabilities', 'session-start', 'tool-event', 'notify-desktop', 'console-server'] as const;
 
 export async function build(outdir = join(root, 'dist')): Promise<void> {
   mkdirSync(outdir, { recursive: true });

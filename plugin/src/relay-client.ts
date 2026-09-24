@@ -38,7 +38,8 @@ export type DirectoryEntry = {
   published_at: string | null;
 };
 export type StreamPage = { messages: Envelope[]; cursor: number; head: number };
-export type ToolEventBody = { tool: string; status: 'ok' | 'error'; duration_ms: number | null };
+/** M2-SPEC §3.3; `waiting` (M4-SPEC §2): the tool is waiting for the member's permission. */
+export type ToolEventBody = { tool: string; status: 'ok' | 'error' | 'waiting'; duration_ms: number | null };
 
 export type CreateRequestBody = {
   idempotency_key: string;

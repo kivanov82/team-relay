@@ -1,11 +1,15 @@
-// What the tool-event hook sends (M2-SPEC §3.3, §4.3), as pure functions.
+// What the tool-event hook sends (M2-SPEC §3.3, §4.3; M4-SPEC §2), as pure functions.
 //
 // Claude Code's PostToolUse / PostToolUseFailure hook input (code.claude.com/docs/en/hooks,
 // checked 23 Sep 2026) carries session_id, transcript_path, cwd, hook_event_name,
 // tool_name, tool_input, tool_use_id, duration_ms (the tool's execution time in ms), and
-// tool_response (PostToolUse) or error and is_interrupt (PostToolUseFailure). Only
+// tool_response (PostToolUse) or error and is_interrupt (PostToolUseFailure). Its
+// PermissionRequest input (checked 24 Sep 2026) carries tool_name, tool_input,
+// permission_mode and permission_suggestions, and fires when Claude Code is about to ask the
+// member for permission: it becomes a `waiting` event (M4-SPEC §2), with no duration. Only
 // hook_event_name, tool_name and duration_ms are ever read here; the event built below is
-// made of those three alone, so tool input, output, errors and paths cannot leave.
+// made of those three alone, so tool input, output, errors, paths and suggested rules
+// cannot leave.
 
 import type { ToolEventBody } from './relay-client.js';
 
@@ -35,13 +39,15 @@ export function toolEventFromPayload(payload: unknown): ToolEventBody | null {
   let status: ToolEventBody['status'];
   if (p.hook_event_name === 'PostToolUse') status = 'ok';
   else if (p.hook_event_name === 'PostToolUseFailure') status = 'error';
+  else if (p.hook_event_name === 'PermissionRequest') status = 'waiting';
   else return null;
   if (typeof p.tool_name !== 'string') return null;
   const { server, tool } = splitToolName(p.tool_name);
   if (RELAY_OWN_TOOLS.has(tool) && isRelayServer(server)) return null;
   if (!TOOL_NAME_RE.test(tool)) return null;
   let duration: number | null = null;
-  if (typeof p.duration_ms === 'number' && Number.isFinite(p.duration_ms) && p.duration_ms >= 0) {
+  // A permission request has not run yet: it has no duration, whatever the payload says.
+  if (status !== 'waiting' && typeof p.duration_ms === 'number' && Number.isFinite(p.duration_ms) && p.duration_ms >= 0) {
     const ms = Math.round(p.duration_ms);
     duration = ms <= MAX_DURATION_MS ? ms : null;
   }

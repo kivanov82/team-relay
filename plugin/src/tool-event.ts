@@ -1,4 +1,5 @@
-// The answering session's PostToolUse / PostToolUseFailure hook (M2-SPEC §4.3):
+// The answering session's PostToolUse / PostToolUseFailure hook (M2-SPEC §4.3) and its
+// PermissionRequest hook (M4-SPEC §2: a `waiting` event while the member is asked):
 //
 //   node dist/tool-event.js --config $ANSWERER_HOME/tool-event.json   (exec form, bin/answerer)
 //

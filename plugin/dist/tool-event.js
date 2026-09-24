@@ -389,13 +389,14 @@ function toolEventFromPayload(payload) {
   let status;
   if (p.hook_event_name === "PostToolUse") status = "ok";
   else if (p.hook_event_name === "PostToolUseFailure") status = "error";
+  else if (p.hook_event_name === "PermissionRequest") status = "waiting";
   else return null;
   if (typeof p.tool_name !== "string") return null;
   const { server, tool } = splitToolName(p.tool_name);
   if (RELAY_OWN_TOOLS.has(tool) && isRelayServer(server)) return null;
   if (!TOOL_NAME_RE.test(tool)) return null;
   let duration = null;
-  if (typeof p.duration_ms === "number" && Number.isFinite(p.duration_ms) && p.duration_ms >= 0) {
+  if (status !== "waiting" && typeof p.duration_ms === "number" && Number.isFinite(p.duration_ms) && p.duration_ms >= 0) {
     const ms = Math.round(p.duration_ms);
     duration = ms <= MAX_DURATION_MS ? ms : null;
   }
