@@ -23,6 +23,13 @@ authorize URL, optionally with ``&email=``) → GET its ``Location`` (the relay'
 ``action=continue``) with the cookie → the ``303`` ``Location`` is
 ``http://127.0.0.1:<port>/callback?code=…&state=…``.
 
+Google ID tokens (M9-SPEC §2, §4, §5: ``/v1/me/teams``, ``POST /v1/teams``, the admin routes
+and delegates need a Google identity): ``GET /__fake_google/id_token?email=<email>`` answers
+``{"id_token": "..."}``, signed by the fake's key, for that verified email (its ``sub`` is the
+one the login flow gives the same email, so both are the same account). The relay accepts such
+a token as a Google ID token; a delegate's is one for its service account's email (the team
+file's ``delegates`` principal). Any other bearer token is a static one, as before.
+
 This module lives under ``tests/`` and is not in the image: nothing in production can reach it.
 """
 
@@ -38,6 +45,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, RedirectResponse, Response
 
 from relay.app import create_app
+from relay.auth import JWT_SHAPE, StaticVerifier, Unauthenticated, Verified
 from relay.config import (
     Settings,
     load_schema,
@@ -49,12 +57,40 @@ from relay.config import (
 )
 from relay.errors import ConfigError
 from relay.log import log_event
+from relay.oauth import OAuthError
 from relay.store import Store
 from relay.store_memory import MemoryStore
 
-from .fake_google import FakeGoogle, FakeGoogleProvider
+from .fake_google import FakeGoogle, FakeGoogleProvider, Grant
 
 AUTHORIZE_PATH = "/__fake_google/authorize"
+ID_TOKEN_PATH = "/__fake_google/id_token"
+
+
+class FakeIdTokenVerifier:
+    """A JWT-shaped bearer token is a Google ID token signed by the fake (verified by the
+    relay's own ID token code: signature, issuer, audience, expiry) with a verified email;
+    anything else is a static token."""
+
+    def __init__(self, provider: FakeGoogleProvider) -> None:
+        self._provider = provider
+        self._static = StaticVerifier()
+
+    async def principal(self, token: str) -> str:
+        return (await self.verify(token)).principal
+
+    async def verify(self, token: str) -> Verified:
+        if JWT_SHAPE.fullmatch(token or "") is None:
+            return await self._static.verify(token)
+        try:
+            claims = await self._provider.verify_id_token(token)
+        except OAuthError as exc:
+            raise Unauthenticated(exc.reason) from None
+        email = normalise_email(claims.get("email"))
+        sub = claims.get("sub")
+        if email is None or claims.get("email_verified") is not True or not isinstance(sub, str):
+            raise Unauthenticated("fake_id_token_claims")
+        return Verified("google:" + email, sub)
 
 
 def build_app(team_config: str, port: int, default_email: str | None) -> FastAPI:
@@ -76,8 +112,18 @@ def build_app(team_config: str, port: int, default_email: str | None) -> FastAPI
         store = MemoryStore()
     fake = FakeGoogle()
     provider = FakeGoogleProvider(fake, authorize_url=public_url + AUTHORIZE_PATH)
-    app = create_app(settings, store, oauth=provider)
+    app = create_app(settings, store, oauth=provider, verifier=FakeIdTokenVerifier(provider))
     callback = public_url + "/v1/login/callback"
+
+    @app.get(ID_TOKEN_PATH)
+    async def fake_id_token(request: Request) -> Response:
+        email = normalise_email(request.query_params.get("email"))
+        if email is None:
+            return JSONResponse({"error": "no_email", "detail": "Pass ?email=."}, 400)
+        grant = Grant(email=email, nonce="", code_challenge="", redirect_uri="")
+        claims = fake.id_token_claims(grant)
+        claims.pop("nonce")
+        return JSONResponse({"id_token": fake.sign(claims)})
 
     @app.get(AUTHORIZE_PATH)
     async def fake_authorize(request: Request) -> Response:

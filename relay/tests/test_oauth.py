@@ -510,3 +510,59 @@ def test_the_launcher_refuses_cloud_run(tmp_path: Path, monkeypatch):
     monkeypatch.setenv("K_SERVICE", "team-relay")
     with pytest.raises(ConfigError, match="Cloud Run"):
         build_app(_launcher_config(tmp_path), 8090, None)
+
+
+async def test_the_launcher_mints_google_id_tokens_for_the_account_routes(
+    tmp_path: Path, monkeypatch
+):
+    """M9: the e2e needs Google identities (creating a team, /v1/me/teams, an admin, the
+    any-team delegate); the launcher mints fake-signed ID tokens and accepts them."""
+    monkeypatch.delenv("FIRESTORE_EMULATOR_HOST", raising=False)
+    from .fake_oauth_app import build_app
+
+    data = team_config_data()
+    data["admins"] = ["google:root@example.com"]
+    data["delegates"] = [
+        {
+            "principal": "google:console@example-project.iam.gserviceaccount.com",
+            "team": "*",
+            "scope": ["read", "manage-roster", "manage-teams"],
+        }
+    ]
+    path = tmp_path / "team.yaml"
+    path.write_text(json.dumps(data))
+    app = build_app(str(path), 8092, None)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1:8092"
+    ) as c:
+
+        async def token_for(email: str) -> dict[str, str]:
+            r = await c.get("/__fake_google/id_token", params={"email": email})
+            assert r.status_code == 200
+            return {"Authorization": f"Bearer {r.json()['id_token']}"}
+
+        assert (await c.get("/__fake_google/id_token")).status_code == 400
+        erin = await token_for("Erin@Example.com")
+        r = await c.post(
+            "/v1/teams",
+            json={"id": "erins", "name": "Erin's", "owner_member_id": "erin"},
+            headers=erin,
+        )
+        assert r.status_code == 201, r.text
+        r = await c.get("/v1/me/teams", headers=erin)
+        assert [t["team"] for t in r.json()["teams"]] == ["erins"]
+        r = await c.get("/v1/teams/erins/me", headers=erin)
+        assert r.json()["role"] == "owner"
+        console = await token_for("console@example-project.iam.gserviceaccount.com")
+        r = await c.get(
+            "/v1/teams/erins/roster",
+            headers={**console, "X-Relay-On-Behalf-Of": "erin@example.com"},
+        )
+        assert r.status_code == 200
+        r = await c.get("/v1/admin/teams", headers=await token_for("root@example.com"))
+        assert "erins" in [t["id"] for t in r.json()["teams"]]
+        # A tampered token is refused; static tokens still work.
+        bad = erin["Authorization"][:-4] + "AAAA"
+        assert (await c.get("/v1/me/teams", headers={"Authorization": bad})).status_code == 401
+        r = await c.get("/v1/teams/demo/me", headers={"Authorization": f"Bearer {TOKENS['bob']}"})
+        assert r.json()["member"] == "bob"
