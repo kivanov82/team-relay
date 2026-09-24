@@ -24,6 +24,11 @@
 # stored credential, /team-relay:logout (dist/logout.js), an owner adding
 # a member through the console server, the new member signing in and appearing in the
 # directory, and removal refusing them within 30 s.
+#
+# M7 (docs/M7-SPEC.md §4): when the relay answers GET /v1/teams/demo/inbox/summary with 200,
+# test/e2e/m7.test.ts runs: a question to a member whose answering session is not running
+# produces the waiting notice in their channel working session (nothing reads their inbox
+# meanwhile), and is delivered once when their answering session starts.
 # Extra arguments are passed to vitest. The tokens are never printed.
 set -euo pipefail
 
@@ -170,6 +175,8 @@ health="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$RELAY_URL/v1/hea
 printf 'Authorization: Bearer %s\n' "$TOKEN_ALICE" >"$WORK/probe.header"
 chmod 600 "$WORK/probe.header"
 activity="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 -H @"$WORK/probe.header" "$RELAY_URL/v1/teams/demo/activity?limit=1" || true)"
+# M7-SPEC §1: a peek; it moves no cursor and writes no presence.
+inbox_summary="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 -H @"$WORK/probe.header" "$RELAY_URL/v1/teams/demo/inbox/summary" || true)"
 rm -f "$WORK/probe.header"
 if [[ "$health" == "200" && "$activity" == "200" ]]; then
   E2E_M2=1
@@ -188,8 +195,16 @@ else
   echo "e2e: SKIPPING the M5 and M6 scenarios (fake OAuth launcher: $FAKE_OAUTH, GET /v1/login/start: $login_start)" >&2
 fi
 
+E2E_M7=0
+if [[ "$inbox_summary" == "200" ]]; then
+  E2E_M7=1
+  echo "e2e: the relay serves the inbox summary: running the M7 scenario" >&2
+else
+  echo "e2e: SKIPPING the M7 scenario (GET /inbox/summary: $inbox_summary)" >&2
+fi
+
 pnpm -C "$ROOT/plugin" build
 
-export RELAY_URL E2E=1 E2E_M2 E2E_M5
+export RELAY_URL E2E=1 E2E_M2 E2E_M5 E2E_M7
 export E2E_TOKEN_ALICE="$TOKEN_ALICE" E2E_TOKEN_BOB="$TOKEN_BOB" E2E_TOKEN_CAROL="$TOKEN_CAROL"
 pnpm -C "$ROOT/plugin" test:e2e "$@"
