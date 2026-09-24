@@ -16065,8 +16065,8 @@ function uint8ArrayToBase64(bytes) {
   }
   return btoa(binaryString);
 }
-function base64urlToUint8Array(base64url2) {
-  const base642 = base64url2.replace(/-/g, "+").replace(/_/g, "/");
+function base64urlToUint8Array(base64url3) {
+  const base642 = base64url3.replace(/-/g, "+").replace(/_/g, "/");
   const padding = "=".repeat((4 - base642.length % 4) % 4);
   return base64ToUint8Array(base642 + padding);
 }
@@ -17234,9 +17234,9 @@ var asciiTabOrNewline = /[\t\n\r]/g;
 function stripTabAndNewline(value) {
   return value.replace(asciiTabOrNewline, "");
 }
-function urlHostnameOk(url, hostname) {
-  hostname.lastIndex = 0;
-  return hostname.test(url.hostname);
+function urlHostnameOk(url, hostname2) {
+  hostname2.lastIndex = 0;
+  return hostname2.test(url.hostname);
 }
 function urlProtocolOk(url, protocol) {
   protocol.lastIndex = 0;
@@ -25088,9 +25088,227 @@ var StdioServerTransport = class {
 
 // src/relay-client.ts
 import { execFile } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { readFileSync as readFileSync3 } from "node:fs";
+
+// src/credentials.ts
+import { randomBytes } from "node:crypto";
+import {
+  chmodSync,
+  closeSync,
+  fsyncSync,
+  lstatSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  unlinkSync,
+  writeSync
+} from "node:fs";
+import { homedir } from "node:os";
+import { basename, dirname, isAbsolute, join } from "node:path";
+
+// src/relay-client-core.ts
 var TEAM_RE = /^[a-z][a-z0-9_-]{1,31}$/;
 var MEMBER_RE = /^[a-z][a-z0-9_]{1,31}$/;
+var LOOPBACK = /* @__PURE__ */ new Set(["localhost", "127.0.0.1", "[::1]", "::1"]);
+function parseRelayUrl(raw) {
+  if (!raw) throw new Error("RELAY_URL must be set");
+  let url;
+  try {
+    url = new URL(raw);
+  } catch {
+    throw new Error("RELAY_URL is not a valid URL");
+  }
+  if (url.username || url.password) throw new Error("RELAY_URL must not carry credentials");
+  if (url.search || url.hash) throw new Error("RELAY_URL must not carry a query or fragment");
+  if (url.protocol === "https:") return url;
+  if (url.protocol === "http:" && LOOPBACK.has(url.hostname)) return url;
+  throw new Error("RELAY_URL must be https (plain http is allowed only to localhost)");
+}
+
+// src/credentials.ts
+var CREDENTIAL_RE = /^trc_[A-Za-z0-9_-]{43}$/;
+var CREDENTIALS_DIR = "team-relay";
+var CREDENTIALS_FILE = "credentials.json";
+var MAX_FILE_BYTES = 16 * 1024;
+var CredentialFileError = class extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "CredentialFileError";
+  }
+};
+function credentialsPath(env = process.env) {
+  const explicit = env.RELAY_CREDENTIALS_FILE?.trim();
+  if (explicit) {
+    if (!isAbsolute(explicit)) throw new CredentialFileError("RELAY_CREDENTIALS_FILE must be an absolute path");
+    return explicit;
+  }
+  const xdg = env.XDG_CONFIG_HOME?.trim();
+  const base = xdg && isAbsolute(xdg) ? xdg : join(env.HOME?.trim() || homedir(), ".config");
+  return join(base, CREDENTIALS_DIR, CREDENTIALS_FILE);
+}
+function uid() {
+  return typeof process.getuid === "function" ? process.getuid() : null;
+}
+function checkOwnedPrivate(st, what, kind) {
+  if (st.isSymbolicLink()) throw new CredentialFileError(`${what} is a symbolic link; refusing to use it`);
+  if (kind === "file" ? !st.isFile() : !st.isDirectory()) throw new CredentialFileError(`${what} is not a ${kind}; refusing to use it`);
+  const me = uid();
+  if (me !== null && st.uid !== me) throw new CredentialFileError(`${what} is owned by another user; refusing to use it`);
+  if ((st.mode & 63) !== 0) {
+    const mode = (st.mode & 511).toString(8).padStart(3, "0");
+    throw new CredentialFileError(
+      `${what} has mode ${mode}, readable or writable by others; refusing to use it (run /team-relay:logout and /team-relay:login again, or chmod ${kind === "file" ? "600" : "700"} it)`
+    );
+  }
+}
+var RFC3339 = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,9})?(Z|[+-]\d{2}:\d{2})$/;
+function normaliseRelayUrl(raw) {
+  const url = parseRelayUrl(raw);
+  const path = url.pathname.replace(/\/+$/, "");
+  return `${url.protocol}//${url.host}${path}`;
+}
+function parseStoredCredential(raw) {
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) throw new CredentialFileError("the credential file is not a JSON object");
+  const c = raw;
+  const { relay_url, team, member, credential, expires_at } = c;
+  if (typeof relay_url !== "string") throw new CredentialFileError("the credential file has no relay_url");
+  let url;
+  try {
+    url = normaliseRelayUrl(relay_url);
+  } catch {
+    throw new CredentialFileError("the credential file has an invalid relay_url");
+  }
+  if (typeof team !== "string" || !TEAM_RE.test(team)) throw new CredentialFileError("the credential file has an invalid team");
+  if (typeof member !== "string" || !MEMBER_RE.test(member)) throw new CredentialFileError("the credential file has an invalid member");
+  if (typeof credential !== "string" || !CREDENTIAL_RE.test(credential)) throw new CredentialFileError("the credential file has an invalid credential");
+  if (expires_at !== void 0 && expires_at !== null && (typeof expires_at !== "string" || !RFC3339.test(expires_at))) {
+    throw new CredentialFileError("the credential file has an invalid expires_at");
+  }
+  return { relay_url: url, team, member, credential, expires_at: typeof expires_at === "string" ? expires_at : null };
+}
+function readCredential(path) {
+  let st;
+  try {
+    st = lstatSync(path);
+  } catch (err) {
+    if (err.code === "ENOENT" || err.code === "ENOTDIR") return null;
+    throw new CredentialFileError(`cannot read the credential file (${err.code ?? "error"})`);
+  }
+  checkOwnedPrivate(lstatSync(dirname(path)), "the credential directory", "directory");
+  checkOwnedPrivate(st, "the credential file", "file");
+  if (st.size > MAX_FILE_BYTES) throw new CredentialFileError("the credential file is too large");
+  let text;
+  try {
+    text = readFileSync(path, "utf8");
+  } catch (err) {
+    throw new CredentialFileError(`cannot read the credential file (${err.code ?? "error"})`);
+  }
+  let json;
+  try {
+    json = JSON.parse(text);
+  } catch {
+    throw new CredentialFileError("the credential file is not valid JSON");
+  }
+  return parseStoredCredential(json);
+}
+function credentialFileExists(path) {
+  try {
+    lstatSync(path);
+    return true;
+  } catch {
+    return false;
+  }
+}
+function credentialFingerprint(path) {
+  try {
+    const st = lstatSync(path);
+    return `${st.dev}:${st.ino}:${st.size}:${st.mtimeMs}`;
+  } catch {
+    return null;
+  }
+}
+function ensureDir(dir) {
+  let st = null;
+  try {
+    st = lstatSync(dir);
+  } catch (err) {
+    if (err.code !== "ENOENT") throw new CredentialFileError(`cannot use the credential directory (${err.code ?? "error"})`);
+  }
+  if (st === null) {
+    mkdirSync(dirname(dir), { recursive: true, mode: 448 });
+    mkdirSync(dir, { mode: 448 });
+    chmodSync(dir, 448);
+    st = lstatSync(dir);
+  }
+  checkOwnedPrivate(st, "the credential directory", "directory");
+}
+function writeCredential(path, value) {
+  const checked = parseStoredCredential(value);
+  const dir = dirname(path);
+  ensureDir(dir);
+  try {
+    const existing = lstatSync(path);
+    if (existing.isSymbolicLink() || !existing.isFile()) throw new CredentialFileError("the credential file is not a regular file; refusing to replace it");
+  } catch (err) {
+    if (err instanceof CredentialFileError) throw err;
+  }
+  const tmp = join(dir, `.${basename(path)}.${randomBytes(8).toString("hex")}.tmp`);
+  const body = `${JSON.stringify(checked, null, 2)}
+`;
+  let fd = null;
+  try {
+    fd = openSync(tmp, "wx", 384);
+    writeSync(fd, body);
+    fsyncSync(fd);
+    closeSync(fd);
+    fd = null;
+    chmodSync(tmp, 384);
+    renameSync(tmp, path);
+  } catch (err) {
+    if (fd !== null) closeSync(fd);
+    rmSync(tmp, { force: true });
+    throw new CredentialFileError(`cannot write the credential file (${err.code ?? "error"})`);
+  }
+  try {
+    const dfd = openSync(dir, "r");
+    try {
+      fsyncSync(dfd);
+    } finally {
+      closeSync(dfd);
+    }
+  } catch {
+  }
+}
+function removeCredential(path) {
+  try {
+    unlinkSync(path);
+    return true;
+  } catch (err) {
+    if (err.code === "ENOENT") return false;
+    throw new CredentialFileError(`cannot remove the credential file (${err.code ?? "error"})`);
+  }
+}
+
+// src/relay-default.ts
+import { readFileSync as readFileSync2 } from "node:fs";
+import { fileURLToPath } from "node:url";
+function defaultRelayFile() {
+  return fileURLToPath(new URL("../relay.default.json", import.meta.url));
+}
+function defaultRelayUrl(file = defaultRelayFile()) {
+  try {
+    const raw = JSON.parse(readFileSync2(file, "utf8"));
+    if (typeof raw.relay_url !== "string") return null;
+    parseRelayUrl(raw.relay_url);
+    return raw.relay_url;
+  } catch {
+    return null;
+  }
+}
+
+// src/relay-client.ts
 var REQUEST_ID_RE = /^rq_[0-9a-f]{32}$/;
 var MESSAGE_ID_RE = /^msg_[0-9a-f]{32}$/;
 var RelayError = class extends Error {
@@ -25133,7 +25351,7 @@ function tokenProviderFromEnv(env) {
     return () => {
       let raw;
       try {
-        raw = readFileSync(file, "utf8");
+        raw = readFileSync3(file, "utf8");
       } catch (err) {
         throw new Error(`cannot read RELAY_TOKEN_FILE (${err.code ?? "error"})`);
       }
@@ -25262,33 +25480,74 @@ function metadataTokenProvider(opts) {
   });
 }
 function authModeFromEnv(env) {
-  const mode = configValue(env.RELAY_AUTH) ?? "google";
-  if (mode !== "google" && mode !== "token" && mode !== "metadata") {
-    throw new Error('RELAY_AUTH must be "google" or "token" (or "metadata" on Google Cloud)');
+  const explicit = configValue(env.RELAY_AUTH);
+  if (explicit === void 0) return credentialFileExists(credentialsPath(env)) ? "credential" : "google";
+  if (explicit !== "credential" && explicit !== "google" && explicit !== "token" && explicit !== "metadata") {
+    throw new Error('RELAY_AUTH must be "credential", "google" or "token" (or "metadata" on Google Cloud)');
   }
-  return mode;
+  return explicit;
 }
-function credentialsFromEnv(env, gcloud = {}) {
+var NotConnected = class extends Error {
+  constructor(message = "Not connected: run /team-relay:login") {
+    super(message);
+    this.name = "NotConnected";
+  }
+};
+var SIGN_IN_AGAIN = "the relay refused your sign-in (signed out, expired, or no longer on the team): run /team-relay:login again";
+function credentialTokenProvider(path, bound) {
+  const relay = normaliseRelayUrl(bound.relay_url);
+  return Object.assign(
+    () => {
+      const stored = readCredential(path);
+      if (!stored) throw new NotConnected();
+      if (stored.relay_url !== relay || stored.team !== bound.team) {
+        throw new NotConnected("you signed in to another relay or team since this started: restart it");
+      }
+      return stored.credential;
+    },
+    { kind: "credential", path }
+  );
+}
+function isCredentialProvider(p) {
+  return p.kind === "credential";
+}
+function connectionFromEnv(env, gcloud = {}) {
+  const explicitMode = configValue(env.RELAY_AUTH) !== void 0;
   const mode = authModeFromEnv(env);
-  if (mode === "token") return tokenProviderFromEnv(env);
-  if (mode === "metadata") return metadataTokenProvider({ audience: configValue(env.RELAY_URL) ?? "" });
-  const account = configValue(env.RELAY_GCLOUD_ACCOUNT);
-  return gcloudTokenProvider({ env, ...gcloud, ...account !== void 0 ? { account } : {} });
-}
-var LOOPBACK = /* @__PURE__ */ new Set(["localhost", "127.0.0.1", "[::1]", "::1"]);
-function parseRelayUrl(raw) {
-  if (!raw) throw new Error("RELAY_URL must be set");
-  let url;
-  try {
-    url = new URL(raw);
-  } catch {
-    throw new Error("RELAY_URL is not a valid URL");
+  if (mode === "credential") {
+    const path = credentialsPath(env);
+    const stored = readCredential(path);
+    if (!stored) throw new NotConnected();
+    const envUrl = configValue(env.RELAY_URL);
+    if (envUrl !== void 0) {
+      let same = false;
+      try {
+        same = normaliseRelayUrl(envUrl) === stored.relay_url;
+      } catch {
+        same = false;
+      }
+      if (!same) throw new Error("RELAY_URL is not the relay you signed in to: unset it, or run /team-relay:login <relay-url>");
+    }
+    const envTeam = configValue(env.RELAY_TEAM);
+    if (envTeam !== void 0 && envTeam !== stored.team) {
+      throw new Error("RELAY_TEAM is not the team you signed in to: unset it, or run /team-relay:login again");
+    }
+    return { mode, url: stored.relay_url, team: stored.team, member: stored.member, token: credentialTokenProvider(path, stored) };
   }
-  if (url.username || url.password) throw new Error("RELAY_URL must not carry credentials");
-  if (url.search || url.hash) throw new Error("RELAY_URL must not carry a query or fragment");
-  if (url.protocol === "https:") return url;
-  if (url.protocol === "http:" && LOOPBACK.has(url.hostname)) return url;
-  throw new Error("RELAY_URL must be https (plain http is allowed only to localhost)");
+  const team = configValue(env.RELAY_TEAM);
+  if (!team) {
+    if (!explicitMode) throw new NotConnected();
+    throw new Error("RELAY_TEAM must be set");
+  }
+  const url = configValue(env.RELAY_URL) ?? (mode === "google" ? defaultRelayUrl() : null) ?? "";
+  let token;
+  if (mode === "token") token = tokenProviderFromEnv(env);
+  else if (mode === "metadata") token = metadataTokenProvider({ audience: configValue(env.RELAY_URL) ?? "" });
+  else {
+    const account = configValue(env.RELAY_GCLOUD_ACCOUNT);
+    token = gcloudTokenProvider({ env, ...gcloud, ...account !== void 0 ? { account } : {} });
+  }
+  return { mode, url, team, token };
 }
 var ON_BEHALF_OF_RE = /^[a-z0-9._%+-]{1,64}@[a-z0-9.-]{1,253}$/;
 var defaultSleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -25315,6 +25574,10 @@ var RelayClient = class {
     this.sleep = opts.sleep ?? defaultSleep;
     this.random = opts.random ?? Math.random;
     this.userAgent = opts.userAgent ?? "team-relay-plugin/0.1.0";
+  }
+  /** The relay's base URL (without a trailing slash). */
+  get url() {
+    return this.base.toString().replace(/\/$/, "");
   }
   teamPath(...parts) {
     return ["v1", "teams", this.team, ...parts].map(encodeURIComponent).join("/");
@@ -25385,6 +25648,9 @@ var RelayClient = class {
           refreshed = true;
           this.token.invalidate();
           continue;
+        }
+        if (err instanceof RelayError && err.status === 401 && isCredentialProvider(this.token)) {
+          throw new RelayError(401, err.code, SIGN_IN_AGAIN);
         }
         if (attempt + 1 >= attempts || !isRetryable(err)) throw err;
         await this.sleep(backoffDelay(attempt, this.backoff, this.random));
@@ -25462,6 +25728,28 @@ var RelayClient = class {
       ...opts
     });
   }
+  /** M6-SPEC §2: the team's roster (owners see every email; members only their own). */
+  roster(opts) {
+    return this.call("GET", this.teamPath("roster"), void 0, opts);
+  }
+  /** M6-SPEC §2 (owners): add a member. Not idempotent, so sent once. */
+  addMember(body, opts) {
+    return this.call("POST", this.teamPath("roster"), body, { attempts: 1, ...opts });
+  }
+  /** M6-SPEC §2 (owners): add or remove one email, or change the role. Sent once. */
+  updateMember(member, body, opts) {
+    if (!MEMBER_RE.test(member)) throw new Error("invalid member id");
+    return this.call("PATCH", this.teamPath("roster", member), body, { attempts: 1, ...opts });
+  }
+  /** M6-SPEC §2 (owners): remove a member (their device credentials are revoked). Sent once. */
+  removeMember(member, opts) {
+    if (!MEMBER_RE.test(member)) throw new Error("invalid member id");
+    return this.call("DELETE", this.teamPath("roster", member), void 0, { attempts: 1, ...opts });
+  }
+  /** M5-SPEC §3: revoke the credential this client signs in with (logout). */
+  revokeSelf(opts) {
+    return this.call("DELETE", this.teamPath("credentials", "self"), void 0, { attempts: 1, ...opts });
+  }
   /** M2-SPEC §3.5: the team's activity feed. */
   activity(q = {}, opts) {
     const params = new URLSearchParams();
@@ -25472,14 +25760,302 @@ var RelayClient = class {
   }
 };
 function relayClientFromEnv(env, extra = {}) {
-  const team = configValue(env.RELAY_TEAM);
-  if (!team) throw new Error("RELAY_TEAM must be set");
-  return new RelayClient({ url: configValue(env.RELAY_URL) ?? "", team, token: credentialsFromEnv(env), ...extra });
+  const c = connectionFromEnv(env);
+  return new RelayClient({ url: c.url, team: c.team, token: c.token, ...extra });
+}
+
+// src/login.ts
+import { createHash, randomBytes as randomBytes2, timingSafeEqual } from "node:crypto";
+import { createServer } from "node:http";
+import { hostname } from "node:os";
+
+// src/console-open.ts
+import { execFile as execFile2 } from "node:child_process";
+import { chmodSync as chmodSync2, mkdtempSync, rmSync as rmSync2, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { isAbsolute as isAbsolute2, join as join2 } from "node:path";
+var REDIRECT_TTL_MS = 1e4;
+var REDIRECT_FILE = "console.html";
+var defaultRun = (command, args, done) => {
+  execFile2(command, args, { shell: false, timeout: 1e4 }, (err) => done(err));
+};
+function escapeHtml(text) {
+  return text.replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
+}
+function redirectHtml(url, title = "Team console") {
+  const u = escapeHtml(url);
+  const t = escapeHtml(title);
+  return [
+    "<!doctype html>",
+    '<html lang="en"><head><meta charset="utf-8">',
+    '<meta name="referrer" content="no-referrer">',
+    `<meta http-equiv="refresh" content="0;url=${u}">`,
+    `<title>${t}</title></head>`,
+    `<body><p><a href="${u}">${t}</a></p></body></html>`,
+    ""
+  ].join("\n");
+}
+function openerFor(platform, env = process.env) {
+  const custom2 = env.TEAM_RELAY_OPEN_COMMAND?.trim();
+  if (custom2) return isAbsolute2(custom2) ? custom2 : null;
+  if (platform === "darwin") return "open";
+  if (platform === "linux") return "xdg-open";
+  return null;
+}
+function openInBrowser(url, opts) {
+  const what = opts.what ?? "the URL above";
+  const opener = opts.opener ?? openerFor(opts.platform ?? process.platform);
+  if (!opener) {
+    opts.log(`no browser opener on this platform; open ${what} yourself`);
+    return null;
+  }
+  let dir;
+  try {
+    dir = mkdtempSync(join2(opts.tmpRoot ?? tmpdir(), "team-relay-console-"));
+    chmodSync2(dir, 448);
+  } catch {
+    opts.log(`could not prepare the browser hand-off; open ${what} yourself`);
+    return null;
+  }
+  const cleanup = () => rmSync2(dir, { recursive: true, force: true });
+  const file = join2(dir, REDIRECT_FILE);
+  try {
+    writeFileSync(file, redirectHtml(url, opts.title), { mode: 384, flag: "wx" });
+  } catch {
+    cleanup();
+    opts.log(`could not prepare the browser hand-off; open ${what} yourself`);
+    return null;
+  }
+  process.once("exit", cleanup);
+  setTimeout(() => {
+    process.removeListener("exit", cleanup);
+    cleanup();
+  }, opts.deleteAfterMs ?? REDIRECT_TTL_MS).unref();
+  (opts.run ?? defaultRun)(opener, [file], (err) => {
+    if (err) opts.log(`could not open a browser (${opener}); open ${what} yourself`);
+  });
+  return file;
+}
+
+// src/login.ts
+var LOGIN_TIMEOUT_MS = 5 * 6e4;
+var DEVICE_RE = /^[A-Za-z0-9 ._()-]{1,64}$/;
+var CODE_RE = /^[A-Za-z0-9_-]{16,256}$/;
+var STATE_RE = /^[A-Za-z0-9_-]{43}$/;
+var TOKEN_RESPONSE_LIMIT = 16 * 1024;
+function base64url2(buf) {
+  return buf.toString("base64url");
+}
+function codeChallenge(verifier) {
+  return base64url2(createHash("sha256").update(verifier, "ascii").digest());
+}
+function deviceLabel(host = hostname()) {
+  const clean = host.split(".")[0].replace(/[^A-Za-z0-9._()-]/g, "-").replace(/^-+|-+$/g, "");
+  const label = `Claude Code on ${clean || "this computer"}`.slice(0, 64).trimEnd();
+  return DEVICE_RE.test(label) ? label : "Claude Code";
+}
+function sameSecret(a, b) {
+  const ha = createHash("sha256").update(a, "utf8").digest();
+  const hb = createHash("sha256").update(b, "utf8").digest();
+  return timingSafeEqual(ha, hb);
+}
+var PAGE_CSP = "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
+function page(title, text) {
+  return [
+    "<!doctype html>",
+    '<html lang="en"><head><meta charset="utf-8">',
+    '<meta name="viewport" content="width=device-width, initial-scale=1">',
+    '<meta name="referrer" content="no-referrer">',
+    `<title>${title}</title>`,
+    "<style>body{font:15px/1.5 system-ui,sans-serif;margin:0;display:grid;place-items:center;min-height:100vh;background:#f7f7f5;color:#1c1c1a}",
+    "main{max-width:26rem;padding:1.5rem 1.75rem;border:1px solid #e3e2de;border-radius:12px;background:#fff}",
+    "h1{font-size:16px;margin:0 0 .4rem}p{margin:0;color:#5c5b57}",
+    "@media (prefers-color-scheme:dark){body{background:#151514;color:#ecebe7}main{background:#1d1d1b;border-color:#2e2e2b}p{color:#a3a29c}}</style>",
+    `</head><body><main><h1>${title}</h1><p>${text}</p></main></body></html>`,
+    ""
+  ].join("\n");
+}
+function respond(res, status, body) {
+  res.writeHead(status, {
+    "Content-Type": "text/html; charset=utf-8",
+    "Content-Length": String(Buffer.byteLength(body)),
+    "Content-Security-Policy": PAGE_CSP,
+    "Cache-Control": "no-store",
+    "Referrer-Policy": "no-referrer",
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    Connection: "close"
+  });
+  res.end(body);
+}
+var LoginError = class extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "LoginError";
+  }
+};
+async function startLogin(opts) {
+  const log2 = opts.log ?? (() => {
+  });
+  const relay = parseRelayUrl(opts.relayUrl);
+  const relayNorm = normaliseRelayUrl(opts.relayUrl);
+  const base = new URL(relay.toString());
+  if (!base.pathname.endsWith("/")) base.pathname += "/";
+  const device = opts.device ?? deviceLabel();
+  if (!DEVICE_RE.test(device)) throw new LoginError("the device label is not valid");
+  const verifier = base64url2(randomBytes2(48));
+  const state = base64url2(randomBytes2(32));
+  const challenge = codeChallenge(verifier);
+  const doFetch = opts.fetch ?? ((u, i) => fetch(u, i));
+  let settle2;
+  const done = new Promise((resolve, reject) => {
+    settle2 = { resolve, reject };
+  });
+  done.catch(() => {
+  });
+  let finished = false;
+  let timer = null;
+  let server = null;
+  const shut = () => {
+    if (timer) clearTimeout(timer);
+    timer = null;
+    if (server) {
+      server.close();
+      server.closeAllConnections();
+    }
+  };
+  const fail2 = (message) => {
+    if (finished) return;
+    finished = true;
+    shut();
+    settle2.reject(new LoginError(message));
+  };
+  const succeed = (v) => {
+    if (finished) return;
+    finished = true;
+    shut();
+    settle2.resolve(v);
+  };
+  let port = 0;
+  let used = false;
+  const exchange = async (code) => {
+    let res;
+    try {
+      res = await doFetch(new URL("v1/login/token", base).toString(), {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Accept: "application/json", "User-Agent": "team-relay-plugin/0.1.0" },
+        body: JSON.stringify({ code, code_verifier: verifier }),
+        redirect: "error",
+        signal: AbortSignal.timeout(3e4)
+      });
+    } catch {
+      return fail2("the relay did not answer the sign-in; run /team-relay:login again");
+    }
+    const text = await res.text().catch(() => "");
+    if (!res.ok) {
+      let code18 = `http_${res.status}`;
+      try {
+        const j = JSON.parse(text);
+        if (typeof j.error === "string" && /^[a-z_]{1,40}$/.test(j.error)) code18 = j.error;
+      } catch {
+      }
+      return fail2(`the relay refused the sign-in (${res.status} ${code18}); run /team-relay:login again`);
+    }
+    if (text.length > TOKEN_RESPONSE_LIMIT) return fail2("the relay answered the sign-in with something unexpected");
+    let body;
+    try {
+      body = JSON.parse(text);
+    } catch {
+      return fail2("the relay answered the sign-in with something that is not JSON");
+    }
+    const { credential, team, member, relay_url, expires_at } = body;
+    if (typeof credential !== "string" || !CREDENTIAL_RE.test(credential)) return fail2("the relay did not return a device credential");
+    if (typeof team !== "string" || !TEAM_RE.test(team)) return fail2("the relay did not return a valid team");
+    if (typeof member !== "string" || !MEMBER_RE.test(member)) return fail2("the relay did not return a valid member id");
+    if (relay_url !== void 0 && relay_url !== null) {
+      let same = false;
+      try {
+        same = typeof relay_url === "string" && normaliseRelayUrl(relay_url) === relayNorm;
+      } catch {
+        same = false;
+      }
+      if (!same) return fail2("the relay named a different relay URL than the one you signed in to; nothing was stored");
+    }
+    const stored = {
+      relay_url: relayNorm,
+      team,
+      member,
+      credential,
+      expires_at: typeof expires_at === "string" ? expires_at : null
+    };
+    try {
+      writeCredential(opts.credentialsFile, stored);
+    } catch (err) {
+      return fail2(`signed in, but the credential could not be stored: ${err.message}`);
+    }
+    succeed(stored);
+  };
+  const handle = (req, res) => {
+    req.resume();
+    if (used || finished) {
+      respond(res, 410, page("Sign-in link used", "This sign-in has finished. You can close this tab."));
+      return;
+    }
+    used = true;
+    const bad = (why, logLine) => {
+      respond(res, 400, page("Sign-in did not complete", `${why} Run /team-relay:login again in Claude Code.`));
+      log2(logLine);
+      fail2(`the sign-in did not complete (${logLine}); run /team-relay:login again`);
+    };
+    const host = req.headers.host;
+    if (host !== `127.0.0.1:${port}`) return bad("This page was reached under an unexpected address.", "unexpected Host on the callback");
+    let url2;
+    try {
+      url2 = new URL(req.url ?? "/", `http://127.0.0.1:${port}`);
+    } catch {
+      return bad("The sign-in answer could not be read.", "unreadable callback");
+    }
+    if (req.method !== "GET" || url2.pathname !== "/callback") return bad("The sign-in answer came to the wrong place.", "not GET /callback");
+    const codes = url2.searchParams.getAll("code");
+    const states = url2.searchParams.getAll("state");
+    if (states.length !== 1 || !STATE_RE.test(states[0]) || !sameSecret(states[0], state)) {
+      return bad("This answer does not belong to the sign-in Claude Code started.", "state mismatch");
+    }
+    if (codes.length !== 1 || !CODE_RE.test(codes[0])) return bad("The sign-in answer carried no code.", "no code");
+    respond(res, 200, page("Connected", "Connected. You can close this tab."));
+    void exchange(codes[0]);
+  };
+  server = createServer(handle);
+  server.requestTimeout = 3e4;
+  server.headersTimeout = 1e4;
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => {
+      server.off("error", reject);
+      resolve();
+    });
+  });
+  port = server.address().port;
+  const start = new URL("v1/login/start", base);
+  start.searchParams.set("port", String(port));
+  start.searchParams.set("state", state);
+  start.searchParams.set("code_challenge", challenge);
+  start.searchParams.set("code_challenge_method", "S256");
+  start.searchParams.set("device", device);
+  const url = start.toString();
+  timer = setTimeout(() => fail2("the sign-in timed out after 5 minutes; run /team-relay:login again"), opts.timeoutMs ?? LOGIN_TIMEOUT_MS);
+  timer.unref?.();
+  try {
+    (opts.open ?? ((u) => void openInBrowser(u, { log: log2, title: "Team relay sign-in", what: "the sign-in link" })))(url);
+  } catch {
+    log2("could not open a browser; open the sign-in link yourself");
+  }
+  return { url, port, done, cancel: () => fail2("the sign-in was cancelled") };
 }
 
 // src/notify.ts
 var DATA_JSON_LIMIT = 16 * 1024;
-var RFC3339 = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,9})?(Z|[+-]\d{2}:\d{2})$/;
+var RFC33392 = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,9})?(Z|[+-]\d{2}:\d{2})$/;
 var CAPABILITY_RE = /^[a-z][a-z0-9_]{1,62}$/;
 var STREAM_TYPES = {
   inbox: /* @__PURE__ */ new Set(["question", "capability_call"]),
@@ -25526,7 +26102,7 @@ function envelopeToNotification(env, expect) {
       const question = str(data.question);
       const ackDeadline = str(data.ack_deadline) ?? "";
       if (question === void 0) return { reject: "question without text" };
-      if (!RFC3339.test(ackDeadline)) return { reject: "bad ack_deadline" };
+      if (!RFC33392.test(ackDeadline)) return { reject: "bad ack_deadline" };
       return {
         content: neutraliseChannelTags(question),
         meta: { ...base, from, ack_deadline: ackDeadline, broadcast: env.broadcast === true ? "true" : "false" }
@@ -25537,7 +26113,7 @@ function envelopeToNotification(env, expect) {
       const capability = str(data.capability) ?? "";
       const ackDeadline = str(data.ack_deadline) ?? "";
       if (!CAPABILITY_RE.test(capability)) return { reject: "bad capability name" };
-      if (!RFC3339.test(ackDeadline)) return { reject: "bad ack_deadline" };
+      if (!RFC33392.test(ackDeadline)) return { reject: "bad ack_deadline" };
       const params = typeof data.params === "object" && data.params !== null ? data.params : {};
       return {
         content: neutraliseChannelTags(`${from} asks you to run ${capability} with ${JSON.stringify(params)}`),
@@ -25597,7 +26173,7 @@ var RecentIds = class {
 // src/manifest.ts
 var import_yaml = __toESM(require_dist2(), 1);
 var import__ = __toESM(require__(), 1);
-import { readFileSync as readFileSync2 } from "node:fs";
+import { readFileSync as readFileSync4 } from "node:fs";
 
 // node_modules/.pnpm/re2js@2.8.6/node_modules/re2js/build/index.js
 var RE2Flags = class RE2Flags2 {
@@ -32196,7 +32772,7 @@ function parseManifest(text) {
   return validateManifest(doc);
 }
 function loadManifest(path) {
-  return parseManifest(readFileSync2(path, "utf8"));
+  return parseManifest(readFileSync4(path, "utf8"));
 }
 function isPlainObject3(v) {
   return typeof v === "object" && v !== null && !Array.isArray(v);
@@ -32264,16 +32840,16 @@ function findCapability(manifest, name) {
 
 // src/exposed.ts
 import { statSync, accessSync, constants } from "node:fs";
-import { isAbsolute } from "node:path";
-import { fileURLToPath } from "node:url";
+import { isAbsolute as isAbsolute3 } from "node:path";
+import { fileURLToPath as fileURLToPath2 } from "node:url";
 function envKey(name) {
   return name.toUpperCase();
 }
 function defaultManifestPath() {
-  return fileURLToPath(new URL("../manifest.yaml", import.meta.url));
+  return fileURLToPath2(new URL("../manifest.yaml", import.meta.url));
 }
 function runnerProblem(path) {
-  if (!isAbsolute(path)) return "runner path must be absolute";
+  if (!isAbsolute3(path)) return "runner path must be absolute";
   let st;
   try {
     st = statSync(path);
@@ -32348,21 +32924,21 @@ function makeLogger(component) {
 }
 
 // src/active.ts
-import { randomBytes } from "node:crypto";
-import { mkdirSync, readFileSync as readFileSync3, renameSync, rmSync, writeFileSync } from "node:fs";
-import { isAbsolute as isAbsolute2, join } from "node:path";
+import { randomBytes as randomBytes3 } from "node:crypto";
+import { mkdirSync as mkdirSync2, readFileSync as readFileSync5, renameSync as renameSync2, rmSync as rmSync3, writeFileSync as writeFileSync2 } from "node:fs";
+import { isAbsolute as isAbsolute4, join as join3 } from "node:path";
 var ACTIVE_FILE = "active.json";
 var MAX_OPEN = 50;
 var READ_LIMIT = 64 * 1024;
-var RFC33392 = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,9})?(Z|[+-]\d{2}:\d{2})$/;
+var RFC33393 = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,9})?(Z|[+-]\d{2}:\d{2})$/;
 function deadlineOf(value) {
-  if (typeof value !== "string" || value.length > 40 || !RFC33392.test(value)) return null;
+  if (typeof value !== "string" || value.length > 40 || !RFC33393.test(value)) return null;
   return Number.isFinite(Date.parse(value)) ? value : null;
 }
 function readActive(stateDir, now = Date.now()) {
   let raw;
   try {
-    raw = readFileSync3(join(stateDir, ACTIVE_FILE), "utf8");
+    raw = readFileSync5(join3(stateDir, ACTIVE_FILE), "utf8");
   } catch {
     return [];
   }
@@ -32381,13 +32957,13 @@ function readActive(stateDir, now = Date.now()) {
 }
 function writeActiveAtomic(stateDir, open2) {
   const body = { version: 1, open: open2.slice(-MAX_OPEN) };
-  const tmp = join(stateDir, `.${ACTIVE_FILE}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`);
+  const tmp = join3(stateDir, `.${ACTIVE_FILE}.${process.pid}.${randomBytes3(6).toString("hex")}.tmp`);
   try {
-    writeFileSync(tmp, `${JSON.stringify(body)}
+    writeFileSync2(tmp, `${JSON.stringify(body)}
 `, { mode: 384, flag: "wx" });
-    renameSync(tmp, join(stateDir, ACTIVE_FILE));
+    renameSync2(tmp, join3(stateDir, ACTIVE_FILE));
   } catch (err) {
-    rmSync(tmp, { force: true });
+    rmSync3(tmp, { force: true });
     throw err;
   }
 }
@@ -32396,8 +32972,8 @@ var ActiveRequests = class {
   }) {
     this.stateDir = stateDir;
     this.onError = onError;
-    if (!isAbsolute2(stateDir)) throw new Error("ANSWERER_STATE_DIR must be an absolute path");
-    mkdirSync(stateDir, { recursive: true, mode: 448 });
+    if (!isAbsolute4(stateDir)) throw new Error("ANSWERER_STATE_DIR must be an absolute path");
+    mkdirSync2(stateDir, { recursive: true, mode: 448 });
   }
   stateDir;
   onError;
@@ -32772,15 +33348,15 @@ var Stopper = class {
   }
 };
 async function streamLoop(server, client, me, stream, stopper, onPushed = () => {
-}) {
+}, onUnauthorized) {
   const recent = new RecentIds(500);
   let failures = 0;
   while (!stopper.stopped) {
     const started = Date.now();
     try {
-      const page = await client.readStream(stream, { wait: 25, limit: 50 }, { attempts: 1, signal: stopper.signal });
+      const page2 = await client.readStream(stream, { wait: 25, limit: 50 }, { attempts: 1, signal: stopper.signal });
       failures = 0;
-      for (const envelope of page.messages) {
+      for (const envelope of page2.messages) {
         if (stopper.stopped) return;
         if (recent.has(envelope.id)) {
           log(`suppressed duplicate ${envelope.id} (seq ${envelope.seq})`);
@@ -32796,9 +33372,14 @@ async function streamLoop(server, client, me, stream, stopper, onPushed = () => 
         }
         await client.ackCursor(stream, envelope.seq, { attempts: 1, signal: stopper.signal });
       }
-      if (page.messages.length === 0 && Date.now() - started < 1e3) await stopper.sleep(1e3);
+      if (page2.messages.length === 0 && Date.now() - started < 1e3) await stopper.sleep(1e3);
     } catch (err) {
       if (stopper.stopped) return;
+      if (err instanceof RelayError && err.status === 401 && onUnauthorized) {
+        log(`the relay refused this session's sign-in (401): ${SIGN_IN_AGAIN}`);
+        onUnauthorized();
+        return;
+      }
       if (err instanceof RelayError && err.status === 401) {
         log("the relay rejected the token (401); retrying in 60 s");
         failures = 0;
@@ -32811,35 +33392,327 @@ async function streamLoop(server, client, me, stream, stopper, onPushed = () => 
     }
   }
 }
+var SESSION_TOOLS = [
+  {
+    name: "login",
+    description: "Sign in to the team relay (/team-relay:login). Opens the browser on the relay, where you sign in with Google and pick your team. Returns at once with the sign-in URL (show it to the user in case no browser opened); a status event on this channel says when the sign-in completes.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        relay_url: { type: "string", description: "Optional: another team relay's base URL (https). Default: the plugin's relay." }
+      },
+      additionalProperties: false
+    }
+  },
+  {
+    name: "logout",
+    description: "Sign out of the team relay on this computer: revokes this device credential at the relay and deletes it here.",
+    inputSchema: { type: "object", properties: {}, additionalProperties: false }
+  },
+  {
+    name: "whoami",
+    description: "Show whether this session is connected to the team relay, and as whom (relay, team, member).",
+    inputSchema: { type: "object", properties: {}, additionalProperties: false }
+  }
+];
+var STATUS_NOTE = 'type="status" events come from this plugin itself (never from a teammate) and say whether you are signed in.';
+var AskerConnection = class {
+  constructor(env, server) {
+    this.env = env;
+    this.server = server;
+    this.path = credentialsPath(env);
+  }
+  env;
+  server;
+  live = null;
+  problem = null;
+  refusedAt = void 0;
+  lastLogged = "";
+  stopper = new Stopper();
+  wake = null;
+  failures = 0;
+  pending = null;
+  path;
+  current() {
+    return this.live ? { client: this.live.client, me: this.live.me } : null;
+  }
+  notConnected() {
+    if (this.refusedAt !== void 0) return `Not connected: ${SIGN_IN_AGAIN}`;
+    if (this.problem) return `Not connected: ${this.problem}`;
+    return "Not connected: run /team-relay:login";
+  }
+  note(line) {
+    if (line !== this.lastLogged) log(line);
+    this.lastLogged = line;
+  }
+  /** A status line pushed into the session: fixed text and id-shaped values only. */
+  async status(content) {
+    try {
+      await this.server.notification({ method: "notifications/claude/channel", params: { content, meta: { type: "status" } } });
+    } catch {
+    }
+  }
+  start() {
+    void this.watch().catch((err) => log(`connection watcher ended: ${describeError(err)}`));
+  }
+  stop() {
+    this.stopper.stop();
+    this.live?.stopper.stop();
+    this.pending?.cancel();
+  }
+  /** Look again now (after a login stored a credential, or a logout removed it). */
+  poke() {
+    this.wake?.();
+  }
+  sleep(ms) {
+    return new Promise((resolve) => {
+      const t = setTimeout(done, ms);
+      const self = this;
+      function done() {
+        clearTimeout(t);
+        self.wake = null;
+        resolve();
+      }
+      this.wake = done;
+      if (this.stopper.stopped) done();
+    });
+  }
+  disconnect(why) {
+    if (!this.live) return;
+    this.live.stopper.stop();
+    log(`disconnected (${why})`);
+    this.live = null;
+  }
+  async watch() {
+    while (!this.stopper.stopped) {
+      const fp = credentialFingerprint(this.path);
+      if (this.live) {
+        if (this.live.mode === "credential" && fp !== this.live.fingerprint) this.disconnect(fp === null ? "signed out" : "signed in again");
+        else {
+          await this.sleep(2e3);
+          continue;
+        }
+      }
+      if (this.refusedAt !== void 0 && fp === this.refusedAt) {
+        await this.sleep(2e3);
+        continue;
+      }
+      this.refusedAt = void 0;
+      const delay = await this.tryConnect(fp);
+      await this.sleep(delay);
+    }
+  }
+  /** One attempt; returns how long to wait before the next look. */
+  async tryConnect(fp) {
+    let c;
+    try {
+      c = connectionFromEnv(this.env);
+    } catch (err) {
+      this.problem = err instanceof NotConnected ? null : describeError(err);
+      this.note(err instanceof NotConnected ? "not connected: waiting for /team-relay:login" : `not connected: ${describeError(err)}`);
+      return 2e3;
+    }
+    let client;
+    try {
+      client = new RelayClient({ url: c.url, team: c.team, token: c.token });
+    } catch (err) {
+      this.problem = describeError(err);
+      this.note(`not connected: ${this.problem}`);
+      return 2e3;
+    }
+    let me;
+    try {
+      me = await client.me({ attempts: 1, timeoutMs: 15e3 });
+    } catch (err) {
+      if (err instanceof RelayError && err.status === 401 && c.mode === "credential") {
+        this.refusedAt = fp;
+        this.problem = null;
+        this.note(`not connected: ${SIGN_IN_AGAIN}`);
+        return 2e3;
+      }
+      this.problem = `the relay did not answer (${describeError(err)})`;
+      this.note(`not connected yet: ${this.problem}; trying again`);
+      return backoffDelay(this.failures++, { baseMs: 2e3, maxMs: 6e4 });
+    }
+    if (me.team !== client.team || !MEMBER_RE.test(me.member)) {
+      this.problem = "the relay answered for a different team";
+      this.note(`not connected: ${this.problem}`);
+      return 6e4;
+    }
+    this.failures = 0;
+    this.problem = null;
+    const stopper = new Stopper();
+    this.live = { client, me, stopper, fingerprint: fp, mode: c.mode };
+    this.lastLogged = "";
+    log(`asker for ${me.member} in team ${me.team}`);
+    const onUnauthorized = c.mode === "credential" ? () => {
+      this.refusedAt = fp;
+      this.disconnect("the relay refused the sign-in");
+      void this.status(`team-relay: not connected: ${SIGN_IN_AGAIN}.`);
+      this.poke();
+    } : void 0;
+    void streamLoop(this.server, client, me, "replies", stopper, void 0, onUnauthorized).catch(
+      (err) => log(`stream loop ended: ${describeError(err)}`)
+    );
+    return 2e3;
+  }
+  // -- the tools ------------------------------------------------------------------------
+  async login(args) {
+    const bad = unknownKey(args, ["relay_url"]);
+    if (bad) return toolError(`unknown argument: ${bad}`);
+    let relayUrl;
+    if (args.relay_url !== void 0 && args.relay_url !== null && args.relay_url !== "") {
+      if (typeof args.relay_url !== "string" || args.relay_url.length > 512) return toolError("relay_url must be a URL");
+      relayUrl = args.relay_url.trim();
+    } else {
+      relayUrl = configValue(this.env.RELAY_URL) ?? defaultRelayUrl() ?? void 0;
+    }
+    if (!relayUrl) return toolError("no relay URL: pass one, as in /team-relay:login https://relay.example.com");
+    try {
+      parseRelayUrl(relayUrl);
+    } catch (err) {
+      return toolError(describeError(err));
+    }
+    this.pending?.cancel();
+    let flow;
+    try {
+      flow = await startLogin({ relayUrl, credentialsFile: this.path, log });
+    } catch (err) {
+      return toolError(`could not start the sign-in: ${describeError(err)}`);
+    }
+    this.pending = flow;
+    flow.done.then(
+      (stored) => {
+        if (this.pending === flow) this.pending = null;
+        log(`signed in as ${stored.member} in team ${stored.team}`);
+        this.poke();
+        void this.status(`team-relay: signed in as ${stored.member} in team ${stored.team}. Teammate tools are ready.`);
+      },
+      (err) => {
+        if (this.pending === flow) this.pending = null;
+        const why = describeError(err);
+        log(`sign-in ended: ${why}`);
+        if (!/cancelled/.test(why)) void this.status(`team-relay: the sign-in did not complete: ${why}.`);
+      }
+    );
+    const envMode = configValue(this.env.RELAY_AUTH);
+    return toolJson({
+      status: "waiting_for_browser",
+      sign_in_url: flow.url,
+      expires_in_seconds: 300,
+      next: "A browser tab should have opened on the relay: sign in with Google there and choose the team. If none opened, open sign_in_url yourself. A status event on this channel says when it is done (or call whoami).",
+      ...envMode && envMode !== "credential" ? { note: `this session signs in with RELAY_AUTH=${envMode} from its environment; restart Claude Code without it to use the new sign-in` } : {}
+    });
+  }
+  async logout(args) {
+    const bad = unknownKey(args, []);
+    if (bad) return toolError(`unknown argument: ${bad}`);
+    this.pending?.cancel();
+    this.pending = null;
+    let stored;
+    try {
+      stored = readCredential(this.path);
+    } catch (err) {
+      removeCredential(this.path);
+      this.disconnect("signed out");
+      this.poke();
+      return toolJson({ signed_out: true, revoked: false, note: `the stored credential could not be read (${describeError(err)}); it was deleted` });
+    }
+    if (!stored) return toolJson({ signed_out: false, note: "not signed in on this computer" });
+    let revoked = false;
+    let note;
+    try {
+      const client = new RelayClient({ url: stored.relay_url, team: stored.team, token: () => stored.credential, attempts: 1, timeoutMs: 1e4 });
+      await client.revokeSelf();
+      revoked = true;
+    } catch (err) {
+      if (err instanceof RelayError && (err.status === 401 || err.status === 404)) {
+        revoked = true;
+        note = "the relay no longer accepted this credential";
+      } else note = `the relay was not reached (${describeError(err)}); the credential was deleted here and expires on its own`;
+    }
+    removeCredential(this.path);
+    this.disconnect("signed out");
+    this.poke();
+    return toolJson({ signed_out: true, revoked, team: stored.team, member: stored.member, ...note ? { note } : {} });
+  }
+  async whoami(args) {
+    const bad = unknownKey(args, []);
+    if (bad) return toolError(`unknown argument: ${bad}`);
+    if (this.live) {
+      let expires = null;
+      if (this.live.mode === "credential") {
+        try {
+          expires = readCredential(this.path)?.expires_at ?? null;
+        } catch {
+          expires = null;
+        }
+      }
+      return toolJson({
+        connected: true,
+        relay_url: this.live.client.url,
+        team: this.live.me.team,
+        member: this.live.me.member,
+        teammates: this.live.me.teammates.filter((m) => MEMBER_RE.test(m)),
+        signed_in_with: SIGNED_IN_WITH[this.live.mode],
+        ...expires ? { credential_expires_at: expires } : {}
+      });
+    }
+    return toolJson({
+      connected: false,
+      message: this.notConnected(),
+      ...this.pending ? { sign_in_pending: true, sign_in_url: this.pending.url } : {}
+    });
+  }
+};
+var SIGNED_IN_WITH = {
+  credential: "device credential (/team-relay:login)",
+  google: "gcloud identity",
+  token: "static development token",
+  metadata: "service account"
+};
 function fail(message) {
   log(message);
   process.exit(1);
+}
+function usesStoredSignIn(env) {
+  try {
+    return connectionFromEnv(env).mode === "credential";
+  } catch (err) {
+    if (err instanceof NotConnected || err instanceof CredentialFileError) return true;
+    return false;
+  }
 }
 async function main() {
   const env = process.env;
   const role = env.RELAY_ROLE;
   if (role !== "asker" && role !== "answerer") fail('RELAY_ROLE must be "asker" or "answerer"');
-  let client;
-  try {
-    client = relayClientFromEnv(env);
-  } catch (err) {
-    fail(`configuration error: ${describeError(err)}`);
+  const waiting = role === "asker" && usesStoredSignIn(env);
+  let fixed = null;
+  if (!waiting) {
+    let client;
+    try {
+      client = relayClientFromEnv(env);
+    } catch (err) {
+      fail(`configuration error: ${describeError(err)}`);
+    }
+    let me;
+    try {
+      me = await client.me({ attempts: 2 });
+    } catch (err) {
+      fail(`cannot start: GET /me failed (${describeError(err)}). Check RELAY_URL, RELAY_TEAM and the token.`);
+    }
+    if (me.team !== client.team || !MEMBER_RE.test(me.member)) fail("cannot start: the relay answered for a different team");
+    log(`${role} for ${me.member} in team ${me.team}`);
+    fixed = { client, me };
   }
-  let me;
-  try {
-    me = await client.me({ attempts: 2 });
-  } catch (err) {
-    fail(`cannot start: GET /me failed (${describeError(err)}). Check RELAY_URL, RELAY_TEAM and the token.`);
-  }
-  if (me.team !== client.team || !MEMBER_RE.test(me.member)) fail("cannot start: the relay answered for a different team");
-  log(`${role} for ${me.member} in team ${me.team}`);
-  if (role === "answerer") {
+  if (role === "answerer" && fixed) {
     try {
       const manifest = loadManifest(env.MANIFEST_PATH || defaultManifestPath());
       const { exposed, skipped } = exposedCapabilities(manifest, env);
       for (const s of skipped) log(`capability ${s.name} not offered: ${s.reason}`);
       const payload = validateManifest(discoveryPayload(exposed, sharesFromEnv(env.ANSWERER_SHARES)));
-      const res = await client.publishManifest(me.member, payload);
+      const res = await fixed.client.publishManifest(fixed.me.member, payload);
       log(`published capabilities: ${res.capabilities.join(", ") || "(none)"}`);
       log(`published shared folders: ${(payload.shares ?? []).map((x) => x.name).join(", ") || "(none)"}`);
     } catch (err) {
@@ -32861,10 +33734,12 @@ async function main() {
     { name: "relay", version: VERSION },
     {
       capabilities: { experimental: { "claude/channel": {} }, tools: {} },
-      instructions: instructionsFor(role)
+      instructions: role === "asker" ? `${instructionsFor(role)} ${STATUS_NOTE}` : instructionsFor(role)
     }
   );
-  const tools = role === "asker" ? ASKER_TOOLS : ANSWERER_TOOLS;
+  const connection = role === "asker" ? new AskerConnection(env, server) : null;
+  const liveNow = () => fixed ?? connection?.current() ?? null;
+  const tools = role === "asker" ? [...ASKER_TOOLS, ...SESSION_TOOLS] : ANSWERER_TOOLS;
   server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: tools.map((t) => ({ ...t })) }));
   server.setRequestHandler(CallToolRequestSchema, async (req) => {
     const name = req.params.name;
@@ -32872,22 +33747,34 @@ async function main() {
     if (!isPlainObject4(args)) return toolError("arguments must be an object");
     try {
       if (role === "asker") {
+        if (name === "login" || name === "logout" || name === "whoami") {
+          if (!connection) {
+            if (name === "whoami" && fixed) {
+              return toolJson({ connected: true, team: fixed.me.team, member: fixed.me.member, relay_url: fixed.client.url, signed_in_with: "the environment (RELAY_AUTH)" });
+            }
+            return toolError("this session signs in with RELAY_AUTH from its environment; unset it and restart Claude Code to use /team-relay:login");
+          }
+          return name === "login" ? await connection.login(args) : name === "logout" ? await connection.logout(args) : await connection.whoami(args);
+        }
+        const live = liveNow();
+        const known = ["list_teammates", "ask_question", "invoke_capability", "request_status"];
+        if (!live) return known.includes(name) ? toolError(connection?.notConnected() ?? "Not connected: run /team-relay:login") : toolError(`unknown tool: ${name}`);
         switch (name) {
           case "list_teammates":
-            return await listTeammates(client);
+            return await listTeammates(live.client);
           case "ask_question":
-            return await askQuestion(client, args);
+            return await askQuestion(live.client, args);
           case "invoke_capability":
-            return await invokeCapability(client, args);
+            return await invokeCapability(live.client, args);
           case "request_status":
-            return await requestStatus(client, args);
+            return await requestStatus(live.client, args);
         }
-      } else {
+      } else if (fixed) {
         switch (name) {
           case "ack_question":
-            return await ackQuestion(client, args, active, deadlines);
+            return await ackQuestion(fixed.client, args, active, deadlines);
           case "reply":
-            return await reply(client, args, active);
+            return await reply(fixed.client, args, active);
         }
       }
       return toolError(`unknown tool: ${name}`);
@@ -32896,15 +33783,21 @@ async function main() {
     }
   });
   const stopper = new Stopper();
-  const stream = role === "asker" ? "replies" : "inbox";
   let loop;
   server.oninitialized = () => {
+    if (connection) {
+      connection.start();
+      return;
+    }
+    if (!fixed) return;
     const onPushed = (e) => deadlines.remember(e.request_id, e.data?.answer_deadline);
-    loop ??= streamLoop(server, client, me, stream, stopper, onPushed).catch((err) => log(`stream loop ended: ${describeError(err)}`));
+    const stream = role === "asker" ? "replies" : "inbox";
+    loop ??= streamLoop(server, fixed.client, fixed.me, stream, stopper, onPushed).catch((err) => log(`stream loop ended: ${describeError(err)}`));
   };
   const shutdown = () => {
     if (stopper.stopped) return;
     stopper.stop();
+    connection?.stop();
     void server.close().finally(() => process.exit(0));
     setTimeout(() => process.exit(0), 2e3).unref();
   };

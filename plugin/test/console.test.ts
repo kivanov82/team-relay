@@ -786,7 +786,7 @@ describe('--open (M2-SPEC §7.7): the key never appears in a process argument', 
     const logs: string[] = [];
     expect(openInBrowser(URL_WITH_KEY, { log: (m) => logs.push(m), platform: 'win32', tmpRoot, run })).toBeNull();
     expect(calls).toHaveLength(1);
-    expect(logs.join('')).toMatch(/not supported/);
+    expect(logs.join('')).toMatch(/no browser opener on this platform/);
   });
 
   it('deletes the file and its directory after 10 s', async () => {

@@ -8,6 +8,7 @@ export default defineConfig({
     include: ['test/e2e/**/*.test.ts'],
     // One set of member processes per stream: never two files at once.
     fileParallelism: false,
+    setupFiles: ['test/helpers/isolate.ts'],
     testTimeout: 60_000,
     hookTimeout: 30_000,
   },

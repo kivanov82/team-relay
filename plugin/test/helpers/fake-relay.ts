@@ -3,7 +3,7 @@
 // validation (a created request stores its params as sent).
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import type { AddressInfo } from 'node:net';
 
 export const TOKENS: Record<string, string> = {
@@ -73,6 +73,32 @@ export class FakeRelay {
   onCursor: ((member: string, stream: string, seq: number) => Promise<void> | void) | null = null;
   private server: Server | null = null;
   url = '';
+
+  // --- M5-SPEC §2, §3: the login flow and device credentials, reduced ---------------------
+  /** The member a login mints a credential for (the fake provider approves at once). */
+  loginAs = 'alice';
+  /** When set, /v1/login/token answers with this status and error instead. */
+  loginRefusal: { status: number; error: string } | null = null;
+  /** When set, /v1/login/token names this relay_url instead of this relay's own. */
+  loginRelayUrl: string | null = null;
+  readonly logins = new Map<string, { challenge: string; state: string; port: number; device: string; member: string; used: boolean }>();
+  /** Device credentials: token → member (revoked ones are removed). */
+  readonly credentials = new Map<string, string>();
+  readonly revoked: string[] = [];
+
+  // --- M6-SPEC §1, §2: the roster, reduced ------------------------------------------------
+  readonly roster: Array<{ member: string; emails: string[]; role: 'owner' | 'member' }> = [
+    { member: 'alice', emails: ['alice@example.com'], role: 'owner' },
+    { member: 'bob', emails: ['bob@example.com'], role: 'member' },
+    { member: 'carol', emails: ['carol@example.com'], role: 'member' },
+  ];
+
+  /** Mint a device credential for `member` directly (as a completed login would). */
+  mintCredential(member: string): string {
+    const token = `trc_${randomBytes(32).toString('base64url')}`;
+    this.credentials.set(token, member);
+    return token;
+  }
 
   async start(): Promise<this> {
     this.server = createServer((req, res) => void this.handle(req, res));
@@ -176,7 +202,7 @@ export class FakeRelay {
     const url = new URL(req.url ?? '/', 'http://x');
     const auth = req.headers.authorization ?? '';
     const token = auth.startsWith('Bearer ') ? auth.slice(7) : '';
-    const member = TOKENS[token] ?? (token && this.authorize ? this.authorize(token) : null);
+    const member = TOKENS[token] ?? this.credentials.get(token) ?? (token && this.authorize ? this.authorize(token) : null);
     const { parsed, raw } = await this.readBody(req);
     const rec: Recorded = {
       method: req.method ?? 'GET',
@@ -197,6 +223,8 @@ export class FakeRelay {
       return this.send(res, fault.status, fault.body ?? { error: fault.status === 401 ? 'unauthenticated' : 'unavailable', detail: 'injected' });
     }
     if (url.pathname === '/healthz') return this.send(res, 200, { ok: true });
+    if (url.pathname === '/v1/login/start' && rec.method === 'GET') return this.loginStart(url, res);
+    if (url.pathname === '/v1/login/token' && rec.method === 'POST') return this.loginToken(rec, res);
     if (!member) return this.send(res, 401, { error: 'unauthenticated' });
 
     const parts = url.pathname.split('/').filter(Boolean).map(decodeURIComponent);
@@ -326,6 +354,89 @@ export class FakeRelay {
         });
       }
     }
+    if (rest[0] === 'credentials' && rest[1] === 'self' && rest.length === 2 && m === 'DELETE') {
+      if (!this.credentials.has(token)) return this.send(res, 404, { error: 'not_found' });
+      this.credentials.delete(token);
+      this.revoked.push(token);
+      return this.send(res, 200, { revoked: true });
+    }
+    if (rest[0] === 'roster') return this.rosterRoute(rest, m, member, body, res);
     return this.send(res, 404, { error: 'not_found' });
+  }
+
+  private rosterRoute(rest: string[], m: string, member: string, body: Record<string, unknown>, res: ServerResponse) {
+    const owner = this.roster.find((r) => r.member === member)?.role === 'owner';
+    if (m === 'GET' && rest.length === 1) {
+      return this.send(res, 200, {
+        members: this.roster.map((r) => ({
+          member: r.member,
+          emails: owner || r.member === member ? r.emails : r.emails.map(() => null),
+          role: r.role,
+          added_by: 'alice',
+          added_at: iso(-86_400_000),
+        })),
+      });
+    }
+    if (!owner) return this.send(res, 403, { error: 'forbidden', detail: 'owners only' });
+    if (m === 'POST' && rest.length === 1) {
+      const id = String(body.member);
+      const email = String(body.email).toLowerCase();
+      if (this.roster.some((r) => r.member === id || r.emails.includes(email))) return this.send(res, 409, { error: 'conflict', detail: 'member id or email taken' });
+      const entry = { member: id, emails: [email], role: (body.role === 'owner' ? 'owner' : 'member') as 'owner' | 'member' };
+      this.roster.push(entry);
+      return this.send(res, 201, { ...entry, added_by: member, added_at: iso() });
+    }
+    const target = this.roster.find((r) => r.member === rest[1]);
+    if (!target || rest.length !== 2) return this.send(res, 404, { error: 'not_found' });
+    if (m === 'PATCH') {
+      if (body.role === 'owner' || body.role === 'member') target.role = body.role;
+      if (typeof body.add_email === 'string') target.emails.push(body.add_email.toLowerCase());
+      if (typeof body.remove_email === 'string') target.emails = target.emails.filter((e) => e !== body.remove_email);
+      return this.send(res, 200, { ...target });
+    }
+    if (m === 'DELETE') {
+      if (target.role === 'owner' && this.roster.filter((r) => r.role === 'owner').length === 1) {
+        return this.send(res, 409, { error: 'last_owner', detail: 'a team needs an owner' });
+      }
+      this.roster.splice(this.roster.indexOf(target), 1);
+      for (const [t, who] of this.credentials) if (who === target.member) this.credentials.delete(t);
+      return this.send(res, 200, { removed: target.member });
+    }
+    return this.send(res, 405, { error: 'method_not_allowed' });
+  }
+
+  /** GET /v1/login/start: the fake provider approves at once and sends the browser home. */
+  private loginStart(url: URL, res: ServerResponse) {
+    const q = url.searchParams;
+    const port = Number(q.get('port'));
+    const state = q.get('state') ?? '';
+    const challenge = q.get('code_challenge') ?? '';
+    const device = q.get('device') ?? '';
+    if (!(port >= 1024 && port <= 65535) || !/^[A-Za-z0-9_-]{43}$/.test(state) || !/^[A-Za-z0-9_-]{43}$/.test(challenge) || q.get('code_challenge_method') !== 'S256' || !/^[A-Za-z0-9 ._()-]{1,64}$/.test(device)) {
+      return this.send(res, 400, { error: 'bad_request' });
+    }
+    const code = randomBytes(32).toString('base64url');
+    this.logins.set(code, { challenge, state, port, device, member: this.loginAs, used: false });
+    res.writeHead(303, { Location: `http://127.0.0.1:${port}/callback?code=${code}&state=${state}`, 'Content-Length': '0' });
+    res.end();
+  }
+
+  /** POST /v1/login/token: code unused and the verifier's S256 equal to the challenge. */
+  private loginToken(rec: Recorded, res: ServerResponse) {
+    if (this.loginRefusal) return this.send(res, this.loginRefusal.status, { error: this.loginRefusal.error });
+    const b = (rec.body ?? {}) as { code?: unknown; code_verifier?: unknown };
+    const login = typeof b.code === 'string' ? this.logins.get(b.code) : undefined;
+    if (!login || login.used || typeof b.code_verifier !== 'string') return this.send(res, 400, { error: 'invalid_grant' });
+    const s256 = createHash('sha256').update(b.code_verifier, 'ascii').digest('base64url');
+    if (s256 !== login.challenge) return this.send(res, 400, { error: 'invalid_grant' });
+    login.used = true;
+    const credential = this.mintCredential(login.member);
+    return this.send(res, 200, {
+      credential,
+      team: TEAM,
+      member: login.member,
+      relay_url: this.loginRelayUrl ?? this.url,
+      expires_at: iso(90 * 86_400_000),
+    });
   }
 }

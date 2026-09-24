@@ -57,9 +57,11 @@ export function toolEventFromPayload(payload: unknown): ToolEventBody | null {
 export type ToolEventConfig = {
   relay_url: string;
   relay_team: string;
-  relay_auth: 'google' | 'token';
+  relay_auth: 'credential' | 'google' | 'token';
   gcloud_account?: string;
   token_file?: string;
+  /** relay_auth credential (M5-SPEC §6): the credential file /team-relay:login stored. */
+  credentials_file?: string;
   state_dir: string;
 };
 
@@ -78,10 +80,14 @@ export function parseToolEventConfig(raw: unknown): ToolEventConfig {
   const state_dir = str('state_dir');
   const relay_auth = str('relay_auth') ?? 'google';
   if (!relay_url || !relay_team || !state_dir) throw new Error('config needs relay_url, relay_team and state_dir');
-  if (relay_auth !== 'google' && relay_auth !== 'token') throw new Error('config relay_auth must be google or token');
+  if (relay_auth !== 'credential' && relay_auth !== 'google' && relay_auth !== 'token') {
+    throw new Error('config relay_auth must be credential, google or token');
+  }
   const gcloud_account = str('gcloud_account');
   const token_file = str('token_file');
+  const credentials_file = str('credentials_file');
   if (relay_auth === 'token' && !token_file) throw new Error('config needs token_file when relay_auth is token');
+  if (relay_auth === 'credential' && !credentials_file) throw new Error('config needs credentials_file when relay_auth is credential');
   return {
     relay_url,
     relay_team,
@@ -89,5 +95,6 @@ export function parseToolEventConfig(raw: unknown): ToolEventConfig {
     state_dir,
     ...(gcloud_account !== undefined ? { gcloud_account } : {}),
     ...(token_file !== undefined ? { token_file } : {}),
+    ...(credentials_file !== undefined ? { credentials_file } : {}),
   };
 }

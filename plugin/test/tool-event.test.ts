@@ -6,11 +6,11 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { spawn, spawnSync } from 'node:child_process';
 import { createServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
-import { existsSync, mkdtempSync, readFileSync, readdirSync, realpathSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ACTIVE_FILE, ActiveRequests, mostRecentOpen, readActive, writeActiveAtomic } from '../src/active.js';
-import { splitToolName, toolEventFromPayload } from '../src/tool-event-core.js';
+import { parseToolEventConfig, splitToolName, toolEventFromPayload } from '../src/tool-event-core.js';
 import { FakeRelay, TOKEN_OF, rqId } from './helpers/fake-relay.js';
 import { DIST, PLUGIN_ROOT, spawnServer, textOf, waitFor } from './helpers/mcp.js';
 
@@ -486,5 +486,33 @@ describe('dist/tool-event.js', () => {
       [id, { tool: 'Glob', status: 'ok', duration_ms: 1234 }],
       [id, { tool: 'Glob', status: 'error', duration_ms: 7 }],
     ]);
+  });
+});
+
+describe('dist/tool-event.js with the stored sign-in (M5-SPEC §6)', () => {
+  it('posts with the device credential named in its config', async () => {
+    const dir = realpathSync(mkdtempSync(join(tmpdir(), 'team-relay-hook-cred-')));
+    const credDir = join(dir, 'team-relay');
+    mkdirSync(credDir, { mode: 0o700 });
+    const credentials = join(credDir, 'credentials.json');
+    const token = relay.mintCredential('bob');
+    writeFileSync(credentials, JSON.stringify({ relay_url: relay.url, team: 'demo', member: 'bob', credential: token, expires_at: null }), { mode: 0o600 });
+    writeFileSync(
+      configPath,
+      JSON.stringify({ relay_url: relay.url, relay_team: 'demo', relay_auth: 'credential', credentials_file: credentials, state_dir: stateDir }),
+    );
+    const id = openRequest();
+    await new ActiveRequests(stateDir).add(id, LATER);
+    const run = await runHook(post('Read'));
+    expect(run.code).toBe(0);
+    expect(relay.toolEvents.map((e) => [e.request_id, e.member])).toEqual([[id, 'bob']]);
+    expect(relay.requests.at(-1)!.headers.authorization).toBe(`Bearer ${token}`);
+    expect(run.stderr).not.toContain(token);
+  });
+
+  it('refuses a config without credentials_file for relay_auth credential', () => {
+    expect(() => parseToolEventConfig({ relay_url: 'https://r.example.com', relay_team: 'demo', relay_auth: 'credential', state_dir: '/s' })).toThrow(
+      /credentials_file/,
+    );
   });
 });

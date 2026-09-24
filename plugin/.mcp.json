@@ -6,12 +6,7 @@
         "${CLAUDE_PLUGIN_ROOT}/dist/channel.js"
       ],
       "env": {
-        "RELAY_ROLE": "asker",
-        "RELAY_URL": "${user_config.relay_url}",
-        "RELAY_TEAM": "${user_config.relay_team}",
-        "RELAY_AUTH": "${user_config.relay_auth}",
-        "RELAY_GCLOUD_ACCOUNT": "${user_config.gcloud_account}",
-        "RELAY_TOKEN": "${user_config.relay_token}"
+        "RELAY_ROLE": "asker"
       }
     }
   }

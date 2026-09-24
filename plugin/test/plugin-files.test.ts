@@ -43,19 +43,14 @@ describe('SessionStart hook', () => {
       const child = execFile(
         process.execPath,
         [join(DIST, 'session-start.js')],
-        { env: { PATH: process.env.PATH ?? '', ...env }, encoding: 'utf8', timeout: 10_000 },
+        { env: { PATH: process.env.PATH ?? '', XDG_CONFIG_HOME: process.env.XDG_CONFIG_HOME ?? '', ...env }, encoding: 'utf8', timeout: 10_000 },
         (err, stdout, stderr) => resolve({ status: err ? ((err as { code?: number }).code ?? 1) : 0, stdout, stderr }),
       );
       child.stdin?.end('{"hook_event_name":"SessionStart"}');
     });
 
-  it('prints one line naming the member and teammates, from the plugin options', async () => {
-    const r = await run({
-      CLAUDE_PLUGIN_OPTION_RELAY_URL: relay.url,
-      CLAUDE_PLUGIN_OPTION_RELAY_TEAM: 'demo',
-      CLAUDE_PLUGIN_OPTION_RELAY_AUTH: 'token',
-      CLAUDE_PLUGIN_OPTION_RELAY_TOKEN: TOKEN_OF.alice!,
-    });
+  it('prints one line naming the member and teammates, with RELAY_* from the environment', async () => {
+    const r = await run({ RELAY_URL: relay.url, RELAY_TEAM: 'demo', RELAY_AUTH: 'token', RELAY_TOKEN: TOKEN_OF.alice! });
     expect(r.status).toBe(0);
     const lines = r.stdout.trimEnd().split('\n');
     expect(lines).toHaveLength(1);
@@ -65,9 +60,11 @@ describe('SessionStart hook', () => {
   });
 
   it('still exits 0 with one line when unconfigured or the relay refuses', async () => {
+    // M5-SPEC §6: no stored sign-in and nothing in the environment.
     const unconfigured = await run({});
     expect(unconfigured.status).toBe(0);
-    expect(unconfigured.stdout).toMatch(/^team-relay: not configured/);
+    expect(unconfigured.stdout.trimEnd().split('\n')).toHaveLength(1);
+    expect(unconfigured.stdout).toMatch(/^team-relay: Not connected: run \/team-relay:login/);
     const refused = await run({ RELAY_URL: relay.url, RELAY_TEAM: 'demo', RELAY_AUTH: 'token', RELAY_TOKEN: 'tok-bad-secret-123' });
     expect(refused.status).toBe(0);
     expect(refused.stdout.trimEnd().split('\n')).toHaveLength(1);

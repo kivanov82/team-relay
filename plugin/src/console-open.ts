@@ -9,7 +9,7 @@
 import { execFile } from 'node:child_process';
 import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { isAbsolute, join } from 'node:path';
 
 export const REDIRECT_TTL_MS = 10_000;
 export const REDIRECT_FILE = 'console.html';
@@ -19,6 +19,15 @@ export type Run = (command: string, args: string[], done: (err: Error | null) =>
 export type OpenOptions = {
   log: (message: string) => void;
   platform?: NodeJS.Platform;
+  /**
+   * The program that opens the redirect file instead of `open` / `xdg-open` (an absolute
+   * path; it is given the file's path and nothing else). TEAM_RELAY_OPEN_COMMAND sets it.
+   */
+  opener?: string;
+  /** The redirect page's title and link text (default: the team console). */
+  title?: string;
+  /** What the log lines call the thing being opened (default: the URL above). */
+  what?: string;
   /** Where the private directory is made (default: the OS temp directory). */
   tmpRoot?: string;
   deleteAfterMs?: number;
@@ -35,21 +44,24 @@ function escapeHtml(text: string): string {
 }
 
 /** The redirect page: no script, no external request, no referrer. */
-export function redirectHtml(url: string): string {
+export function redirectHtml(url: string, title = 'Team console'): string {
   const u = escapeHtml(url);
+  const t = escapeHtml(title);
   return [
     '<!doctype html>',
     '<html lang="en"><head><meta charset="utf-8">',
     '<meta name="referrer" content="no-referrer">',
     `<meta http-equiv="refresh" content="0;url=${u}">`,
-    '<title>Team console</title></head>',
-    `<body><p><a href="${u}">Open the team console</a></p></body></html>`,
+    `<title>${t}</title></head>`,
+    `<body><p><a href="${u}">${t}</a></p></body></html>`,
     '',
   ].join('\n');
 }
 
 /** The platform's opener, or null where --open is not supported. */
-export function openerFor(platform: NodeJS.Platform): string | null {
+export function openerFor(platform: NodeJS.Platform, env: NodeJS.ProcessEnv = process.env): string | null {
+  const custom = env.TEAM_RELAY_OPEN_COMMAND?.trim();
+  if (custom) return isAbsolute(custom) ? custom : null;
   if (platform === 'darwin') return 'open';
   if (platform === 'linux') return 'xdg-open';
   return null;
@@ -60,9 +72,10 @@ export function openerFor(platform: NodeJS.Platform): string | null {
  * path (for tests), or null when nothing was opened.
  */
 export function openInBrowser(url: string, opts: OpenOptions): string | null {
-  const opener = openerFor(opts.platform ?? process.platform);
+  const what = opts.what ?? 'the URL above';
+  const opener = opts.opener ?? openerFor(opts.platform ?? process.platform);
   if (!opener) {
-    opts.log('--open is not supported on this platform; open the URL above yourself');
+    opts.log(`no browser opener on this platform; open ${what} yourself`);
     return null;
   }
   let dir: string;
@@ -70,16 +83,16 @@ export function openInBrowser(url: string, opts: OpenOptions): string | null {
     dir = mkdtempSync(join(opts.tmpRoot ?? tmpdir(), 'team-relay-console-'));
     chmodSync(dir, 0o700);
   } catch {
-    opts.log('could not prepare the browser hand-off; open the URL above yourself');
+    opts.log(`could not prepare the browser hand-off; open ${what} yourself`);
     return null;
   }
   const cleanup = () => rmSync(dir, { recursive: true, force: true });
   const file = join(dir, REDIRECT_FILE);
   try {
-    writeFileSync(file, redirectHtml(url), { mode: 0o600, flag: 'wx' });
+    writeFileSync(file, redirectHtml(url, opts.title), { mode: 0o600, flag: 'wx' });
   } catch {
     cleanup();
-    opts.log('could not prepare the browser hand-off; open the URL above yourself');
+    opts.log(`could not prepare the browser hand-off; open ${what} yourself`);
     return null;
   }
   process.once('exit', cleanup);
@@ -88,7 +101,7 @@ export function openInBrowser(url: string, opts: OpenOptions): string | null {
     cleanup();
   }, opts.deleteAfterMs ?? REDIRECT_TTL_MS).unref();
   (opts.run ?? defaultRun)(opener, [file], (err) => {
-    if (err) opts.log(`could not open a browser (${opener}); open the URL above yourself`);
+    if (err) opts.log(`could not open a browser (${opener}); open ${what} yourself`);
   });
   return file;
 }

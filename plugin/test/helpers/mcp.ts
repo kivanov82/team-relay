@@ -24,7 +24,13 @@ export type Spawned = {
  * default, `google`, is covered by identity.test.ts with a fake gcloud).
  */
 export function baseEnv(env: Record<string, string>): Record<string, string> {
-  const out: Record<string, string> = { PATH: process.env.PATH ?? '/usr/bin:/bin', HOME: process.env.HOME ?? '/tmp', RELAY_AUTH: 'token' };
+  const out: Record<string, string> = {
+    PATH: process.env.PATH ?? '/usr/bin:/bin',
+    HOME: process.env.HOME ?? '/tmp',
+    RELAY_AUTH: 'token',
+    // test/helpers/isolate.ts: never the developer's own stored sign-in.
+    ...(process.env.XDG_CONFIG_HOME ? { XDG_CONFIG_HOME: process.env.XDG_CONFIG_HOME } : {}),
+  };
   return { ...out, ...env };
 }
 

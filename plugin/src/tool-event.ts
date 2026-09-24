@@ -11,7 +11,7 @@
 import { readFileSync } from 'node:fs';
 import { mostRecentOpen } from './active.js';
 import { makeLogger } from './log.js';
-import { RelayClient, gcloudTokenProvider, tokenProviderFromEnv, type TokenProvider } from './relay-client.js';
+import { RelayClient, credentialTokenProvider, gcloudTokenProvider, tokenProviderFromEnv, type TokenProvider } from './relay-client.js';
 import { parseToolEventConfig, toolEventFromPayload } from './tool-event-core.js';
 import { describeError } from './tool-util.js';
 
@@ -68,6 +68,9 @@ async function run(): Promise<void> {
   let token: TokenProvider;
   if (config.relay_auth === 'token') {
     token = tokenProviderFromEnv({ RELAY_TOKEN_FILE: config.token_file });
+  } else if (config.relay_auth === 'credential') {
+    // Bound to the relay and team the answering session was started for (M5-SPEC §6).
+    token = credentialTokenProvider(config.credentials_file!, { relay_url: config.relay_url, team: config.relay_team });
   } else {
     token = gcloudTokenProvider({
       env: process.env,

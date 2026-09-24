@@ -7,8 +7,11 @@
 import { execFile } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 
-export const TEAM_RE = /^[a-z][a-z0-9_-]{1,31}$/;
-export const MEMBER_RE = /^[a-z][a-z0-9_]{1,31}$/;
+import { credentialFileExists, credentialsPath, normaliseRelayUrl, readCredential } from './credentials.js';
+import { MEMBER_RE, TEAM_RE, parseRelayUrl } from './relay-client-core.js';
+import { defaultRelayUrl } from './relay-default.js';
+
+export { MEMBER_RE, TEAM_RE, parseRelayUrl };
 export const REQUEST_ID_RE = /^rq_[0-9a-f]{32}$/;
 export const MESSAGE_ID_RE = /^msg_[0-9a-f]{32}$/;
 
@@ -40,6 +43,19 @@ export type DirectoryEntry = {
 export type StreamPage = { messages: Envelope[]; cursor: number; head: number };
 /** M2-SPEC §3.3; `waiting` (M4-SPEC §2): the tool is waiting for the member's permission. */
 export type ToolEventBody = { tool: string; status: 'ok' | 'error' | 'waiting'; duration_ms: number | null };
+
+/** M6-SPEC §2. */
+export type RosterRole = 'owner' | 'member';
+export type RosterMember = {
+  member: string;
+  emails: Array<string | null> | null;
+  role: RosterRole;
+  added_by?: string | null;
+  added_at?: string | null;
+};
+export type RosterPage = { members: RosterMember[] };
+export type AddMemberBody = { member: string; email: string; role?: RosterRole };
+export type UpdateMemberBody = { add_email?: string; remove_email?: string; role?: RosterRole };
 
 export type CreateRequestBody = {
   idempotency_key: string;
@@ -323,45 +339,125 @@ export function metadataTokenProvider(opts: MetadataOptions): RefreshableTokenPr
   });
 }
 
-export type AuthMode = 'google' | 'token' | 'metadata';
+export type AuthMode = 'credential' | 'google' | 'token' | 'metadata';
 
 /**
- * RELAY_AUTH: `google` (default), `token` (a static dev token, for the emulator and tests),
- * or `metadata` (the runtime service account on Google Cloud: the hosted console).
+ * RELAY_AUTH (M5-SPEC §6), when set, wins: `credential` (the device credential
+ * /team-relay:login stored), `google` (your gcloud identity), `token` (a static dev token,
+ * for the emulator and tests), or `metadata` (the runtime service account on Google Cloud:
+ * the hosted console). Unset: the credential file if there is one, else `google`.
  */
 export function authModeFromEnv(env: NodeJS.ProcessEnv): AuthMode {
-  const mode = configValue(env.RELAY_AUTH) ?? 'google';
-  if (mode !== 'google' && mode !== 'token' && mode !== 'metadata') {
-    throw new Error('RELAY_AUTH must be "google" or "token" (or "metadata" on Google Cloud)');
+  const explicit = configValue(env.RELAY_AUTH);
+  if (explicit === undefined) return credentialFileExists(credentialsPath(env)) ? 'credential' : 'google';
+  if (explicit !== 'credential' && explicit !== 'google' && explicit !== 'token' && explicit !== 'metadata') {
+    throw new Error('RELAY_AUTH must be "credential", "google" or "token" (or "metadata" on Google Cloud)');
   }
-  return mode;
+  return explicit;
 }
 
-/** The credentials the environment asks for (RELAY_AUTH, RELAY_GCLOUD_ACCOUNT, RELAY_TOKEN[_FILE]). */
+/** Nothing says which relay or team to use, and there is no stored sign-in. */
+export class NotConnected extends Error {
+  constructor(message = 'Not connected: run /team-relay:login') {
+    super(message);
+    this.name = 'NotConnected';
+  }
+}
+
+/** What a 401 means for a device credential (M5-SPEC §6): sign in again, never a retry loop. */
+export const SIGN_IN_AGAIN =
+  'the relay refused your sign-in (signed out, expired, or no longer on the team): run /team-relay:login again';
+
+/** A provider of the stored device credential, bound to the relay and team it was minted for. */
+export type CredentialTokenProvider = (() => string) & { kind: 'credential'; path: string };
+
+/**
+ * Reads the credential file on every call, so a logout or a new login is seen at once. The
+ * credential is only ever sent to the relay and team it was minted for: once the file names
+ * another relay or team (a login elsewhere since), this provider refuses.
+ */
+export function credentialTokenProvider(path: string, bound: { relay_url: string; team: string }): CredentialTokenProvider {
+  const relay = normaliseRelayUrl(bound.relay_url);
+  return Object.assign(
+    () => {
+      const stored = readCredential(path);
+      if (!stored) throw new NotConnected();
+      if (stored.relay_url !== relay || stored.team !== bound.team) {
+        throw new NotConnected('you signed in to another relay or team since this started: restart it');
+      }
+      return stored.credential;
+    },
+    { kind: 'credential' as const, path },
+  );
+}
+
+export function isCredentialProvider(p: TokenProvider): p is TokenProvider & CredentialTokenProvider {
+  return (p as { kind?: unknown }).kind === 'credential';
+}
+
+/** Where to reach the relay, as whom: the result of reading the environment and the credential file. */
+export type Connection = {
+  mode: AuthMode;
+  url: string;
+  team: string;
+  token: TokenProvider;
+  /** The member the stored credential was issued to (credential mode). */
+  member?: string;
+};
+
+/**
+ * The connection the environment asks for. Credential mode takes the relay and team from
+ * the file (RELAY_URL / RELAY_TEAM, when set, must agree with it). Other modes need
+ * RELAY_TEAM; RELAY_URL defaults to the plugin's default relay (plugin/relay.default.json).
+ * Throws NotConnected when there is neither a stored sign-in nor a team to sign in to.
+ */
+export function connectionFromEnv(env: NodeJS.ProcessEnv, gcloud: Omit<GcloudOptions, 'account'> = {}): Connection {
+  const explicitMode = configValue(env.RELAY_AUTH) !== undefined;
+  const mode = authModeFromEnv(env);
+  if (mode === 'credential') {
+    const path = credentialsPath(env);
+    const stored = readCredential(path);
+    if (!stored) throw new NotConnected();
+    const envUrl = configValue(env.RELAY_URL);
+    if (envUrl !== undefined) {
+      let same = false;
+      try {
+        same = normaliseRelayUrl(envUrl) === stored.relay_url;
+      } catch {
+        same = false;
+      }
+      if (!same) throw new Error('RELAY_URL is not the relay you signed in to: unset it, or run /team-relay:login <relay-url>');
+    }
+    const envTeam = configValue(env.RELAY_TEAM);
+    if (envTeam !== undefined && envTeam !== stored.team) {
+      throw new Error('RELAY_TEAM is not the team you signed in to: unset it, or run /team-relay:login again');
+    }
+    return { mode, url: stored.relay_url, team: stored.team, member: stored.member, token: credentialTokenProvider(path, stored) };
+  }
+  const team = configValue(env.RELAY_TEAM);
+  if (!team) {
+    if (!explicitMode) throw new NotConnected();
+    throw new Error('RELAY_TEAM must be set');
+  }
+  const url = configValue(env.RELAY_URL) ?? (mode === 'google' ? defaultRelayUrl() : null) ?? '';
+  let token: TokenProvider;
+  if (mode === 'token') token = tokenProviderFromEnv(env);
+  else if (mode === 'metadata') token = metadataTokenProvider({ audience: configValue(env.RELAY_URL) ?? '' });
+  else {
+    const account = configValue(env.RELAY_GCLOUD_ACCOUNT);
+    token = gcloudTokenProvider({ env, ...gcloud, ...(account !== undefined ? { account } : {}) });
+  }
+  return { mode, url, team, token };
+}
+
+/** The credentials the environment asks for (RELAY_AUTH, the credential file, RELAY_GCLOUD_ACCOUNT, RELAY_TOKEN[_FILE]). */
 export function credentialsFromEnv(env: NodeJS.ProcessEnv, gcloud: Omit<GcloudOptions, 'account'> = {}): TokenProvider {
   const mode = authModeFromEnv(env);
+  if (mode === 'credential') return connectionFromEnv(env, gcloud).token;
   if (mode === 'token') return tokenProviderFromEnv(env);
   if (mode === 'metadata') return metadataTokenProvider({ audience: configValue(env.RELAY_URL) ?? '' });
   const account = configValue(env.RELAY_GCLOUD_ACCOUNT);
   return gcloudTokenProvider({ env, ...gcloud, ...(account !== undefined ? { account } : {}) });
-}
-
-const LOOPBACK = new Set(['localhost', '127.0.0.1', '[::1]', '::1']);
-
-/** https everywhere; plain http only to a loopback address (local development). */
-export function parseRelayUrl(raw: string | undefined): URL {
-  if (!raw) throw new Error('RELAY_URL must be set');
-  let url: URL;
-  try {
-    url = new URL(raw);
-  } catch {
-    throw new Error('RELAY_URL is not a valid URL');
-  }
-  if (url.username || url.password) throw new Error('RELAY_URL must not carry credentials');
-  if (url.search || url.hash) throw new Error('RELAY_URL must not carry a query or fragment');
-  if (url.protocol === 'https:') return url;
-  if (url.protocol === 'http:' && LOOPBACK.has(url.hostname)) return url;
-  throw new Error('RELAY_URL must be https (plain http is allowed only to localhost)');
 }
 
 export type RelayClientOptions = {
@@ -413,6 +509,11 @@ export class RelayClient {
     this.sleep = opts.sleep ?? defaultSleep;
     this.random = opts.random ?? Math.random;
     this.userAgent = opts.userAgent ?? 'team-relay-plugin/0.1.0';
+  }
+
+  /** The relay's base URL (without a trailing slash). */
+  get url(): string {
+    return this.base.toString().replace(/\/$/, '');
   }
 
   private teamPath(...parts: string[]): string {
@@ -486,6 +587,10 @@ export class RelayClient {
           refreshed = true;
           this.token.invalidate();
           continue;
+        }
+        // A device credential cannot be refreshed: tell the member to sign in again.
+        if (err instanceof RelayError && err.status === 401 && isCredentialProvider(this.token)) {
+          throw new RelayError(401, err.code, SIGN_IN_AGAIN);
         }
         if (attempt + 1 >= attempts || !isRetryable(err)) throw err;
         await this.sleep(backoffDelay(attempt, this.backoff, this.random));
@@ -576,6 +681,33 @@ export class RelayClient {
     });
   }
 
+  /** M6-SPEC §2: the team's roster (owners see every email; members only their own). */
+  roster(opts?: CallOptions) {
+    return this.call<RosterPage>('GET', this.teamPath('roster'), undefined, opts);
+  }
+
+  /** M6-SPEC §2 (owners): add a member. Not idempotent, so sent once. */
+  addMember(body: AddMemberBody, opts?: CallOptions) {
+    return this.call<Record<string, unknown>>('POST', this.teamPath('roster'), body, { attempts: 1, ...opts });
+  }
+
+  /** M6-SPEC §2 (owners): add or remove one email, or change the role. Sent once. */
+  updateMember(member: string, body: UpdateMemberBody, opts?: CallOptions) {
+    if (!MEMBER_RE.test(member)) throw new Error('invalid member id');
+    return this.call<Record<string, unknown>>('PATCH', this.teamPath('roster', member), body, { attempts: 1, ...opts });
+  }
+
+  /** M6-SPEC §2 (owners): remove a member (their device credentials are revoked). Sent once. */
+  removeMember(member: string, opts?: CallOptions) {
+    if (!MEMBER_RE.test(member)) throw new Error('invalid member id');
+    return this.call<Record<string, unknown>>('DELETE', this.teamPath('roster', member), undefined, { attempts: 1, ...opts });
+  }
+
+  /** M5-SPEC §3: revoke the credential this client signs in with (logout). */
+  revokeSelf(opts?: CallOptions) {
+    return this.call<Record<string, unknown>>('DELETE', this.teamPath('credentials', 'self'), undefined, { attempts: 1, ...opts });
+  }
+
   /** M2-SPEC §3.5: the team's activity feed. */
   activity(q: { since?: string; limit?: number } = {}, opts?: CallOptions) {
     const params = new URLSearchParams();
@@ -587,12 +719,11 @@ export class RelayClient {
 }
 
 /**
- * Build a client from the common env: RELAY_URL, RELAY_TEAM, RELAY_AUTH (`google` by
- * default, `token` or `metadata`), RELAY_GCLOUD_ACCOUNT, and RELAY_TOKEN / RELAY_TOKEN_FILE
- * for `token`.
+ * Build a client from the environment and the credential file (connectionFromEnv): the
+ * stored device credential by default, else RELAY_URL, RELAY_TEAM, RELAY_AUTH,
+ * RELAY_GCLOUD_ACCOUNT and RELAY_TOKEN / RELAY_TOKEN_FILE.
  */
 export function relayClientFromEnv(env: NodeJS.ProcessEnv, extra: Partial<RelayClientOptions> = {}): RelayClient {
-  const team = configValue(env.RELAY_TEAM);
-  if (!team) throw new Error('RELAY_TEAM must be set');
-  return new RelayClient({ url: configValue(env.RELAY_URL) ?? '', team, token: credentialsFromEnv(env), ...extra });
+  const c = connectionFromEnv(env);
+  return new RelayClient({ url: c.url, team: c.team, token: c.token, ...extra });
 }

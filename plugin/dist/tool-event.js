@@ -1,17 +1,127 @@
 import { createRequire as __teamRelayCreateRequire } from 'node:module'; const require = __teamRelayCreateRequire(import.meta.url);
 
 // src/tool-event.ts
-import { readFileSync as readFileSync3 } from "node:fs";
+import { readFileSync as readFileSync4 } from "node:fs";
 
 // src/active.ts
-import { mkdirSync, readFileSync as readFileSync2, renameSync, rmSync, writeFileSync } from "node:fs";
-import { isAbsolute, join } from "node:path";
+import { mkdirSync as mkdirSync2, readFileSync as readFileSync3, renameSync as renameSync2, rmSync as rmSync2, writeFileSync } from "node:fs";
+import { isAbsolute as isAbsolute2, join as join2 } from "node:path";
 
 // src/relay-client.ts
 import { execFile } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { readFileSync as readFileSync2 } from "node:fs";
+
+// src/credentials.ts
+import {
+  chmodSync,
+  closeSync,
+  fsyncSync,
+  lstatSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  unlinkSync,
+  writeSync
+} from "node:fs";
+import { basename, dirname, isAbsolute, join } from "node:path";
+
+// src/relay-client-core.ts
 var TEAM_RE = /^[a-z][a-z0-9_-]{1,31}$/;
 var MEMBER_RE = /^[a-z][a-z0-9_]{1,31}$/;
+var LOOPBACK = /* @__PURE__ */ new Set(["localhost", "127.0.0.1", "[::1]", "::1"]);
+function parseRelayUrl(raw) {
+  if (!raw) throw new Error("RELAY_URL must be set");
+  let url;
+  try {
+    url = new URL(raw);
+  } catch {
+    throw new Error("RELAY_URL is not a valid URL");
+  }
+  if (url.username || url.password) throw new Error("RELAY_URL must not carry credentials");
+  if (url.search || url.hash) throw new Error("RELAY_URL must not carry a query or fragment");
+  if (url.protocol === "https:") return url;
+  if (url.protocol === "http:" && LOOPBACK.has(url.hostname)) return url;
+  throw new Error("RELAY_URL must be https (plain http is allowed only to localhost)");
+}
+
+// src/credentials.ts
+var CREDENTIAL_RE = /^trc_[A-Za-z0-9_-]{43}$/;
+var MAX_FILE_BYTES = 16 * 1024;
+var CredentialFileError = class extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "CredentialFileError";
+  }
+};
+function uid() {
+  return typeof process.getuid === "function" ? process.getuid() : null;
+}
+function checkOwnedPrivate(st, what, kind) {
+  if (st.isSymbolicLink()) throw new CredentialFileError(`${what} is a symbolic link; refusing to use it`);
+  if (kind === "file" ? !st.isFile() : !st.isDirectory()) throw new CredentialFileError(`${what} is not a ${kind}; refusing to use it`);
+  const me = uid();
+  if (me !== null && st.uid !== me) throw new CredentialFileError(`${what} is owned by another user; refusing to use it`);
+  if ((st.mode & 63) !== 0) {
+    const mode = (st.mode & 511).toString(8).padStart(3, "0");
+    throw new CredentialFileError(
+      `${what} has mode ${mode}, readable or writable by others; refusing to use it (run /team-relay:logout and /team-relay:login again, or chmod ${kind === "file" ? "600" : "700"} it)`
+    );
+  }
+}
+var RFC3339 = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,9})?(Z|[+-]\d{2}:\d{2})$/;
+function normaliseRelayUrl(raw) {
+  const url = parseRelayUrl(raw);
+  const path = url.pathname.replace(/\/+$/, "");
+  return `${url.protocol}//${url.host}${path}`;
+}
+function parseStoredCredential(raw) {
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) throw new CredentialFileError("the credential file is not a JSON object");
+  const c = raw;
+  const { relay_url, team, member, credential, expires_at } = c;
+  if (typeof relay_url !== "string") throw new CredentialFileError("the credential file has no relay_url");
+  let url;
+  try {
+    url = normaliseRelayUrl(relay_url);
+  } catch {
+    throw new CredentialFileError("the credential file has an invalid relay_url");
+  }
+  if (typeof team !== "string" || !TEAM_RE.test(team)) throw new CredentialFileError("the credential file has an invalid team");
+  if (typeof member !== "string" || !MEMBER_RE.test(member)) throw new CredentialFileError("the credential file has an invalid member");
+  if (typeof credential !== "string" || !CREDENTIAL_RE.test(credential)) throw new CredentialFileError("the credential file has an invalid credential");
+  if (expires_at !== void 0 && expires_at !== null && (typeof expires_at !== "string" || !RFC3339.test(expires_at))) {
+    throw new CredentialFileError("the credential file has an invalid expires_at");
+  }
+  return { relay_url: url, team, member, credential, expires_at: typeof expires_at === "string" ? expires_at : null };
+}
+function readCredential(path) {
+  let st;
+  try {
+    st = lstatSync(path);
+  } catch (err) {
+    if (err.code === "ENOENT" || err.code === "ENOTDIR") return null;
+    throw new CredentialFileError(`cannot read the credential file (${err.code ?? "error"})`);
+  }
+  checkOwnedPrivate(lstatSync(dirname(path)), "the credential directory", "directory");
+  checkOwnedPrivate(st, "the credential file", "file");
+  if (st.size > MAX_FILE_BYTES) throw new CredentialFileError("the credential file is too large");
+  let text;
+  try {
+    text = readFileSync(path, "utf8");
+  } catch (err) {
+    throw new CredentialFileError(`cannot read the credential file (${err.code ?? "error"})`);
+  }
+  let json;
+  try {
+    json = JSON.parse(text);
+  } catch {
+    throw new CredentialFileError("the credential file is not valid JSON");
+  }
+  return parseStoredCredential(json);
+}
+
+// src/relay-client.ts
 var REQUEST_ID_RE = /^rq_[0-9a-f]{32}$/;
 var RelayError = class extends Error {
   status;
@@ -53,7 +163,7 @@ function tokenProviderFromEnv(env) {
     return () => {
       let raw;
       try {
-        raw = readFileSync(file, "utf8");
+        raw = readFileSync2(file, "utf8");
       } catch (err) {
         throw new Error(`cannot read RELAY_TOKEN_FILE (${err.code ?? "error"})`);
       }
@@ -134,20 +244,29 @@ function gcloudTokenProvider(opts = {}) {
   return provider;
 }
 var METADATA_OUTPUT_LIMIT = 16 * 1024;
-var LOOPBACK = /* @__PURE__ */ new Set(["localhost", "127.0.0.1", "[::1]", "::1"]);
-function parseRelayUrl(raw) {
-  if (!raw) throw new Error("RELAY_URL must be set");
-  let url;
-  try {
-    url = new URL(raw);
-  } catch {
-    throw new Error("RELAY_URL is not a valid URL");
+var NotConnected = class extends Error {
+  constructor(message = "Not connected: run /team-relay:login") {
+    super(message);
+    this.name = "NotConnected";
   }
-  if (url.username || url.password) throw new Error("RELAY_URL must not carry credentials");
-  if (url.search || url.hash) throw new Error("RELAY_URL must not carry a query or fragment");
-  if (url.protocol === "https:") return url;
-  if (url.protocol === "http:" && LOOPBACK.has(url.hostname)) return url;
-  throw new Error("RELAY_URL must be https (plain http is allowed only to localhost)");
+};
+var SIGN_IN_AGAIN = "the relay refused your sign-in (signed out, expired, or no longer on the team): run /team-relay:login again";
+function credentialTokenProvider(path, bound) {
+  const relay = normaliseRelayUrl(bound.relay_url);
+  return Object.assign(
+    () => {
+      const stored = readCredential(path);
+      if (!stored) throw new NotConnected();
+      if (stored.relay_url !== relay || stored.team !== bound.team) {
+        throw new NotConnected("you signed in to another relay or team since this started: restart it");
+      }
+      return stored.credential;
+    },
+    { kind: "credential", path }
+  );
+}
+function isCredentialProvider(p) {
+  return p.kind === "credential";
 }
 var ON_BEHALF_OF_RE = /^[a-z0-9._%+-]{1,64}@[a-z0-9.-]{1,253}$/;
 var defaultSleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -174,6 +293,10 @@ var RelayClient = class {
     this.sleep = opts.sleep ?? defaultSleep;
     this.random = opts.random ?? Math.random;
     this.userAgent = opts.userAgent ?? "team-relay-plugin/0.1.0";
+  }
+  /** The relay's base URL (without a trailing slash). */
+  get url() {
+    return this.base.toString().replace(/\/$/, "");
   }
   teamPath(...parts) {
     return ["v1", "teams", this.team, ...parts].map(encodeURIComponent).join("/");
@@ -244,6 +367,9 @@ var RelayClient = class {
           refreshed = true;
           this.token.invalidate();
           continue;
+        }
+        if (err instanceof RelayError && err.status === 401 && isCredentialProvider(this.token)) {
+          throw new RelayError(401, err.code, SIGN_IN_AGAIN);
         }
         if (attempt + 1 >= attempts || !isRetryable(err)) throw err;
         await this.sleep(backoffDelay(attempt, this.backoff, this.random));
@@ -321,6 +447,28 @@ var RelayClient = class {
       ...opts
     });
   }
+  /** M6-SPEC §2: the team's roster (owners see every email; members only their own). */
+  roster(opts) {
+    return this.call("GET", this.teamPath("roster"), void 0, opts);
+  }
+  /** M6-SPEC §2 (owners): add a member. Not idempotent, so sent once. */
+  addMember(body, opts) {
+    return this.call("POST", this.teamPath("roster"), body, { attempts: 1, ...opts });
+  }
+  /** M6-SPEC §2 (owners): add or remove one email, or change the role. Sent once. */
+  updateMember(member, body, opts) {
+    if (!MEMBER_RE.test(member)) throw new Error("invalid member id");
+    return this.call("PATCH", this.teamPath("roster", member), body, { attempts: 1, ...opts });
+  }
+  /** M6-SPEC §2 (owners): remove a member (their device credentials are revoked). Sent once. */
+  removeMember(member, opts) {
+    if (!MEMBER_RE.test(member)) throw new Error("invalid member id");
+    return this.call("DELETE", this.teamPath("roster", member), void 0, { attempts: 1, ...opts });
+  }
+  /** M5-SPEC §3: revoke the credential this client signs in with (logout). */
+  revokeSelf(opts) {
+    return this.call("DELETE", this.teamPath("credentials", "self"), void 0, { attempts: 1, ...opts });
+  }
   /** M2-SPEC §3.5: the team's activity feed. */
   activity(q = {}, opts) {
     const params = new URLSearchParams();
@@ -334,15 +482,15 @@ var RelayClient = class {
 // src/active.ts
 var ACTIVE_FILE = "active.json";
 var READ_LIMIT = 64 * 1024;
-var RFC3339 = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,9})?(Z|[+-]\d{2}:\d{2})$/;
+var RFC33392 = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,9})?(Z|[+-]\d{2}:\d{2})$/;
 function deadlineOf(value) {
-  if (typeof value !== "string" || value.length > 40 || !RFC3339.test(value)) return null;
+  if (typeof value !== "string" || value.length > 40 || !RFC33392.test(value)) return null;
   return Number.isFinite(Date.parse(value)) ? value : null;
 }
 function readActive(stateDir, now = Date.now()) {
   let raw;
   try {
-    raw = readFileSync2(join(stateDir, ACTIVE_FILE), "utf8");
+    raw = readFileSync3(join2(stateDir, ACTIVE_FILE), "utf8");
   } catch {
     return [];
   }
@@ -416,17 +564,22 @@ function parseToolEventConfig(raw) {
   const state_dir = str("state_dir");
   const relay_auth = str("relay_auth") ?? "google";
   if (!relay_url || !relay_team || !state_dir) throw new Error("config needs relay_url, relay_team and state_dir");
-  if (relay_auth !== "google" && relay_auth !== "token") throw new Error("config relay_auth must be google or token");
+  if (relay_auth !== "credential" && relay_auth !== "google" && relay_auth !== "token") {
+    throw new Error("config relay_auth must be credential, google or token");
+  }
   const gcloud_account = str("gcloud_account");
   const token_file = str("token_file");
+  const credentials_file = str("credentials_file");
   if (relay_auth === "token" && !token_file) throw new Error("config needs token_file when relay_auth is token");
+  if (relay_auth === "credential" && !credentials_file) throw new Error("config needs credentials_file when relay_auth is credential");
   return {
     relay_url,
     relay_team,
     relay_auth,
     state_dir,
     ...gcloud_account !== void 0 ? { gcloud_account } : {},
-    ...token_file !== void 0 ? { token_file } : {}
+    ...token_file !== void 0 ? { token_file } : {},
+    ...credentials_file !== void 0 ? { credentials_file } : {}
   };
 }
 
@@ -480,12 +633,14 @@ async function run() {
   }
   const event = toolEventFromPayload(payload);
   if (!event) return;
-  const config = parseToolEventConfig(JSON.parse(readFileSync3(path, "utf8")));
+  const config = parseToolEventConfig(JSON.parse(readFileSync4(path, "utf8")));
   const requestId = mostRecentOpen(config.state_dir);
   if (!requestId) return;
   let token;
   if (config.relay_auth === "token") {
     token = tokenProviderFromEnv({ RELAY_TOKEN_FILE: config.token_file });
+  } else if (config.relay_auth === "credential") {
+    token = credentialTokenProvider(config.credentials_file, { relay_url: config.relay_url, team: config.relay_team });
   } else {
     token = gcloudTokenProvider({
       env: process.env,

@@ -1,6 +1,7 @@
-# The team's capability manifest. Every member installs the same plugin; the install
-# wizard asks each member which of these they will run (and where the program that runs
-# each one lives), and the enabled subset is what teammates discover.
+# The team's capability manifest. Every member installs the same plugin; each member
+# chooses which of these their answering session runs (CAP_<NAME>_ENABLED and
+# CAP_<NAME>_RUNNER in its environment; /team-relay:answering lists them), and the enabled
+# subset is what teammates discover.
 #
 # Synthetic example operations. Parameters are enums, bounded numbers, booleans, or
 # strings with a length cap and an allow-list pattern: never free-form SQL, shell or paths.

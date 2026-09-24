@@ -283,7 +283,16 @@ describe('channel server: asker tools', () => {
   it('lists exactly the asker tools', async () => {
     const s = await channel('alice', 'asker');
     const { tools } = await s.client.listTools();
-    expect(tools.map((t) => t.name).sort()).toEqual(['ask_question', 'invoke_capability', 'list_teammates', 'request_status']);
+    // M5-SPEC §6: login, logout and whoami join the asker's tools.
+    expect(tools.map((t) => t.name).sort()).toEqual([
+      'ask_question',
+      'invoke_capability',
+      'list_teammates',
+      'login',
+      'logout',
+      'request_status',
+      'whoami',
+    ]);
   });
 
   it('ask_question posts one request with a fresh UUID idempotency key per call', async () => {

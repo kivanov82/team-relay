@@ -11,17 +11,34 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import {
   MEMBER_RE,
+  NotConnected,
   REQUEST_ID_RE,
+  RelayClient,
   RelayError,
+  SIGN_IN_AGAIN,
   backoffDelay,
+  configValue,
+  connectionFromEnv,
   isRetryable,
+  parseRelayUrl,
   relayClientFromEnv,
+  type AuthMode,
+  type Connection,
   type CreateRequestBody,
   type Envelope,
   type Me,
-  type RelayClient,
   type StreamName,
 } from './relay-client.js';
+import {
+  CredentialFileError,
+  credentialFingerprint,
+  credentialsPath,
+  readCredential,
+  removeCredential,
+  type StoredCredential,
+} from './credentials.js';
+import { startLogin, type LoginFlow } from './login.js';
+import { defaultRelayUrl } from './relay-default.js';
 import { envelopeToNotification, neutraliseDeep, RecentIds } from './notify.js';
 import { findCapability, loadManifest, validateManifest, validateParams, codePointLength, hasLoneSurrogate } from './manifest.js';
 import { defaultManifestPath, discoveryPayload, exposedCapabilities, sharesFromEnv } from './exposed.js';
@@ -397,6 +414,8 @@ async function streamLoop(
   stream: StreamName,
   stopper: Stopper,
   onPushed: (envelope: Envelope) => void = () => {},
+  /** A device credential that is refused is not retried (M5-SPEC §6): the caller waits for a new login. */
+  onUnauthorized?: () => void,
 ): Promise<void> {
   const recent = new RecentIds(500);
   let failures = 0;
@@ -426,6 +445,11 @@ async function streamLoop(
       if (page.messages.length === 0 && Date.now() - started < 1000) await stopper.sleep(1000);
     } catch (err) {
       if (stopper.stopped) return;
+      if (err instanceof RelayError && err.status === 401 && onUnauthorized) {
+        log(`the relay refused this session's sign-in (401): ${SIGN_IN_AGAIN}`);
+        onUnauthorized();
+        return;
+      }
       if (err instanceof RelayError && err.status === 401) {
         log('the relay rejected the token (401); retrying in 60 s');
         failures = 0;
@@ -440,6 +464,326 @@ async function streamLoop(
 }
 
 // ---------------------------------------------------------------------------------------
+// Signing in (M5-SPEC §2, §6): the asker channel's login, logout and whoami tools
+
+const SESSION_TOOLS = [
+  {
+    name: 'login',
+    description:
+      'Sign in to the team relay (/team-relay:login). Opens the browser on the relay, where you sign in with Google and pick your team. Returns at once with the sign-in URL (show it to the user in case no browser opened); a status event on this channel says when the sign-in completes.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        relay_url: { type: 'string', description: "Optional: another team relay's base URL (https). Default: the plugin's relay." },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'logout',
+    description: 'Sign out of the team relay on this computer: revokes this device credential at the relay and deletes it here.',
+    inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+  },
+  {
+    name: 'whoami',
+    description: 'Show whether this session is connected to the team relay, and as whom (relay, team, member).',
+    inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+  },
+] as const;
+
+const STATUS_NOTE =
+  'type="status" events come from this plugin itself (never from a teammate) and say whether you are signed in.';
+
+type Live = { client: RelayClient; me: Me };
+
+/**
+ * The asker's connection (M5-SPEC §6). With no stored sign-in it waits quietly, looking for
+ * the credential file every 2 s, and connects as soon as one appears (a login from this
+ * session or another). A credential the relay refuses is not retried: it waits until the
+ * file changes (a new login). A logout stops the stream and returns to waiting.
+ */
+class AskerConnection {
+  private live: (Live & { stopper: Stopper; fingerprint: string | null; mode: AuthMode }) | null = null;
+  private problem: string | null = null;
+  private refusedAt: string | null | undefined = undefined;
+  private lastLogged = '';
+  private readonly stopper = new Stopper();
+  private wake: (() => void) | null = null;
+  private failures = 0;
+  private pending: LoginFlow | null = null;
+  private readonly path: string;
+
+  constructor(
+    private readonly env: NodeJS.ProcessEnv,
+    private readonly server: Server,
+  ) {
+    this.path = credentialsPath(env);
+  }
+
+  current(): Live | null {
+    return this.live ? { client: this.live.client, me: this.live.me } : null;
+  }
+
+  notConnected(): string {
+    if (this.refusedAt !== undefined) return `Not connected: ${SIGN_IN_AGAIN}`;
+    if (this.problem) return `Not connected: ${this.problem}`;
+    return 'Not connected: run /team-relay:login';
+  }
+
+  private note(line: string) {
+    if (line !== this.lastLogged) log(line);
+    this.lastLogged = line;
+  }
+
+  /** A status line pushed into the session: fixed text and id-shaped values only. */
+  private async status(content: string) {
+    try {
+      await this.server.notification({ method: 'notifications/claude/channel', params: { content, meta: { type: 'status' } } });
+    } catch {
+      // not connected to Claude Code (yet): the whoami tool still says it
+    }
+  }
+
+  start() {
+    void this.watch().catch((err) => log(`connection watcher ended: ${describeError(err)}`));
+  }
+
+  stop() {
+    this.stopper.stop();
+    this.live?.stopper.stop();
+    this.pending?.cancel();
+  }
+
+  /** Look again now (after a login stored a credential, or a logout removed it). */
+  poke() {
+    this.wake?.();
+  }
+
+  private sleep(ms: number): Promise<void> {
+    return new Promise((resolve) => {
+      const t = setTimeout(done, ms);
+      const self = this;
+      function done() {
+        clearTimeout(t);
+        self.wake = null;
+        resolve();
+      }
+      this.wake = done;
+      if (this.stopper.stopped) done();
+    });
+  }
+
+  private disconnect(why: string) {
+    if (!this.live) return;
+    this.live.stopper.stop();
+    log(`disconnected (${why})`);
+    this.live = null;
+  }
+
+  private async watch() {
+    while (!this.stopper.stopped) {
+      const fp = credentialFingerprint(this.path);
+      if (this.live) {
+        if (this.live.mode === 'credential' && fp !== this.live.fingerprint) this.disconnect(fp === null ? 'signed out' : 'signed in again');
+        else {
+          await this.sleep(2000);
+          continue;
+        }
+      }
+      if (this.refusedAt !== undefined && fp === this.refusedAt) {
+        await this.sleep(2000);
+        continue;
+      }
+      this.refusedAt = undefined;
+      const delay = await this.tryConnect(fp);
+      await this.sleep(delay);
+    }
+  }
+
+  /** One attempt; returns how long to wait before the next look. */
+  private async tryConnect(fp: string | null): Promise<number> {
+    let c: Connection;
+    try {
+      c = connectionFromEnv(this.env);
+    } catch (err) {
+      this.problem = err instanceof NotConnected ? null : describeError(err);
+      this.note(err instanceof NotConnected ? 'not connected: waiting for /team-relay:login' : `not connected: ${describeError(err)}`);
+      return 2000;
+    }
+    let client: RelayClient;
+    try {
+      client = new RelayClient({ url: c.url, team: c.team, token: c.token });
+    } catch (err) {
+      this.problem = describeError(err);
+      this.note(`not connected: ${this.problem}`);
+      return 2000;
+    }
+    let me: Me;
+    try {
+      me = await client.me({ attempts: 1, timeoutMs: 15_000 });
+    } catch (err) {
+      if (err instanceof RelayError && err.status === 401 && c.mode === 'credential') {
+        this.refusedAt = fp;
+        this.problem = null;
+        this.note(`not connected: ${SIGN_IN_AGAIN}`);
+        return 2000;
+      }
+      this.problem = `the relay did not answer (${describeError(err)})`;
+      this.note(`not connected yet: ${this.problem}; trying again`);
+      return backoffDelay(this.failures++, { baseMs: 2000, maxMs: 60_000 });
+    }
+    if (me.team !== client.team || !MEMBER_RE.test(me.member)) {
+      this.problem = 'the relay answered for a different team';
+      this.note(`not connected: ${this.problem}`);
+      return 60_000;
+    }
+    this.failures = 0;
+    this.problem = null;
+    const stopper = new Stopper();
+    this.live = { client, me, stopper, fingerprint: fp, mode: c.mode };
+    this.lastLogged = '';
+    log(`asker for ${me.member} in team ${me.team}`);
+    const onUnauthorized =
+      c.mode === 'credential'
+        ? () => {
+            this.refusedAt = fp;
+            this.disconnect('the relay refused the sign-in');
+            void this.status(`team-relay: not connected: ${SIGN_IN_AGAIN}.`);
+            this.poke();
+          }
+        : undefined;
+    void streamLoop(this.server, client, me, 'replies', stopper, undefined, onUnauthorized).catch((err) =>
+      log(`stream loop ended: ${describeError(err)}`),
+    );
+    return 2000;
+  }
+
+  // -- the tools ------------------------------------------------------------------------
+
+  async login(args: Record<string, unknown>): Promise<ToolResult> {
+    const bad = unknownKey(args, ['relay_url']);
+    if (bad) return toolError(`unknown argument: ${bad}`);
+    let relayUrl: string | undefined;
+    if (args.relay_url !== undefined && args.relay_url !== null && args.relay_url !== '') {
+      if (typeof args.relay_url !== 'string' || args.relay_url.length > 512) return toolError('relay_url must be a URL');
+      relayUrl = args.relay_url.trim();
+    } else {
+      relayUrl = configValue(this.env.RELAY_URL) ?? defaultRelayUrl() ?? undefined;
+    }
+    if (!relayUrl) return toolError('no relay URL: pass one, as in /team-relay:login https://relay.example.com');
+    try {
+      parseRelayUrl(relayUrl);
+    } catch (err) {
+      return toolError(describeError(err));
+    }
+    this.pending?.cancel();
+    let flow: LoginFlow;
+    try {
+      flow = await startLogin({ relayUrl, credentialsFile: this.path, log });
+    } catch (err) {
+      return toolError(`could not start the sign-in: ${describeError(err)}`);
+    }
+    this.pending = flow;
+    flow.done.then(
+      (stored) => {
+        if (this.pending === flow) this.pending = null;
+        log(`signed in as ${stored.member} in team ${stored.team}`);
+        this.poke();
+        void this.status(`team-relay: signed in as ${stored.member} in team ${stored.team}. Teammate tools are ready.`);
+      },
+      (err: unknown) => {
+        if (this.pending === flow) this.pending = null;
+        const why = describeError(err);
+        log(`sign-in ended: ${why}`);
+        if (!/cancelled/.test(why)) void this.status(`team-relay: the sign-in did not complete: ${why}.`);
+      },
+    );
+    const envMode = configValue(this.env.RELAY_AUTH);
+    return toolJson({
+      status: 'waiting_for_browser',
+      sign_in_url: flow.url,
+      expires_in_seconds: 300,
+      next:
+        'A browser tab should have opened on the relay: sign in with Google there and choose the team. If none opened, open sign_in_url yourself. ' +
+        'A status event on this channel says when it is done (or call whoami).',
+      ...(envMode && envMode !== 'credential'
+        ? { note: `this session signs in with RELAY_AUTH=${envMode} from its environment; restart Claude Code without it to use the new sign-in` }
+        : {}),
+    });
+  }
+
+  async logout(args: Record<string, unknown>): Promise<ToolResult> {
+    const bad = unknownKey(args, []);
+    if (bad) return toolError(`unknown argument: ${bad}`);
+    this.pending?.cancel();
+    this.pending = null;
+    let stored: StoredCredential | null;
+    try {
+      stored = readCredential(this.path);
+    } catch (err) {
+      // An unusable file is still removed: signing out must always be possible.
+      removeCredential(this.path);
+      this.disconnect('signed out');
+      this.poke();
+      return toolJson({ signed_out: true, revoked: false, note: `the stored credential could not be read (${describeError(err)}); it was deleted` });
+    }
+    if (!stored) return toolJson({ signed_out: false, note: 'not signed in on this computer' });
+    let revoked = false;
+    let note: string | undefined;
+    try {
+      const client = new RelayClient({ url: stored.relay_url, team: stored.team, token: () => stored.credential, attempts: 1, timeoutMs: 10_000 });
+      await client.revokeSelf();
+      revoked = true;
+    } catch (err) {
+      if (err instanceof RelayError && (err.status === 401 || err.status === 404)) {
+        revoked = true;
+        note = 'the relay no longer accepted this credential';
+      } else note = `the relay was not reached (${describeError(err)}); the credential was deleted here and expires on its own`;
+    }
+    removeCredential(this.path);
+    this.disconnect('signed out');
+    this.poke();
+    return toolJson({ signed_out: true, revoked, team: stored.team, member: stored.member, ...(note ? { note } : {}) });
+  }
+
+  async whoami(args: Record<string, unknown>): Promise<ToolResult> {
+    const bad = unknownKey(args, []);
+    if (bad) return toolError(`unknown argument: ${bad}`);
+    if (this.live) {
+      let expires: string | null = null;
+      if (this.live.mode === 'credential') {
+        try {
+          expires = readCredential(this.path)?.expires_at ?? null;
+        } catch {
+          expires = null;
+        }
+      }
+      return toolJson({
+        connected: true,
+        relay_url: this.live.client.url,
+        team: this.live.me.team,
+        member: this.live.me.member,
+        teammates: this.live.me.teammates.filter((m) => MEMBER_RE.test(m)),
+        signed_in_with: SIGNED_IN_WITH[this.live.mode],
+        ...(expires ? { credential_expires_at: expires } : {}),
+      });
+    }
+    return toolJson({
+      connected: false,
+      message: this.notConnected(),
+      ...(this.pending ? { sign_in_pending: true, sign_in_url: this.pending.url } : {}),
+    });
+  }
+}
+
+const SIGNED_IN_WITH: Record<AuthMode, string> = {
+  credential: 'device credential (/team-relay:login)',
+  google: 'gcloud identity',
+  token: 'static development token',
+  metadata: 'service account',
+};
+
+// ---------------------------------------------------------------------------------------
 // Main
 
 function fail(message: string): never {
@@ -447,28 +791,43 @@ function fail(message: string): never {
   process.exit(1);
 }
 
+/** An asker that signs in with the stored credential, or waits for one (M5-SPEC §6). */
+function usesStoredSignIn(env: NodeJS.ProcessEnv): boolean {
+  try {
+    return connectionFromEnv(env).mode === 'credential';
+  } catch (err) {
+    // No sign-in yet, or a credential file that must not be used: wait for /team-relay:login.
+    if (err instanceof NotConnected || err instanceof CredentialFileError) return true;
+    return false;
+  }
+}
+
 async function main(): Promise<void> {
   const env = process.env;
   const role = env.RELAY_ROLE;
   if (role !== 'asker' && role !== 'answerer') fail('RELAY_ROLE must be "asker" or "answerer"');
 
-  let client: RelayClient;
-  try {
-    client = relayClientFromEnv(env);
-  } catch (err) {
-    fail(`configuration error: ${describeError(err)}`);
+  const waiting = role === 'asker' && usesStoredSignIn(env);
+  let fixed: Live | null = null;
+  if (!waiting) {
+    let client: RelayClient;
+    try {
+      client = relayClientFromEnv(env);
+    } catch (err) {
+      fail(`configuration error: ${describeError(err)}`);
+    }
+    let me: Me;
+    try {
+      me = await client.me({ attempts: 2 });
+    } catch (err) {
+      fail(`cannot start: GET /me failed (${describeError(err)}). Check RELAY_URL, RELAY_TEAM and the token.`);
+    }
+    if (me.team !== client.team || !MEMBER_RE.test(me.member)) fail('cannot start: the relay answered for a different team');
+    log(`${role} for ${me.member} in team ${me.team}`);
+    fixed = { client, me };
   }
 
-  let me: Me;
-  try {
-    me = await client.me({ attempts: 2 });
-  } catch (err) {
-    fail(`cannot start: GET /me failed (${describeError(err)}). Check RELAY_URL, RELAY_TEAM and the token.`);
-  }
-  if (me.team !== client.team || !MEMBER_RE.test(me.member)) fail('cannot start: the relay answered for a different team');
-  log(`${role} for ${me.member} in team ${me.team}`);
-
-  if (role === 'answerer') {
+  if (role === 'answerer' && fixed) {
     // Publish the discovery payload: exactly the capabilities this member will run.
     try {
       const manifest = loadManifest(env.MANIFEST_PATH || defaultManifestPath());
@@ -477,7 +836,7 @@ async function main(): Promise<void> {
       // M4-SPEC §3: the shared folders' names (bin/answerer passes basenames, never paths),
       // checked against the same schema the relay validates the payload with.
       const payload = validateManifest(discoveryPayload(exposed, sharesFromEnv(env.ANSWERER_SHARES)));
-      const res = await client.publishManifest(me.member, payload);
+      const res = await fixed.client.publishManifest(fixed.me.member, payload);
       log(`published capabilities: ${res.capabilities.join(', ') || '(none)'}`);
       log(`published shared folders: ${(payload.shares ?? []).map((x) => x.name).join(', ') || '(none)'}`);
     } catch (err) {
@@ -503,11 +862,14 @@ async function main(): Promise<void> {
     { name: 'relay', version: VERSION },
     {
       capabilities: { experimental: { 'claude/channel': {} }, tools: {} },
-      instructions: instructionsFor(role),
+      instructions: role === 'asker' ? `${instructionsFor(role)} ${STATUS_NOTE}` : instructionsFor(role),
     },
   );
 
-  const tools = role === 'asker' ? ASKER_TOOLS : ANSWERER_TOOLS;
+  const connection = role === 'asker' ? new AskerConnection(env, server) : null;
+  const liveNow = (): Live | null => fixed ?? connection?.current() ?? null;
+
+  const tools = role === 'asker' ? [...ASKER_TOOLS, ...SESSION_TOOLS] : ANSWERER_TOOLS;
   server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: tools.map((t) => ({ ...t })) }));
   server.setRequestHandler(CallToolRequestSchema, async (req) => {
     const name = req.params.name;
@@ -515,22 +877,34 @@ async function main(): Promise<void> {
     if (!isPlainObject(args)) return toolError('arguments must be an object');
     try {
       if (role === 'asker') {
+        if (name === 'login' || name === 'logout' || name === 'whoami') {
+          if (!connection) {
+            if (name === 'whoami' && fixed) {
+              return toolJson({ connected: true, team: fixed.me.team, member: fixed.me.member, relay_url: fixed.client.url, signed_in_with: 'the environment (RELAY_AUTH)' });
+            }
+            return toolError('this session signs in with RELAY_AUTH from its environment; unset it and restart Claude Code to use /team-relay:login');
+          }
+          return name === 'login' ? await connection.login(args) : name === 'logout' ? await connection.logout(args) : await connection.whoami(args);
+        }
+        const live = liveNow();
+        const known = ['list_teammates', 'ask_question', 'invoke_capability', 'request_status'];
+        if (!live) return known.includes(name) ? toolError(connection?.notConnected() ?? 'Not connected: run /team-relay:login') : toolError(`unknown tool: ${name}`);
         switch (name) {
           case 'list_teammates':
-            return await listTeammates(client);
+            return await listTeammates(live.client);
           case 'ask_question':
-            return await askQuestion(client, args);
+            return await askQuestion(live.client, args);
           case 'invoke_capability':
-            return await invokeCapability(client, args);
+            return await invokeCapability(live.client, args);
           case 'request_status':
-            return await requestStatus(client, args);
+            return await requestStatus(live.client, args);
         }
-      } else {
+      } else if (fixed) {
         switch (name) {
           case 'ack_question':
-            return await ackQuestion(client, args, active, deadlines);
+            return await ackQuestion(fixed.client, args, active, deadlines);
           case 'reply':
-            return await reply(client, args, active);
+            return await reply(fixed.client, args, active);
         }
       }
       return toolError(`unknown tool: ${name}`);
@@ -540,17 +914,23 @@ async function main(): Promise<void> {
   });
 
   const stopper = new Stopper();
-  const stream: StreamName = role === 'asker' ? 'replies' : 'inbox';
   let loop: Promise<void> | undefined;
   server.oninitialized = () => {
+    if (connection) {
+      connection.start();
+      return;
+    }
+    if (!fixed) return;
     // The answerer remembers each pushed request's answer deadline for active.json (§7.6).
     const onPushed = (e: Envelope) => deadlines.remember(e.request_id, e.data?.answer_deadline);
-    loop ??= streamLoop(server, client, me, stream, stopper, onPushed).catch((err) => log(`stream loop ended: ${describeError(err)}`));
+    const stream: StreamName = role === 'asker' ? 'replies' : 'inbox';
+    loop ??= streamLoop(server, fixed.client, fixed.me, stream, stopper, onPushed).catch((err) => log(`stream loop ended: ${describeError(err)}`));
   };
 
   const shutdown = () => {
     if (stopper.stopped) return;
     stopper.stop();
+    connection?.stop();
     void server.close().finally(() => process.exit(0));
     setTimeout(() => process.exit(0), 2000).unref();
   };

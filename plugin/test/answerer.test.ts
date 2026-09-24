@@ -14,6 +14,8 @@ const ANSWERER = join(PLUGIN_ROOT, 'bin', 'answerer');
 const HOME_PATHS = [
   '~/.ssh/**', '~/.gnupg/**', '~/.aws/**', '~/.config/gcloud/**', '~/.azure/**', '~/.kube/**', '~/.docker/**',
   '~/.netrc', '~/.npmrc', '~/.pypirc', '~/.git-credentials', '~/.claude/**', '~/.claude-team-relay/**',
+  // M5-SPEC §6: the team relay's own device credential.
+  '~/.config/team-relay/**',
   '~/Library/Keychains/**',
   // §7.5
   '~/.config/gh/**', '~/.zsh_history', '~/.bash_history', '~/.*_history',
@@ -37,6 +39,8 @@ function expectedDeny(home: string, tokenFile: string | null, extra: string[] = 
     // The session's own files.
     ...['~/.claude.json', `/${home}/**`].map((p) => `Read(${p})`),
     ...(tokenFile ? [`Read(/${tokenFile})`] : []),
+    // M5-SPEC §6: the credential directory under XDG_CONFIG_HOME (test/helpers/isolate.ts sets it).
+    `Read(/${XDG}/team-relay/**)`,
     ...extra.map((p) => `Read(${p})`),
   ];
 }
@@ -59,6 +63,8 @@ function expectedHooks(home: string) {
   };
 }
 const TOKEN = 'tok-bob-answerer-secret-7';
+/** test/helpers/isolate.ts: an empty private XDG_CONFIG_HOME, so no stored sign-in unless a test writes one. */
+const XDG = process.env.XDG_CONFIG_HOME!;
 
 // Each run gets its own TMPDIR, so the default working directory is a fresh one under it
 // and no test touches the real ${TMPDIR}/team-relay-answerer-<uid>.
@@ -68,6 +74,7 @@ function runAnswerer(env: Record<string, string>, args: string[] = ['--print-com
       PATH: process.env.PATH ?? '/usr/bin:/bin',
       HOME: process.env.HOME ?? '/tmp',
       TMPDIR: mkdtempSync(join(tmpdir(), 'team-relay-ans-tmp-')),
+      XDG_CONFIG_HOME: XDG,
       // Static test tokens; the google default has its own tests below.
       RELAY_AUTH: 'token',
       ...env,
@@ -280,9 +287,10 @@ describe('bin/answerer --print-command', () => {
 
   it('fails clearly when required settings are missing', () => {
     const home = join(mkdtempSync(join(tmpdir(), 'team-relay-ans-')), 'home');
-    const noUrl = runAnswerer({ ANSWERER_HOME: home, RELAY_TEAM: 'demo', RELAY_TOKEN: TOKEN });
-    expect(noUrl.status).not.toBe(0);
-    expect(noUrl.stderr).toMatch(/RELAY_URL is required/);
+    // M5-SPEC §6: without a stored sign-in and without a team, there is nothing to sign in to.
+    const noTeam = runAnswerer({ ANSWERER_HOME: home, RELAY_AUTH: '', RELAY_URL: 'https://relay.example.com' });
+    expect(noTeam.status).not.toBe(0);
+    expect(noTeam.stderr).toMatch(/not connected: run \/team-relay:login in Claude Code first/);
     const noToken = runAnswerer({ ANSWERER_HOME: home, RELAY_URL: 'https://relay.example.com', RELAY_TEAM: 'demo' });
     expect(noToken.status).not.toBe(0);
     expect(noToken.stderr).toMatch(/RELAY_TOKEN/);
@@ -352,7 +360,7 @@ describe('bin/answerer with RELAY_AUTH=google (M2-SPEC §4.1)', () => {
     const base = { ANSWERER_HOME: home, RELAY_URL: 'https://relay.example.com', RELAY_TEAM: 'demo' };
     const badMode = runAnswerer({ ...base, RELAY_AUTH: 'basic' });
     expect(badMode.status).not.toBe(0);
-    expect(badMode.stderr).toMatch(/RELAY_AUTH must be google or token/);
+    expect(badMode.stderr).toMatch(/RELAY_AUTH must be credential, google or token/);
     const badAccount = runAnswerer({ ...base, RELAY_AUTH: 'google', RELAY_GCLOUD_ACCOUNT: '--impersonate-service-account=x@y.z' });
     expect(badAccount.status).not.toBe(0);
     expect(badAccount.stderr).toMatch(/RELAY_GCLOUD_ACCOUNT must be an account email address/);
@@ -742,5 +750,93 @@ describe('bin/answerer session files publish the shared folder names (M4-SPEC §
       await client?.close().catch(() => {});
       await relay.stop();
     }
+  });
+});
+
+describe('bin/answerer with the stored sign-in (M5-SPEC §6)', () => {
+  const CREDENTIAL = `trc_${'Q'.repeat(43)}`;
+  function signedIn(relayUrl = 'https://relay.example.com') {
+    const xdg = realpathSync(mkdtempSync(join(tmpdir(), 'team-relay-ans-xdg-')));
+    const dir = join(xdg, 'team-relay');
+    mkdirSync(dir, { mode: 0o700 });
+    const file = join(dir, 'credentials.json');
+    writeFileSync(
+      file,
+      JSON.stringify({ relay_url: relayUrl, team: 'demo', member: 'bob', credential: CREDENTIAL, expires_at: '2026-12-23T00:00:00Z' }),
+      { mode: 0o600 },
+    );
+    return { xdg, dir, file };
+  }
+  const run = (xdg: string, extra: Record<string, string> = {}) => {
+    const home = join(mkdtempSync(join(tmpdir(), 'team-relay-ans-')), 'home');
+    const r = runAnswerer({ ANSWERER_HOME: home, XDG_CONFIG_HOME: xdg, RELAY_AUTH: '', ...extra });
+    return { home: r.status === 0 ? realpathSync(home) : home, r };
+  };
+
+  it('needs no settings: relay and team come from the credential file, which only the servers read', () => {
+    const { xdg, dir, file } = signedIn();
+    const { home, r } = run(xdg);
+    expect(r.status, r.stderr).toBe(0);
+    expect(existsSync(join(home, 'token'))).toBe(false);
+    const raw = readFileSync(join(home, 'mcp.json'), 'utf8');
+    expect(raw).not.toContain(CREDENTIAL);
+    const mcp = JSON.parse(raw);
+    for (const name of ['relay', 'capabilities']) {
+      expect(mcp.mcpServers[name].env).toMatchObject({
+        RELAY_AUTH: 'credential',
+        RELAY_CREDENTIALS_FILE: file,
+        RELAY_URL: 'https://relay.example.com',
+        RELAY_TEAM: 'demo',
+      });
+      expect(mcp.mcpServers[name].env.RELAY_TOKEN_FILE).toBeUndefined();
+    }
+    expect(JSON.parse(readFileSync(join(home, 'tool-event.json'), 'utf8'))).toEqual({
+      relay_url: 'https://relay.example.com',
+      relay_team: 'demo',
+      relay_auth: 'credential',
+      state_dir: join(home, 'state'),
+      credentials_file: file,
+    });
+    // The deny list covers the default place, the XDG place and the file in use.
+    const deny: string[] = JSON.parse(readFileSync(join(home, 'settings.json'), 'utf8')).permissions.deny;
+    expect(deny).toContain('Read(~/.config/team-relay/**)');
+    expect(deny).toContain(`Read(/${dir}/**)`);
+    expect(deny).toContain(`Read(/${file})`);
+    for (const f of ['settings.json', 'tool-event.json']) expect(readFileSync(join(home, f), 'utf8')).not.toContain(CREDENTIAL);
+  });
+
+  it('refuses RELAY_URL or RELAY_TEAM that name another relay or team', () => {
+    const { xdg } = signedIn();
+    const url = run(xdg, { RELAY_URL: 'https://other.example.com' });
+    expect(url.r.status).not.toBe(0);
+    expect(url.r.stderr).toMatch(/RELAY_URL is not the relay you signed in to/);
+    const team = run(xdg, { RELAY_TEAM: 'other' });
+    expect(team.r.status).not.toBe(0);
+    expect(team.r.stderr).toMatch(/RELAY_TEAM is not the team you signed in to/);
+    expect(run(xdg, { RELAY_URL: 'https://relay.example.com/', RELAY_TEAM: 'demo' }).r.status).toBe(0);
+  });
+
+  it('refuses a credential file others can read, without printing the credential', () => {
+    const { xdg, file } = signedIn();
+    chmodSync(file, 0o644);
+    const { r } = run(xdg);
+    expect(r.status).not.toBe(0);
+    expect(r.stderr).toMatch(/mode 644/);
+    expect(r.stderr).toMatch(/refusing to start: the stored sign-in cannot be used/);
+    expect(r.stderr + r.stdout).not.toContain(CREDENTIAL);
+  });
+
+  it('RELAY_AUTH=credential without a sign-in says to run /team-relay:login', () => {
+    const xdg = realpathSync(mkdtempSync(join(tmpdir(), 'team-relay-ans-xdg-')));
+    const { r } = run(xdg, { RELAY_AUTH: 'credential' });
+    expect(r.status).not.toBe(0);
+    expect(r.stderr).toMatch(/run \/team-relay:login in Claude Code first/);
+  });
+
+  it('refuses to share a folder inside the credential directory', () => {
+    const { xdg, dir } = signedIn();
+    const { r } = run(xdg, { ANSWERER_READ_DIRS: dir });
+    expect(r.status).not.toBe(0);
+    expect(r.stderr).toMatch(/inside a credential location on the deny list/);
   });
 });

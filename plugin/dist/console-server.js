@@ -14791,13 +14791,13 @@ var require__ = __commonJS({
 
 // src/console-server.ts
 import { randomBytes } from "node:crypto";
-import { fileURLToPath as fileURLToPath2 } from "node:url";
+import { fileURLToPath as fileURLToPath3 } from "node:url";
 
 // src/console-app.ts
 import { createHash as createHash2, timingSafeEqual } from "node:crypto";
-import { existsSync, readFileSync as readFileSync3, realpathSync, statSync } from "node:fs";
+import { existsSync, readFileSync as readFileSync5, realpathSync, statSync } from "node:fs";
 import { createServer } from "node:http";
-import { extname, join, sep } from "node:path";
+import { extname, join as join2, sep } from "node:path";
 
 // src/console-demo.ts
 import { createHash } from "node:crypto";
@@ -22761,9 +22761,157 @@ function iapVerifier(opts) {
 
 // src/relay-client.ts
 import { execFile } from "node:child_process";
-import { readFileSync as readFileSync2 } from "node:fs";
+import { readFileSync as readFileSync4 } from "node:fs";
+
+// src/credentials.ts
+import {
+  chmodSync,
+  closeSync,
+  fsyncSync,
+  lstatSync,
+  mkdirSync,
+  openSync,
+  readFileSync as readFileSync2,
+  renameSync,
+  rmSync,
+  unlinkSync,
+  writeSync
+} from "node:fs";
+import { homedir } from "node:os";
+import { basename, dirname, isAbsolute, join } from "node:path";
+
+// src/relay-client-core.ts
 var TEAM_RE = /^[a-z][a-z0-9_-]{1,31}$/;
 var MEMBER_RE = /^[a-z][a-z0-9_]{1,31}$/;
+var LOOPBACK = /* @__PURE__ */ new Set(["localhost", "127.0.0.1", "[::1]", "::1"]);
+function parseRelayUrl(raw) {
+  if (!raw) throw new Error("RELAY_URL must be set");
+  let url;
+  try {
+    url = new URL(raw);
+  } catch {
+    throw new Error("RELAY_URL is not a valid URL");
+  }
+  if (url.username || url.password) throw new Error("RELAY_URL must not carry credentials");
+  if (url.search || url.hash) throw new Error("RELAY_URL must not carry a query or fragment");
+  if (url.protocol === "https:") return url;
+  if (url.protocol === "http:" && LOOPBACK.has(url.hostname)) return url;
+  throw new Error("RELAY_URL must be https (plain http is allowed only to localhost)");
+}
+
+// src/credentials.ts
+var CREDENTIAL_RE = /^trc_[A-Za-z0-9_-]{43}$/;
+var CREDENTIALS_DIR = "team-relay";
+var CREDENTIALS_FILE = "credentials.json";
+var MAX_FILE_BYTES = 16 * 1024;
+var CredentialFileError = class extends Error {
+  constructor(message2) {
+    super(message2);
+    this.name = "CredentialFileError";
+  }
+};
+function credentialsPath(env = process.env) {
+  const explicit = env.RELAY_CREDENTIALS_FILE?.trim();
+  if (explicit) {
+    if (!isAbsolute(explicit)) throw new CredentialFileError("RELAY_CREDENTIALS_FILE must be an absolute path");
+    return explicit;
+  }
+  const xdg = env.XDG_CONFIG_HOME?.trim();
+  const base = xdg && isAbsolute(xdg) ? xdg : join(env.HOME?.trim() || homedir(), ".config");
+  return join(base, CREDENTIALS_DIR, CREDENTIALS_FILE);
+}
+function uid() {
+  return typeof process.getuid === "function" ? process.getuid() : null;
+}
+function checkOwnedPrivate(st, what, kind) {
+  if (st.isSymbolicLink()) throw new CredentialFileError(`${what} is a symbolic link; refusing to use it`);
+  if (kind === "file" ? !st.isFile() : !st.isDirectory()) throw new CredentialFileError(`${what} is not a ${kind}; refusing to use it`);
+  const me = uid();
+  if (me !== null && st.uid !== me) throw new CredentialFileError(`${what} is owned by another user; refusing to use it`);
+  if ((st.mode & 63) !== 0) {
+    const mode = (st.mode & 511).toString(8).padStart(3, "0");
+    throw new CredentialFileError(
+      `${what} has mode ${mode}, readable or writable by others; refusing to use it (run /team-relay:logout and /team-relay:login again, or chmod ${kind === "file" ? "600" : "700"} it)`
+    );
+  }
+}
+var RFC3339 = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,9})?(Z|[+-]\d{2}:\d{2})$/;
+function normaliseRelayUrl(raw) {
+  const url = parseRelayUrl(raw);
+  const path = url.pathname.replace(/\/+$/, "");
+  return `${url.protocol}//${url.host}${path}`;
+}
+function parseStoredCredential(raw) {
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) throw new CredentialFileError("the credential file is not a JSON object");
+  const c = raw;
+  const { relay_url, team, member, credential, expires_at } = c;
+  if (typeof relay_url !== "string") throw new CredentialFileError("the credential file has no relay_url");
+  let url;
+  try {
+    url = normaliseRelayUrl(relay_url);
+  } catch {
+    throw new CredentialFileError("the credential file has an invalid relay_url");
+  }
+  if (typeof team !== "string" || !TEAM_RE.test(team)) throw new CredentialFileError("the credential file has an invalid team");
+  if (typeof member !== "string" || !MEMBER_RE.test(member)) throw new CredentialFileError("the credential file has an invalid member");
+  if (typeof credential !== "string" || !CREDENTIAL_RE.test(credential)) throw new CredentialFileError("the credential file has an invalid credential");
+  if (expires_at !== void 0 && expires_at !== null && (typeof expires_at !== "string" || !RFC3339.test(expires_at))) {
+    throw new CredentialFileError("the credential file has an invalid expires_at");
+  }
+  return { relay_url: url, team, member, credential, expires_at: typeof expires_at === "string" ? expires_at : null };
+}
+function readCredential(path) {
+  let st;
+  try {
+    st = lstatSync(path);
+  } catch (err) {
+    if (err.code === "ENOENT" || err.code === "ENOTDIR") return null;
+    throw new CredentialFileError(`cannot read the credential file (${err.code ?? "error"})`);
+  }
+  checkOwnedPrivate(lstatSync(dirname(path)), "the credential directory", "directory");
+  checkOwnedPrivate(st, "the credential file", "file");
+  if (st.size > MAX_FILE_BYTES) throw new CredentialFileError("the credential file is too large");
+  let text;
+  try {
+    text = readFileSync2(path, "utf8");
+  } catch (err) {
+    throw new CredentialFileError(`cannot read the credential file (${err.code ?? "error"})`);
+  }
+  let json;
+  try {
+    json = JSON.parse(text);
+  } catch {
+    throw new CredentialFileError("the credential file is not valid JSON");
+  }
+  return parseStoredCredential(json);
+}
+function credentialFileExists(path) {
+  try {
+    lstatSync(path);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// src/relay-default.ts
+import { readFileSync as readFileSync3 } from "node:fs";
+import { fileURLToPath as fileURLToPath2 } from "node:url";
+function defaultRelayFile() {
+  return fileURLToPath2(new URL("../relay.default.json", import.meta.url));
+}
+function defaultRelayUrl(file = defaultRelayFile()) {
+  try {
+    const raw = JSON.parse(readFileSync3(file, "utf8"));
+    if (typeof raw.relay_url !== "string") return null;
+    parseRelayUrl(raw.relay_url);
+    return raw.relay_url;
+  } catch {
+    return null;
+  }
+}
+
+// src/relay-client.ts
 var REQUEST_ID_RE = /^rq_[0-9a-f]{32}$/;
 var RelayError = class extends Error {
   status;
@@ -22805,7 +22953,7 @@ function tokenProviderFromEnv(env) {
     return () => {
       let raw;
       try {
-        raw = readFileSync2(file, "utf8");
+        raw = readFileSync4(file, "utf8");
       } catch (err) {
         throw new Error(`cannot read RELAY_TOKEN_FILE (${err.code ?? "error"})`);
       }
@@ -22934,33 +23082,74 @@ function metadataTokenProvider(opts) {
   });
 }
 function authModeFromEnv(env) {
-  const mode = configValue(env.RELAY_AUTH) ?? "google";
-  if (mode !== "google" && mode !== "token" && mode !== "metadata") {
-    throw new Error('RELAY_AUTH must be "google" or "token" (or "metadata" on Google Cloud)');
+  const explicit = configValue(env.RELAY_AUTH);
+  if (explicit === void 0) return credentialFileExists(credentialsPath(env)) ? "credential" : "google";
+  if (explicit !== "credential" && explicit !== "google" && explicit !== "token" && explicit !== "metadata") {
+    throw new Error('RELAY_AUTH must be "credential", "google" or "token" (or "metadata" on Google Cloud)');
   }
-  return mode;
+  return explicit;
 }
-function credentialsFromEnv(env, gcloud = {}) {
+var NotConnected = class extends Error {
+  constructor(message2 = "Not connected: run /team-relay:login") {
+    super(message2);
+    this.name = "NotConnected";
+  }
+};
+var SIGN_IN_AGAIN = "the relay refused your sign-in (signed out, expired, or no longer on the team): run /team-relay:login again";
+function credentialTokenProvider(path, bound) {
+  const relay = normaliseRelayUrl(bound.relay_url);
+  return Object.assign(
+    () => {
+      const stored = readCredential(path);
+      if (!stored) throw new NotConnected();
+      if (stored.relay_url !== relay || stored.team !== bound.team) {
+        throw new NotConnected("you signed in to another relay or team since this started: restart it");
+      }
+      return stored.credential;
+    },
+    { kind: "credential", path }
+  );
+}
+function isCredentialProvider(p) {
+  return p.kind === "credential";
+}
+function connectionFromEnv(env, gcloud = {}) {
+  const explicitMode = configValue(env.RELAY_AUTH) !== void 0;
   const mode = authModeFromEnv(env);
-  if (mode === "token") return tokenProviderFromEnv(env);
-  if (mode === "metadata") return metadataTokenProvider({ audience: configValue(env.RELAY_URL) ?? "" });
-  const account = configValue(env.RELAY_GCLOUD_ACCOUNT);
-  return gcloudTokenProvider({ env, ...gcloud, ...account !== void 0 ? { account } : {} });
-}
-var LOOPBACK = /* @__PURE__ */ new Set(["localhost", "127.0.0.1", "[::1]", "::1"]);
-function parseRelayUrl(raw) {
-  if (!raw) throw new Error("RELAY_URL must be set");
-  let url;
-  try {
-    url = new URL(raw);
-  } catch {
-    throw new Error("RELAY_URL is not a valid URL");
+  if (mode === "credential") {
+    const path = credentialsPath(env);
+    const stored = readCredential(path);
+    if (!stored) throw new NotConnected();
+    const envUrl = configValue(env.RELAY_URL);
+    if (envUrl !== void 0) {
+      let same = false;
+      try {
+        same = normaliseRelayUrl(envUrl) === stored.relay_url;
+      } catch {
+        same = false;
+      }
+      if (!same) throw new Error("RELAY_URL is not the relay you signed in to: unset it, or run /team-relay:login <relay-url>");
+    }
+    const envTeam = configValue(env.RELAY_TEAM);
+    if (envTeam !== void 0 && envTeam !== stored.team) {
+      throw new Error("RELAY_TEAM is not the team you signed in to: unset it, or run /team-relay:login again");
+    }
+    return { mode, url: stored.relay_url, team: stored.team, member: stored.member, token: credentialTokenProvider(path, stored) };
   }
-  if (url.username || url.password) throw new Error("RELAY_URL must not carry credentials");
-  if (url.search || url.hash) throw new Error("RELAY_URL must not carry a query or fragment");
-  if (url.protocol === "https:") return url;
-  if (url.protocol === "http:" && LOOPBACK.has(url.hostname)) return url;
-  throw new Error("RELAY_URL must be https (plain http is allowed only to localhost)");
+  const team = configValue(env.RELAY_TEAM);
+  if (!team) {
+    if (!explicitMode) throw new NotConnected();
+    throw new Error("RELAY_TEAM must be set");
+  }
+  const url = configValue(env.RELAY_URL) ?? (mode === "google" ? defaultRelayUrl() : null) ?? "";
+  let token;
+  if (mode === "token") token = tokenProviderFromEnv(env);
+  else if (mode === "metadata") token = metadataTokenProvider({ audience: configValue(env.RELAY_URL) ?? "" });
+  else {
+    const account = configValue(env.RELAY_GCLOUD_ACCOUNT);
+    token = gcloudTokenProvider({ env, ...gcloud, ...account !== void 0 ? { account } : {} });
+  }
+  return { mode, url, team, token };
 }
 var ON_BEHALF_OF_RE = /^[a-z0-9._%+-]{1,64}@[a-z0-9.-]{1,253}$/;
 var defaultSleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -22987,6 +23176,10 @@ var RelayClient = class {
     this.sleep = opts.sleep ?? defaultSleep;
     this.random = opts.random ?? Math.random;
     this.userAgent = opts.userAgent ?? "team-relay-plugin/0.1.0";
+  }
+  /** The relay's base URL (without a trailing slash). */
+  get url() {
+    return this.base.toString().replace(/\/$/, "");
   }
   teamPath(...parts) {
     return ["v1", "teams", this.team, ...parts].map(encodeURIComponent).join("/");
@@ -23057,6 +23250,9 @@ var RelayClient = class {
           refreshed = true;
           this.token.invalidate();
           continue;
+        }
+        if (err instanceof RelayError && err.status === 401 && isCredentialProvider(this.token)) {
+          throw new RelayError(401, err.code, SIGN_IN_AGAIN);
         }
         if (attempt + 1 >= attempts || !isRetryable(err)) throw err;
         await this.sleep(backoffDelay(attempt, this.backoff, this.random));
@@ -23134,6 +23330,28 @@ var RelayClient = class {
       ...opts
     });
   }
+  /** M6-SPEC §2: the team's roster (owners see every email; members only their own). */
+  roster(opts) {
+    return this.call("GET", this.teamPath("roster"), void 0, opts);
+  }
+  /** M6-SPEC §2 (owners): add a member. Not idempotent, so sent once. */
+  addMember(body, opts) {
+    return this.call("POST", this.teamPath("roster"), body, { attempts: 1, ...opts });
+  }
+  /** M6-SPEC §2 (owners): add or remove one email, or change the role. Sent once. */
+  updateMember(member, body, opts) {
+    if (!MEMBER_RE.test(member)) throw new Error("invalid member id");
+    return this.call("PATCH", this.teamPath("roster", member), body, { attempts: 1, ...opts });
+  }
+  /** M6-SPEC §2 (owners): remove a member (their device credentials are revoked). Sent once. */
+  removeMember(member, opts) {
+    if (!MEMBER_RE.test(member)) throw new Error("invalid member id");
+    return this.call("DELETE", this.teamPath("roster", member), void 0, { attempts: 1, ...opts });
+  }
+  /** M5-SPEC §3: revoke the credential this client signs in with (logout). */
+  revokeSelf(opts) {
+    return this.call("DELETE", this.teamPath("credentials", "self"), void 0, { attempts: 1, ...opts });
+  }
   /** M2-SPEC §3.5: the team's activity feed. */
   activity(q = {}, opts) {
     const params = new URLSearchParams();
@@ -23144,9 +23362,8 @@ var RelayClient = class {
   }
 };
 function relayClientFromEnv(env, extra = {}) {
-  const team = configValue(env.RELAY_TEAM);
-  if (!team) throw new Error("RELAY_TEAM must be set");
-  return new RelayClient({ url: configValue(env.RELAY_URL) ?? "", team, token: credentialsFromEnv(env), ...extra });
+  const c = connectionFromEnv(env);
+  return new RelayClient({ url: c.url, team: c.team, token: c.token, ...extra });
 }
 
 // src/console-app.ts
@@ -23188,7 +23405,7 @@ var MIME = {
   ".ttf": "font/ttf",
   ".txt": "text/plain; charset=utf-8"
 };
-var RFC3339 = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,9})?(Z|[+-]\d{2}:\d{2})$/;
+var RFC33392 = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,9})?(Z|[+-]\d{2}:\d{2})$/;
 function relayBackend(client) {
   const opts = (ctx) => ({
     attempts: 1,
@@ -23326,7 +23543,7 @@ function createConsoleServer(opts) {
       }
       const since = url.searchParams.get("since");
       if (since !== null) {
-        if (!RFC3339.test(since)) return sendJson(res, 400, { error: "bad_request", detail: "since must be an RFC 3339 time" });
+        if (!RFC33392.test(since)) return sendJson(res, 400, { error: "bad_request", detail: "since must be an RFC 3339 time" });
         q.since = since;
       }
       const limit = url.searchParams.get("limit");
@@ -23360,7 +23577,7 @@ function createConsoleServer(opts) {
     const head = req.method === "HEAD";
     if (req.method !== "GET" && !head) return send(res, 405, "method not allowed\n", "text/plain; charset=utf-8", { Allow: "GET, HEAD" });
     const html = (body) => send(res, 200, body, MIME[".html"], { "Cache-Control": "no-cache" }, head);
-    const index = staticRoot ? join(staticRoot, "index.html") : null;
+    const index = staticRoot ? join2(staticRoot, "index.html") : null;
     if (!staticRoot || !index || !existsSync(index)) return html(PLACEHOLDER);
     let rel;
     try {
@@ -23371,8 +23588,8 @@ function createConsoleServer(opts) {
     if (rel.includes("\0") || rel.includes("\\") || rel.split("/").some((seg) => seg === ".." || seg === ".")) {
       return send(res, 400, "bad path\n", "text/plain; charset=utf-8");
     }
-    if (rel === "/" || rel === "") return html(readFileSync3(index));
-    const candidate = join(staticRoot, rel);
+    if (rel === "/" || rel === "") return html(readFileSync5(index));
+    const candidate = join2(staticRoot, rel);
     let real = null;
     try {
       real = realpathSync(candidate);
@@ -23382,9 +23599,9 @@ function createConsoleServer(opts) {
     if (real && real.startsWith(staticRoot + sep) && statSync(real).isFile()) {
       const type = MIME[extname(real).toLowerCase()] ?? "application/octet-stream";
       const cache2 = rel.startsWith("/assets/") ? `${hosted2 ? "private" : "public"}, max-age=31536000, immutable` : "no-cache";
-      return send(res, 200, readFileSync3(real), type, { "Cache-Control": cache2 }, head);
+      return send(res, 200, readFileSync5(real), type, { "Cache-Control": cache2 }, head);
     }
-    if (!extname(rel)) return html(readFileSync3(index));
+    if (!extname(rel)) return html(readFileSync5(index));
     return send(res, 404, "not found\n", "text/plain; charset=utf-8");
   }
   const unauthorized = (res) => send(res, 401, "unauthorized\n", "text/plain; charset=utf-8", { "Cache-Control": "no-store" });
@@ -23457,9 +23674,9 @@ function createConsoleServer(opts) {
 
 // src/console-open.ts
 import { execFile as execFile2 } from "node:child_process";
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync as chmodSync2, mkdtempSync, rmSync as rmSync2, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join as join2 } from "node:path";
+import { isAbsolute as isAbsolute2, join as join3 } from "node:path";
 var REDIRECT_TTL_MS = 1e4;
 var REDIRECT_FILE = "console.html";
 var defaultRun = (command, args, done) => {
@@ -23468,44 +23685,48 @@ var defaultRun = (command, args, done) => {
 function escapeHtml(text) {
   return text.replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
 }
-function redirectHtml(url) {
+function redirectHtml(url, title = "Team console") {
   const u = escapeHtml(url);
+  const t = escapeHtml(title);
   return [
     "<!doctype html>",
     '<html lang="en"><head><meta charset="utf-8">',
     '<meta name="referrer" content="no-referrer">',
     `<meta http-equiv="refresh" content="0;url=${u}">`,
-    "<title>Team console</title></head>",
-    `<body><p><a href="${u}">Open the team console</a></p></body></html>`,
+    `<title>${t}</title></head>`,
+    `<body><p><a href="${u}">${t}</a></p></body></html>`,
     ""
   ].join("\n");
 }
-function openerFor(platform) {
+function openerFor(platform, env = process.env) {
+  const custom = env.TEAM_RELAY_OPEN_COMMAND?.trim();
+  if (custom) return isAbsolute2(custom) ? custom : null;
   if (platform === "darwin") return "open";
   if (platform === "linux") return "xdg-open";
   return null;
 }
 function openInBrowser(url, opts) {
-  const opener = openerFor(opts.platform ?? process.platform);
+  const what = opts.what ?? "the URL above";
+  const opener = opts.opener ?? openerFor(opts.platform ?? process.platform);
   if (!opener) {
-    opts.log("--open is not supported on this platform; open the URL above yourself");
+    opts.log(`no browser opener on this platform; open ${what} yourself`);
     return null;
   }
   let dir;
   try {
-    dir = mkdtempSync(join2(opts.tmpRoot ?? tmpdir(), "team-relay-console-"));
-    chmodSync(dir, 448);
+    dir = mkdtempSync(join3(opts.tmpRoot ?? tmpdir(), "team-relay-console-"));
+    chmodSync2(dir, 448);
   } catch {
-    opts.log("could not prepare the browser hand-off; open the URL above yourself");
+    opts.log(`could not prepare the browser hand-off; open ${what} yourself`);
     return null;
   }
-  const cleanup = () => rmSync(dir, { recursive: true, force: true });
-  const file = join2(dir, REDIRECT_FILE);
+  const cleanup = () => rmSync2(dir, { recursive: true, force: true });
+  const file = join3(dir, REDIRECT_FILE);
   try {
-    writeFileSync(file, redirectHtml(url), { mode: 384, flag: "wx" });
+    writeFileSync(file, redirectHtml(url, opts.title), { mode: 384, flag: "wx" });
   } catch {
     cleanup();
-    opts.log("could not prepare the browser hand-off; open the URL above yourself");
+    opts.log(`could not prepare the browser hand-off; open ${what} yourself`);
     return null;
   }
   process.once("exit", cleanup);
@@ -23514,7 +23735,7 @@ function openInBrowser(url, opts) {
     cleanup();
   }, opts.deleteAfterMs ?? REDIRECT_TTL_MS).unref();
   (opts.run ?? defaultRun)(opener, [file], (err) => {
-    if (err) opts.log(`could not open a browser (${opener}); open the URL above yourself`);
+    if (err) opts.log(`could not open a browser (${opener}); open ${what} yourself`);
   });
   return file;
 }
@@ -23587,7 +23808,7 @@ async function hosted() {
   let audience;
   let backend;
   let team;
-  let join3;
+  let join4;
   try {
     const repoUrl = checkJoinRepoUrl(env.JOIN_REPO_URL);
     publicHost = checkPublicHost(configValue(env.CONSOLE_PUBLIC_HOST));
@@ -23596,14 +23817,14 @@ async function hosted() {
     const client = relayClientFromEnv(env);
     backend = relayBackend(client);
     team = client.team;
-    join3 = joinInfo(configValue(env.RELAY_URL) ?? "", team, repoUrl);
+    join4 = joinInfo(configValue(env.RELAY_URL) ?? "", team, repoUrl);
   } catch (err) {
     fail(`configuration error: ${describeError(err)}`);
   }
   const keys = new IapKeySet({ log });
   const verify = iapVerifier({ audience, keys, log });
-  const staticDir = fileURLToPath2(new URL("./console/", import.meta.url));
-  const app = createConsoleServer({ backend, hosted: { publicHost, verify }, staticDir, join: join3, log });
+  const staticDir = fileURLToPath3(new URL("./console/", import.meta.url));
+  const app = createConsoleServer({ backend, hosted: { publicHost, verify }, staticDir, join: join4, log });
   let bound;
   try {
     bound = await app.listen(port);
@@ -23632,11 +23853,11 @@ async function main() {
   }
   let backend;
   let label;
-  let join3;
+  let join4;
   if (flags.demo) {
     backend = demoBackend(new DemoTeam());
     label = "demo team (synthetic: alice, bob, carol)";
-    join3 = DEMO_JOIN;
+    join4 = DEMO_JOIN;
   } else {
     let client;
     try {
@@ -23646,11 +23867,11 @@ async function main() {
     }
     backend = relayBackend(client);
     label = `team ${client.team}`;
-    join3 = joinInfo(configValue(process.env.RELAY_URL) ?? "", client.team, repoUrl);
+    join4 = joinInfo(configValue(process.env.RELAY_URL) ?? "", client.team, repoUrl);
   }
   const key = randomBytes(32).toString("base64url");
-  const staticDir = fileURLToPath2(new URL("./console/", import.meta.url));
-  const app = createConsoleServer({ backend, key, staticDir, join: join3, log });
+  const staticDir = fileURLToPath3(new URL("./console/", import.meta.url));
+  const app = createConsoleServer({ backend, key, staticDir, join: join4, log });
   let bound;
   try {
     bound = await app.listen(port);

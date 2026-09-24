@@ -6,6 +6,7 @@ export default defineConfig({
     // The end-to-end gate needs a relay and an emulator: `pnpm test:e2e` via scripts/e2e.sh.
     exclude: [...configDefaults.exclude, 'test/e2e/**'],
     globalSetup: ['test/helpers/global-setup.ts'],
+    setupFiles: ['test/helpers/isolate.ts'],
     testTimeout: 30_000,
     hookTimeout: 30_000,
   },

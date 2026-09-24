@@ -18,14 +18,23 @@
 #
 # These are permission rules, not an OS sandbox: see the plugin README.
 #
-# Environment:
-#   RELAY_URL, RELAY_TEAM                  required
-#   RELAY_AUTH                             google (default) or token
+# Environment (none of the relay settings is needed after /team-relay:login, M5-SPEC §6):
+#   RELAY_AUTH                             optional; unset: the credential /team-relay:login
+#                                          stored (see RELAY_CREDENTIALS_FILE) if there is one,
+#                                          else google. credential, google or token.
+#   RELAY_URL, RELAY_TEAM                  credential: taken from the stored sign-in (when set,
+#                                          they must name the same relay and team). google and
+#                                          token: RELAY_TEAM is required; RELAY_URL defaults to
+#                                          the plugin's relay (relay.default.json)
+#   RELAY_CREDENTIALS_FILE                 optional; the credential file (absolute). Default:
+#                                          $XDG_CONFIG_HOME/team-relay/credentials.json, or
+#                                          ~/.config/team-relay/credentials.json. Never readable
+#                                          by the session (deny list)
 #   RELAY_GCLOUD_ACCOUNT                   optional (google): the gcloud account whose ID
 #                                          token identifies you (gcloud's active one otherwise)
 #   RELAY_TOKEN_FILE or RELAY_TOKEN        required when RELAY_AUTH is token (the file wins; a
 #                                          RELAY_TOKEN value is written to a mode-600 file,
-#                                          never into mcp.json); ignored for google
+#                                          never into mcp.json); ignored otherwise
 #   ALLOW_PRODUCTION                       "true" to allow production-data capabilities
 #   CAP_<NAME>_ENABLED, CAP_<NAME>_RUNNER  per capability (NAME is the capability name uppercased)
 #   MANIFEST_PATH                          optional; defaults to the plugin's manifest.yaml
@@ -63,19 +72,13 @@ die() {
 
 plugin_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 
-[[ -n "${RELAY_URL:-}" ]] || die "RELAY_URL is required"
-[[ -n "${RELAY_TEAM:-}" ]] || die "RELAY_TEAM is required"
-relay_auth="${RELAY_AUTH:-google}"
-case "$relay_auth" in
-  google | token) ;;
-  *) die "RELAY_AUTH must be google or token" ;;
-esac
-if [[ "$relay_auth" == "token" && -z "${RELAY_TOKEN_FILE:-}" && -z "${RELAY_TOKEN:-}" ]]; then
-  die "RELAY_AUTH is token, so RELAY_TOKEN_FILE or RELAY_TOKEN is required"
-fi
 if [[ -n "${RELAY_GCLOUD_ACCOUNT:-}" && ! "$RELAY_GCLOUD_ACCOUNT" =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+$ ]]; then
   die "RELAY_GCLOUD_ACCOUNT must be an account email address"
 fi
+case "${RELAY_AUTH:-}" in
+  "" | credential | google | token) ;;
+  *) die "RELAY_AUTH must be credential, google or token" ;;
+esac
 
 node_bin="$(command -v node || true)"
 [[ -n "$node_bin" ]] || die "node is required (Node 22 or later)"
@@ -98,6 +101,64 @@ physical_path() {
   printf '%s\n' "${phys}${rest:-}"
 }
 
+# --- Who the session signs in as (M5-SPEC §6) --------------------------------------------
+# One implementation of the credential file's rules (dist/credential-info.js): it prints the
+# stored sign-in's relay, team and member (never the credential), or says why the file must
+# not be used.
+credentials_file=""
+relay_auth="${RELAY_AUTH:-}"
+if [[ -z "$relay_auth" || "$relay_auth" == "credential" ]]; then
+  set +e
+  info="$("$node_bin" "$plugin_root/dist/credential-info.js")"
+  info_status=$?
+  set -e
+  case "$info_status" in
+    0) relay_auth="credential" ;;
+    3)
+      [[ "$relay_auth" == "credential" ]] && die "RELAY_AUTH is credential, but you have not signed in: run /team-relay:login in Claude Code first"
+      relay_auth="google"
+      ;;
+    *) die "refusing to start: the stored sign-in cannot be used (see above); run /team-relay:login in Claude Code again" ;;
+  esac
+fi
+if [[ "$relay_auth" == "credential" ]]; then
+  read_info() { ANSWERER_INFO="$info" "$node_bin" -e 'process.stdout.write(String(JSON.parse(process.env.ANSWERER_INFO)[process.argv[1]]))' "$1"; }
+  credentials_file="$(read_info path)"
+  stored_url="$(read_info relay_url)"
+  stored_team="$(read_info team)"
+  if [[ -n "${RELAY_URL:-}" && "${RELAY_URL%/}" != "$stored_url" ]]; then
+    die "RELAY_URL is not the relay you signed in to ($stored_url): unset it, or run /team-relay:login <relay-url>"
+  fi
+  if [[ -n "${RELAY_TEAM:-}" && "$RELAY_TEAM" != "$stored_team" ]]; then
+    die "RELAY_TEAM is not the team you signed in to ($stored_team): unset it, or run /team-relay:login again"
+  fi
+  RELAY_URL="$stored_url"
+  RELAY_TEAM="$stored_team"
+else
+  [[ -n "${RELAY_TEAM:-}" ]] || die "not connected: run /team-relay:login in Claude Code first (or set RELAY_TEAM, and RELAY_URL, to sign in with gcloud)"
+  if [[ -z "${RELAY_URL:-}" ]]; then
+    RELAY_URL="$("$node_bin" "$plugin_root/dist/credential-info.js" --default-relay)"
+    [[ -n "$RELAY_URL" ]] || die "RELAY_URL is required"
+  fi
+  if [[ "$relay_auth" == "token" && -z "${RELAY_TOKEN_FILE:-}" && -z "${RELAY_TOKEN:-}" ]]; then
+    die "RELAY_AUTH is token, so RELAY_TOKEN_FILE or RELAY_TOKEN is required"
+  fi
+fi
+export RELAY_URL RELAY_TEAM
+
+# Where credential files live, for the deny list: the default place and the one in use.
+credential_dirs=()
+config_home="${XDG_CONFIG_HOME:-}"
+if [[ -n "$config_home" && "$config_home" == /* ]]; then
+  credential_dirs+=("$config_home/team-relay")
+fi
+if [[ -n "$credentials_file" ]]; then
+  credential_dirs+=("$(dirname "$credentials_file")")
+elif [[ -n "${RELAY_CREDENTIALS_FILE:-}" && "$RELAY_CREDENTIALS_FILE" == /* ]]; then
+  credential_dirs+=("$(dirname "$RELAY_CREDENTIALS_FILE")")
+fi
+credential_dirs_json="$("$node_bin" -e 'process.stdout.write(JSON.stringify(process.argv.slice(1)))' ${credential_dirs[@]+"${credential_dirs[@]}"})"
+
 home="${ANSWERER_HOME:-$HOME/.claude-team-relay/answerer}"
 home_target="$(physical_path "$home")"
 
@@ -110,7 +171,7 @@ read -r -d '' DENY_LISTS_JS <<'JS' || true
 const HOME_PATHS = [
   "~/.ssh/**", "~/.gnupg/**", "~/.aws/**", "~/.config/gcloud/**", "~/.azure/**", "~/.kube/**",
   "~/.docker/**", "~/.netrc", "~/.npmrc", "~/.pypirc", "~/.git-credentials", "~/.claude/**",
-  "~/.claude-team-relay/**", "~/Library/Keychains/**",
+  "~/.claude-team-relay/**", "~/.config/team-relay/**", "~/Library/Keychains/**",
   "~/.config/gh/**", "~/.zsh_history", "~/.bash_history", "~/.*_history",
   "~/Library/Application Support/**/Cookies*", "~/Library/Application Support/Firefox/**",
   "~/Library/Application Support/Google/Chrome/**", "~/.terraform.d/**", "~/.cargo/credentials*",
@@ -186,6 +247,10 @@ const credentialHit = (p) => {
     if (p.split("/").some((part) => part !== "" && re.test(part))) return rule;
   }
   if (e.CLOUDSDK_CONFIG && e.CLOUDSDK_CONFIG.startsWith("/") && within(p, realOr(e.CLOUDSDK_CONFIG))) return "CLOUDSDK_CONFIG";
+  // M5-SPEC §6: the team relay's own credential directories.
+  for (const d of JSON.parse(e.ANSWERER_CREDENTIAL_DIRS || "[]")) {
+    if (within(p, d) || within(p, realOr(d))) return d + "/**";
+  }
   return null;
 };
 const homeReal = realOr(e.HOME);
@@ -230,7 +295,7 @@ entries.forEach((entry, i) => {
 });
 process.stdout.write(JSON.stringify({ dirs, shares }));
 JS
-read_dirs_json="$(ANSWERER_HOME_TARGET="${home_target:-/}" "$node_bin" --input-type=module -e "${DENY_LISTS_JS}
+read_dirs_json="$(ANSWERER_HOME_TARGET="${home_target:-/}" ANSWERER_CREDENTIAL_DIRS="$credential_dirs_json" "$node_bin" --input-type=module -e "${DENY_LISTS_JS}
 ${READ_DIRS_JS}")"
 
 # --- The session's working directory (M1-SPEC §11.13) -----------------------------------
@@ -324,8 +389,9 @@ chmod 700 "$home" "$home/config" "$home/state"
 home="$(cd "$home" && pwd -P)"
 
 token_file=""
-if [[ "$relay_auth" == "google" ]]; then
-  # Your gcloud identity: no token is stored anywhere; drop one a token-mode run left behind.
+if [[ "$relay_auth" == "google" || "$relay_auth" == "credential" ]]; then
+  # Your gcloud identity or your stored sign-in: no token is kept here; drop one a token-mode
+  # run left behind.
   rm -f "$home/token"
 elif [[ -n "${RELAY_TOKEN_FILE:-}" ]]; then
   [[ -r "$RELAY_TOKEN_FILE" ]] || die "RELAY_TOKEN_FILE is not readable"
@@ -346,6 +412,7 @@ import { writeFileSync } from "node:fs";
 const e = process.env;
 const out = e.ANSWERER_OUT;
 const google = e.ANSWERER_AUTH === "google";
+const credential = e.ANSWERER_AUTH === "credential";
 const stateDir = out + "/state";
 const { dirs, shares } = JSON.parse(e.ANSWERER_READ_DIRS_JSON);
 const common = {
@@ -362,6 +429,9 @@ if (google) {
   for (const [k, v] of Object.entries(e)) {
     if (/^CLOUDSDK_[A-Z0-9_]+$/.test(k) && typeof v === "string") common[k] = v;
   }
+} else if (credential) {
+  // M5-SPEC §6: the credential /team-relay:login stored, named by its absolute path.
+  common.RELAY_CREDENTIALS_FILE = e.ANSWERER_CREDENTIALS_FILE;
 } else {
   common.RELAY_TOKEN_FILE = e.ANSWERER_TOKEN_FILE;
 }
@@ -385,6 +455,9 @@ const readDeny = [...HOME_PATHS];
 for (const p of ANY_DEPTH) readDeny.push(p, "~/" + p, "//" + p);
 readDeny.push("~/.claude.json", anchored(out) + "/**");
 if (e.ANSWERER_TOKEN_FILE) readDeny.push(anchored(e.ANSWERER_TOKEN_FILE));
+// M5-SPEC §6: the team relay's credential file and directory, wherever they are.
+for (const d of JSON.parse(e.ANSWERER_CREDENTIAL_DIRS || "[]")) readDeny.push(anchored(d) + "/**");
+if (e.ANSWERER_CREDENTIALS_FILE) readDeny.push(anchored(e.ANSWERER_CREDENTIALS_FILE));
 if (google && e.CLOUDSDK_CONFIG && e.CLOUDSDK_CONFIG.startsWith("/")) readDeny.push(anchored(e.CLOUDSDK_CONFIG) + "/**");
 if (e.CLAUDE_CONFIG_DIR && e.CLAUDE_CONFIG_DIR.startsWith("/")) readDeny.push(anchored(e.CLAUDE_CONFIG_DIR) + "/**");
 const deny = ["Bash", "Write", "Edit", "NotebookEdit", "WebFetch", "WebSearch", "Agent", "Task"];
@@ -434,7 +507,8 @@ const settings = {
 };
 const toolEvent = { relay_url: e.RELAY_URL, relay_team: e.RELAY_TEAM, relay_auth: e.ANSWERER_AUTH, state_dir: stateDir };
 if (google && e.RELAY_GCLOUD_ACCOUNT) toolEvent.gcloud_account = e.RELAY_GCLOUD_ACCOUNT;
-if (!google) toolEvent.token_file = e.ANSWERER_TOKEN_FILE;
+if (credential) toolEvent.credentials_file = e.ANSWERER_CREDENTIALS_FILE;
+else if (!google) toolEvent.token_file = e.ANSWERER_TOKEN_FILE;
 const write = (name, value) => writeFileSync(out + "/" + name, JSON.stringify(value, null, 2) + "\n", { mode: 0o600 });
 write("mcp.json", mcp);
 write("settings.json", settings);
@@ -442,7 +516,8 @@ write("tool-event.json", toolEvent);
 JS
 ANSWERER_OUT="$home" ANSWERER_NODE="$node_bin" ANSWERER_PLUGIN_ROOT="$plugin_root" \
 ANSWERER_AUTH="$relay_auth" ANSWERER_TOKEN_FILE="$token_file" ANSWERER_MANIFEST="$manifest_path" \
-ANSWERER_READ_DIRS_JSON="$read_dirs_json" \
+ANSWERER_READ_DIRS_JSON="$read_dirs_json" ANSWERER_CREDENTIALS_FILE="$credentials_file" \
+ANSWERER_CREDENTIAL_DIRS="$credential_dirs_json" \
   "$node_bin" --input-type=module -e "${DENY_LISTS_JS}
 ${SETTINGS_JS}"
 chmod 600 "$home/mcp.json" "$home/settings.json" "$home/tool-event.json"
