@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "relay"
+version = "0.1.0"
+description = "Team relay: per-member mailboxes for questions and capability calls between Claude Code sessions"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi==0.141.1",
+    "uvicorn[standard]==0.52.4",
+    "pydantic==2.13.5",
+    "pyyaml==6.0.3",
+    "google-cloud-firestore==2.31.0",
+    "google-auth==2.58.0",
+    # Direct, not inherited: relay/auth.py builds google.auth.transport.requests.Request to
+    # fetch Google's signing certificates, and that module imports requests by name.
+    "requests==2.34.2",
+    "jsonschema==4.26.0",
+    # Teammate-published manifest patterns are evaluated only by RE2 (linear time; M1-SPEC
+    # §11.1). Imported as `re2`; ships binary wheels (manylinux for the python:3.12 image).
+    "google-re2==1.1.20251105",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest==9.1.1",
+    # The async tests use anyio's pytest plugin (asyncio backend only).
+    "anyio==4.15.1",
+    "httpx==0.28.1",
+    "ruff==0.16.5",
+]
+
+[tool.setuptools]
+packages = ["relay"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+exclude = ["build", ".venv"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "ASYNC"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

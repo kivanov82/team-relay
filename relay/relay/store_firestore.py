@@ -1,0 +1,749 @@
+"""Firestore store (M1-SPEC §6): ``google.cloud.firestore.AsyncClient`` with async
+transactions. Inside every transaction all reads happen before any write.
+
+Representation choices:
+- Every document that can expire carries ``expire_at`` as a Timestamp (the TTL field).
+- JSON blobs whose shape the relay does not control (a manifest, capability params, an
+  envelope's ``data``) are stored as canonical JSON strings: Firestore cannot hold
+  integers beyond 64 bits or some map keys that JSON allows, and a string round-trips
+  exactly, so both stores return identical values.
+- Recipient order is kept in a list; Firestore maps do not preserve key order.
+- Per-sender quotas are counter documents under ``teams/{team}/counters/{key}`` holding
+  ``{count, expire_at}``; the window is part of the key.
+- A request's ``updated_at`` (M2-SPEC §3.5) is written only when set, never below the stored
+  value plus 1 ms (§7.1, stamped in the writing transaction), and the activity feed
+  queries it with one single-field range or equality filter, ordered by it alone; Firestore
+  breaks ties by document id (the request id), which is the order MemoryStore uses. The
+  automatic single-field index serves every such query, so no composite index is needed.
+- A request document stays well under Firestore's 1 MiB: a question is at most 8000
+  characters, each recipient carries at most a 2000-character answer preview and 50 tool
+  events, and a team has at most 50 members.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import random
+from collections.abc import Awaitable, Callable, Sequence
+from datetime import UTC, datetime, timedelta
+from typing import Any
+
+from google.api_core import exceptions as gexc
+from google.cloud import firestore
+from google.cloud.firestore_v1.async_transaction import AsyncTransaction
+from google.cloud.firestore_v1.base_query import FieldFilter
+
+from .jsonutil import canonical_json
+from .store import (
+    DELIVERY_SCAN_LIMIT,
+    STREAM_SCAN_LIMIT,
+    AuditEntry,
+    BeyondHead,
+    CreateOutcome,
+    Envelope,
+    IdempotencyRecord,
+    MemberDoc,
+    MutateFn,
+    ProgressEntry,
+    Quota,
+    QuotaExceeded,
+    RecipientState,
+    RequestDoc,
+    StreamPage,
+    ToolEvent,
+    monotonic_updated_at,
+    stamp_deliveries,
+)
+
+_TXN_ATTEMPTS = 8
+_MAX_SCAN_PAGE = 250
+
+
+def _dt(value: Any) -> datetime | None:
+    """Firestore returns DatetimeWithNanoseconds; hand back a plain aware datetime."""
+    if value is None:
+        return None
+    value = value.astimezone(UTC)
+    return datetime(
+        value.year,
+        value.month,
+        value.day,
+        value.hour,
+        value.minute,
+        value.second,
+        value.microsecond,
+        tzinfo=UTC,
+    )
+
+
+def _int_field(snap: Any, name: str) -> int:
+    if not snap.exists:
+        return 0
+    return int((snap.to_dict() or {}).get(name) or 0)
+
+
+def _seq_id(seq: int, width: int) -> str:
+    return str(seq).zfill(width)
+
+
+# Encoding ------------------------------------------------------------------------------
+
+
+def _envelope_to_doc(env: Envelope) -> dict[str, Any]:
+    return {
+        "id": env.id,
+        "seq": env.seq,
+        "team": env.team,
+        "stream": env.stream,
+        "type": env.type,
+        "from": env.sender,
+        "to": env.to,
+        "request_id": env.request_id,
+        "broadcast": env.broadcast,
+        "time": env.time,
+        "expire_at": env.expire_at,
+        "data_json": canonical_json(env.data),
+    }
+
+
+def _envelope_from_doc(doc: dict[str, Any]) -> Envelope:
+    return Envelope(
+        id=doc["id"],
+        seq=doc["seq"],
+        team=doc["team"],
+        stream=doc["stream"],
+        type=doc["type"],
+        sender=doc["from"],
+        to=doc["to"],
+        request_id=doc["request_id"],
+        broadcast=doc["broadcast"],
+        time=_dt(doc["time"]),  # type: ignore[arg-type]
+        expire_at=_dt(doc["expire_at"]),  # type: ignore[arg-type]
+        data=json.loads(doc["data_json"]),
+    )
+
+
+def _request_to_doc(req: RequestDoc) -> dict[str, Any]:
+    capability = None
+    if req.capability is not None:
+        capability = {
+            "name": req.capability["name"],
+            "environment": req.capability["environment"],
+            "params_json": canonical_json(req.capability["params"]),
+        }
+    doc: dict[str, Any] = {
+        "request_id": req.request_id,
+        "team": req.team,
+        "kind": req.kind,
+        "asker": req.asker,
+        "broadcast": req.broadcast,
+        "question": req.question,
+        "capability": capability,
+        "created_at": req.created_at,
+        "ack_deadline": req.ack_deadline,
+        "answer_deadline": req.answer_deadline,
+        "expire_at": req.expire_at,
+        "next_deadline": req.next_deadline,
+        "recipient_order": list(req.recipients),
+        "recipients": {
+            m: {
+                "status": r.status,
+                "acked_at": r.acked_at,
+                "answered_at": r.answered_at,
+                "reply_key": r.reply_key,
+                "reply_message_id": r.reply_message_id,
+                "progress_count": r.progress_count,
+                "delivered_at": r.delivered_at,
+                "answer_delivered_at": r.answer_delivered_at,
+                "tools": [
+                    {
+                        "tool": t.tool,
+                        "status": t.status,
+                        "at": t.at,
+                        "duration_ms": t.duration_ms,
+                    }
+                    for t in r.tools
+                ],
+                "last_progress_pct": r.last_progress_pct,
+                "answer_preview": r.answer_preview,
+            }
+            for m, r in req.recipients.items()
+        },
+        "progress_head": req.progress_head,
+    }
+    if req.updated_at is not None:
+        doc["updated_at"] = req.updated_at
+    return doc
+
+
+def _request_from_doc(doc: dict[str, Any]) -> RequestDoc:
+    capability = None
+    if doc.get("capability") is not None:
+        cap = doc["capability"]
+        capability = {
+            "name": cap["name"],
+            "params": json.loads(cap["params_json"]),
+            "environment": cap["environment"],
+        }
+    recipients = {}
+    for member in doc["recipient_order"]:
+        r = doc["recipients"][member]
+        recipients[member] = RecipientState(
+            status=r["status"],
+            acked_at=_dt(r.get("acked_at")),
+            answered_at=_dt(r.get("answered_at")),
+            reply_key=r.get("reply_key"),
+            reply_message_id=r.get("reply_message_id"),
+            progress_count=r.get("progress_count", 0),
+            delivered_at=_dt(r.get("delivered_at")),
+            answer_delivered_at=_dt(r.get("answer_delivered_at")),
+            tools=[
+                ToolEvent(
+                    tool=t["tool"],
+                    status=t["status"],
+                    at=_dt(t["at"]),  # type: ignore[arg-type]
+                    duration_ms=t.get("duration_ms"),
+                )
+                for t in r.get("tools") or []
+            ],
+            last_progress_pct=r.get("last_progress_pct"),
+            answer_preview=r.get("answer_preview"),
+        )
+    return RequestDoc(
+        request_id=doc["request_id"],
+        team=doc["team"],
+        kind=doc["kind"],
+        asker=doc["asker"],
+        broadcast=doc["broadcast"],
+        question=doc.get("question"),
+        capability=capability,
+        created_at=_dt(doc["created_at"]),  # type: ignore[arg-type]
+        ack_deadline=_dt(doc["ack_deadline"]),  # type: ignore[arg-type]
+        answer_deadline=_dt(doc["answer_deadline"]),  # type: ignore[arg-type]
+        expire_at=_dt(doc["expire_at"]),  # type: ignore[arg-type]
+        next_deadline=_dt(doc.get("next_deadline")),
+        recipients=recipients,
+        progress_head=doc.get("progress_head", 0),
+        updated_at=_dt(doc.get("updated_at")),
+    )
+
+
+def _progress_to_doc(entry: ProgressEntry) -> dict[str, Any]:
+    return {
+        "seq": entry.seq,
+        "member": entry.member,
+        "kind": entry.kind,
+        "text": entry.text,
+        "pct": entry.pct,
+        "tool": entry.tool,
+        "status": entry.status,
+        "duration_ms": entry.duration_ms,
+        "time": entry.time,
+        "expire_at": entry.expire_at,
+    }
+
+
+def _progress_from_doc(doc: dict[str, Any]) -> ProgressEntry:
+    return ProgressEntry(
+        seq=doc["seq"],
+        member=doc["member"],
+        kind=doc.get("kind") or "progress",  # entries written before M2 are progress
+        text=doc.get("text"),
+        pct=doc.get("pct"),
+        tool=doc.get("tool"),
+        status=doc.get("status"),
+        duration_ms=doc.get("duration_ms"),
+        time=_dt(doc["time"]),  # type: ignore[arg-type]
+        expire_at=_dt(doc["expire_at"]),  # type: ignore[arg-type]
+    )
+
+
+def _idem_to_doc(rec: IdempotencyRecord) -> dict[str, Any]:
+    return {
+        "request_id": rec.request_id,
+        "body_hash": rec.body_hash,
+        "recipients": list(rec.recipients),
+        "ack_deadline": rec.ack_deadline,
+        "answer_deadline": rec.answer_deadline,
+        "expire_at": rec.expire_at,
+    }
+
+
+def _idem_from_doc(doc: dict[str, Any]) -> IdempotencyRecord:
+    return IdempotencyRecord(
+        request_id=doc["request_id"],
+        body_hash=doc["body_hash"],
+        recipients=list(doc["recipients"]),
+        ack_deadline=_dt(doc["ack_deadline"]),  # type: ignore[arg-type]
+        answer_deadline=_dt(doc["answer_deadline"]),  # type: ignore[arg-type]
+        expire_at=_dt(doc["expire_at"]),  # type: ignore[arg-type]
+    )
+
+
+def _audit_to_doc(entry: AuditEntry) -> dict[str, Any]:
+    return {
+        "time": entry.time,
+        "team": entry.team,
+        "actor": entry.actor,
+        "action": entry.action,
+        "outcome": entry.outcome,
+        "request_id": entry.request_id,
+        "message_id": entry.message_id,
+        "envelope_type": entry.envelope_type,
+        "to": list(entry.to),
+        "content_sha256": entry.content_sha256,
+        "content_length": entry.content_length,
+        "detail": entry.detail,
+        "expire_at": entry.expire_at,
+    }
+
+
+def _audit_from_doc(doc: dict[str, Any]) -> AuditEntry:
+    return AuditEntry(
+        time=_dt(doc["time"]),  # type: ignore[arg-type]
+        team=doc["team"],
+        actor=doc["actor"],
+        action=doc["action"],
+        outcome=doc["outcome"],
+        expire_at=_dt(doc["expire_at"]),  # type: ignore[arg-type]
+        request_id=doc.get("request_id"),
+        message_id=doc.get("message_id"),
+        envelope_type=doc.get("envelope_type"),
+        to=list(doc.get("to") or []),
+        content_sha256=doc.get("content_sha256"),
+        content_length=doc.get("content_length"),
+        detail=doc.get("detail"),
+    )
+
+
+class FirestoreStore:
+    def __init__(
+        self,
+        project: str | None = None,
+        database: str | None = None,
+        client: firestore.AsyncClient | None = None,
+    ) -> None:
+        self._project = project
+        self._database = database
+        self._client = client
+
+    # The client is created on first use, inside the running event loop (grpc.aio binds
+    # to the loop that creates its channel).
+    def _db(self) -> firestore.AsyncClient:
+        if self._client is None:
+            self._client = firestore.AsyncClient(project=self._project, database=self._database)
+        return self._client
+
+    async def aclose(self) -> None:
+        client, self._client = self._client, None
+        api = getattr(client, "_firestore_api_internal", None) if client else None
+        if api is not None:
+            await api.transport.close()
+
+    # Paths --------------------------------------------------------------------------------
+    def _team(self, team: str):
+        return self._db().collection("teams").document(team)
+
+    def _member(self, team: str, member: str):
+        return self._team(team).collection("members").document(member)
+
+    def _stream(self, team: str, member: str, stream: str):
+        return self._member(team, member).collection("streams").document(stream)
+
+    def _request(self, team: str, request_id: str):
+        return self._team(team).collection("requests").document(request_id)
+
+    def _idem(self, team: str, key_id: str):
+        return self._team(team).collection("idempotency").document(key_id)
+
+    def _audit_col(self, team: str):
+        return self._team(team).collection("audit")
+
+    def _counter(self, team: str, key: str):
+        return self._team(team).collection("counters").document(key)
+
+    # Transactions -------------------------------------------------------------------------
+    async def _run[T](self, body: Callable[[AsyncTransaction], Awaitable[T]]) -> T:
+        """Run ``body`` in a transaction, retrying contention (Aborted) from reads as well
+        as from the commit. Anything else, including an ApiError from a mutation
+        function, rolls back and propagates."""
+        wrapped = firestore.async_transactional(body)
+        for attempt in range(_TXN_ATTEMPTS):
+            txn = self._db().transaction(max_attempts=1)
+            try:
+                return await wrapped(txn)
+            except (gexc.Aborted, ValueError) as exc:
+                aborted = isinstance(exc, gexc.Aborted) or isinstance(exc.__cause__, gexc.Aborted)
+                if not aborted or attempt == _TXN_ATTEMPTS - 1:
+                    raise
+                await asyncio.sleep(random.uniform(0.01, 0.05) * (2**attempt))
+        raise RuntimeError("unreachable")
+
+    async def _write_envelopes(self, txn: AsyncTransaction, envelopes: Sequence[Envelope]) -> None:
+        """Assign seqs and stage the writes. Reads every target stream head first."""
+        targets: dict[tuple[str, str, str], Any] = {}
+        for env in envelopes:
+            key = (env.team, env.to, env.stream)
+            if key not in targets:
+                targets[key] = self._stream(*key)
+        heads: dict[tuple[str, str, str], tuple[int, bool]] = {}
+        for key, ref in targets.items():
+            snap = await ref.get(transaction=txn)
+            heads[key] = (_int_field(snap, "head"), snap.exists)
+        # All reads are done; writes from here on.
+        next_seq = {key: head for key, (head, _) in heads.items()}
+        for env in envelopes:
+            key = (env.team, env.to, env.stream)
+            next_seq[key] += 1
+            env.seq = next_seq[key]
+            msg_ref = targets[key].collection("messages").document(_seq_id(env.seq, 12))
+            txn.create(msg_ref, _envelope_to_doc(env))
+        for key, head in next_seq.items():
+            if heads[key][1]:
+                txn.update(targets[key], {"head": head})
+            else:
+                txn.set(targets[key], {"head": head, "cursor": 0})
+
+    def _write_audit(self, txn: AsyncTransaction, entries: Sequence[AuditEntry]) -> None:
+        for entry in entries:
+            txn.set(self._audit_col(entry.team).document(), _audit_to_doc(entry))
+
+    async def _read_quotas(
+        self, txn: AsyncTransaction, team: str, quotas: Sequence[Quota]
+    ) -> list[int]:
+        """Read every quota's count (a read: call before any write) and refuse when one is
+        at its limit."""
+        counts = []
+        for quota in quotas:
+            snap = await self._counter(team, quota.key).get(transaction=txn)
+            count = _int_field(snap, "count")
+            if count >= quota.limit:
+                raise QuotaExceeded(quota)
+            counts.append(count)
+        return counts
+
+    def _write_quotas(
+        self, txn: AsyncTransaction, team: str, quotas: Sequence[Quota], counts: Sequence[int]
+    ) -> None:
+        for quota, count in zip(quotas, counts, strict=True):
+            txn.set(
+                self._counter(team, quota.key),
+                {"count": count + 1, "expire_at": quota.expire_at},
+            )
+
+    # Members ------------------------------------------------------------------------------
+    async def get_members(self, team: str, members: Sequence[str]) -> dict[str, MemberDoc]:
+        if not members:
+            return {}
+        refs = [self._member(team, m) for m in members]
+        out: dict[str, MemberDoc] = {}
+        async for snap in self._db().get_all(refs):
+            if not snap.exists:
+                continue
+            doc = snap.to_dict() or {}
+            manifest_json = doc.get("manifest_json")
+            presence = {
+                stream: _dt(entry.get("last_seen"))
+                for stream, entry in (doc.get("presence") or {}).items()
+                if isinstance(entry, dict) and entry.get("last_seen") is not None
+            }
+            out[snap.id] = MemberDoc(
+                manifest=json.loads(manifest_json) if manifest_json else None,
+                published_at=_dt(doc.get("published_at")),
+                last_seen=_dt(doc.get("last_seen")),
+                presence=presence,  # type: ignore[arg-type]
+            )
+        return {m: out[m] for m in members if m in out}
+
+    async def put_manifest(
+        self,
+        team: str,
+        member: str,
+        manifest: dict[str, Any],
+        published_at: datetime,
+        audit: Sequence[AuditEntry],
+    ) -> None:
+        async def body(txn: AsyncTransaction) -> None:
+            txn.set(
+                self._member(team, member),
+                {"manifest_json": canonical_json(manifest), "published_at": published_at},
+                merge=True,
+            )
+            self._write_audit(txn, audit)
+
+        await self._run(body)
+
+    async def touch_presence(
+        self, team: str, member: str, stream: str, now: datetime, min_interval: timedelta
+    ) -> None:
+        ref = self._member(team, member)
+        snap = await ref.get(field_paths=[f"presence.{stream}.last_seen", "last_seen"])
+        doc = (snap.to_dict() or {}) if snap.exists else {}
+        entry = (doc.get("presence") or {}).get(stream) or {}
+        last = _dt(entry.get("last_seen")) if isinstance(entry, dict) else None
+        if last is None or now - last >= min_interval:
+            seen = _dt(doc.get("last_seen"))
+            # Unconditional merge (it merges nested maps field by field, so the other
+            # stream's presence stays): two racing polls both write, which is harmless.
+            await ref.set(
+                {
+                    "presence": {stream: {"last_seen": now}},
+                    "last_seen": now if seen is None or now > seen else seen,
+                },
+                merge=True,
+            )
+
+    # Requests -----------------------------------------------------------------------------
+    async def get_idempotency(
+        self, team: str, key_id: str, now: datetime
+    ) -> IdempotencyRecord | None:
+        snap = await self._idem(team, key_id).get()
+        if not snap.exists:
+            return None
+        record = _idem_from_doc(snap.to_dict() or {})
+        return None if record.expire_at <= now else record
+
+    async def create_request(
+        self,
+        team: str,
+        key_id: str,
+        record: IdempotencyRecord,
+        request: RequestDoc,
+        envelopes: Sequence[Envelope],
+        audit: Sequence[AuditEntry],
+        now: datetime,
+        quotas: Sequence[Quota] = (),
+    ) -> CreateOutcome:
+        async def body(txn: AsyncTransaction) -> CreateOutcome:
+            idem_ref = self._idem(team, key_id)
+            snap = await idem_ref.get(transaction=txn)
+            if snap.exists:
+                existing = _idem_from_doc(snap.to_dict() or {})
+                if existing.expire_at > now:
+                    return CreateOutcome(created=False, record=existing)
+            counts = await self._read_quotas(txn, team, quotas)  # raising writes nothing
+            # Envelope seqs are assigned on copies so a retried attempt starts clean.
+            staged = [Envelope(**{**env.__dict__, "seq": 0}) for env in envelopes]
+            await self._write_envelopes(txn, staged)  # reads heads, then stages writes
+            self._write_quotas(txn, team, quotas, counts)
+            txn.set(idem_ref, _idem_to_doc(record))
+            txn.create(self._request(team, request.request_id), _request_to_doc(request))
+            self._write_audit(txn, audit)
+            return CreateOutcome(created=True, record=record)
+
+        return await self._run(body)
+
+    async def get_request(self, team: str, request_id: str) -> RequestDoc | None:
+        snap = await self._request(team, request_id).get()
+        if not snap.exists:
+            return None
+        return _request_from_doc(snap.to_dict() or {})
+
+    async def list_progress(self, team: str, request_id: str) -> list[ProgressEntry]:
+        query = self._request(team, request_id).collection("progress").order_by("seq")
+        return [_progress_from_doc(snap.to_dict() or {}) async for snap in query.stream()]
+
+    async def mutate_request[T](self, team: str, request_id: str, fn: MutateFn[T]) -> T:
+        async def body(txn: AsyncTransaction) -> T:
+            ref = self._request(team, request_id)
+            snap = await ref.get(transaction=txn)
+            current = _request_from_doc(snap.to_dict() or {}) if snap.exists else None
+            previous = current.updated_at if current is not None else None
+            mutation = fn(current)
+            staged = [Envelope(**{**env.__dict__, "seq": 0}) for env in mutation.envelopes]
+            await self._write_envelopes(txn, staged)  # the last reads; writes follow
+            if mutation.request is not None:
+                if mutation.request.request_id != request_id:
+                    raise RuntimeError("a mutation may only write its own request")
+                # M2-SPEC §7.1, on the value this attempt read: a retry after another
+                # writer committed reads that writer's value and stamps past it.
+                mutation.request.updated_at = monotonic_updated_at(
+                    mutation.request.updated_at, previous
+                )
+                txn.set(ref, _request_to_doc(mutation.request))
+            for entry in mutation.progress:
+                txn.create(
+                    ref.collection("progress").document(_seq_id(entry.seq, 6)),
+                    _progress_to_doc(entry),
+                )
+            self._write_audit(txn, mutation.audit)
+            return mutation.result
+
+        return await self._run(body)
+
+    async def due_requests(self, team: str, asker: str, now: datetime, limit: int) -> list[str]:
+        query = (
+            self._team(team)
+            .collection("requests")
+            .where(filter=FieldFilter("asker", "==", asker))
+            .where(filter=FieldFilter("next_deadline", "<=", now))
+            .order_by("next_deadline")
+            .limit(limit)
+            .select(["next_deadline"])
+        )
+        return [snap.id async for snap in query.stream()]
+
+    async def requests_updated_after(
+        self, team: str, since: datetime, limit: int, *, descending: bool = False
+    ) -> list[RequestDoc]:
+        direction = firestore.Query.DESCENDING if descending else firestore.Query.ASCENDING
+        query = (
+            self._team(team)
+            .collection("requests")
+            .where(filter=FieldFilter("updated_at", ">", since))
+            .order_by("updated_at", direction=direction)
+            .limit(limit)
+        )
+        return [_request_from_doc(snap.to_dict() or {}) async for snap in query.stream()]
+
+    async def requests_updated_at(self, team: str, at: datetime, limit: int) -> list[RequestDoc]:
+        query = (
+            self._team(team)
+            .collection("requests")
+            .where(filter=FieldFilter("updated_at", "==", at))
+            .limit(limit)
+        )
+        docs = [_request_from_doc(snap.to_dict() or {}) async for snap in query.stream()]
+        return sorted(docs, key=lambda d: d.request_id)
+
+    # Streams ------------------------------------------------------------------------------
+    async def read_stream(
+        self, team: str, member: str, stream: str, after: int | None, limit: int, now: datetime
+    ) -> StreamPage:
+        ref = self._stream(team, member, stream)
+        snap = await ref.get()
+        head = _int_field(snap, "head")
+        cursor = _int_field(snap, "cursor")
+        out: list[Envelope] = []
+        start = cursor if after is None else after
+        position = start
+        expired_through = start  # the end of the expired run right after ``start``
+        scanned = 0
+        page = limit
+        # Only up to the head read above, so the returned head is never below a returned seq.
+        while len(out) < limit and position < head and scanned < STREAM_SCAN_LIMIT:
+            page = min(page, STREAM_SCAN_LIMIT - scanned)
+            query = (
+                ref.collection("messages")
+                .where(filter=FieldFilter("seq", ">", position))
+                .where(filter=FieldFilter("seq", "<=", head))
+                .order_by("seq")
+                .limit(page)
+            )
+            batch = [snap.to_dict() or {} async for snap in query.stream()]
+            if not batch:
+                break
+            for doc in batch:
+                scanned += 1
+                position = doc["seq"]
+                if _dt(doc["expire_at"]) > now:  # type: ignore[operator]
+                    if len(out) < limit:
+                        out.append(_envelope_from_doc(doc))
+                elif not out:
+                    expired_through = position
+            if len(batch) < page:
+                break
+            # Past a full page of expired envelopes, read bigger pages: fewer round trips.
+            page = min(page * 2, _MAX_SCAN_PAGE)
+        if start == cursor and expired_through > cursor:
+            cursor = await self._advance_cursor(team, ref, expired_through, now)
+        return StreamPage(messages=out, cursor=cursor, head=head)
+
+    async def _advance_cursor(self, team: str, ref: Any, to: int, now: datetime) -> int:
+        """Move the cursor to ``to`` unless it is already there or beyond (§11.5), stamping
+        the deliveries it passes (M2-SPEC §3.2)."""
+
+        async def body(txn: AsyncTransaction) -> int:
+            snap = await ref.get(transaction=txn)
+            current = _int_field(snap, "cursor")
+            if to > current:
+                await self._advance(txn, team, ref, current, to, now)
+                return to
+            return current
+
+        return await self._run(body)
+
+    async def _advance(
+        self, txn: AsyncTransaction, team: str, ref: Any, cursor: int, to: int, now: datetime
+    ) -> None:
+        """Inside a transaction that has read the stream document: read the first
+        DELIVERY_SCAN_LIMIT messages in ``(cursor, to]`` and their requests (the last reads),
+        then stage the cursor move and the stamped requests."""
+        query = (
+            ref.collection("messages")
+            .where(filter=FieldFilter("seq", ">", cursor))
+            .where(filter=FieldFilter("seq", "<=", to))
+            .order_by("seq")
+            .limit(DELIVERY_SCAN_LIMIT)
+        )
+        passed = [
+            _envelope_from_doc(snap.to_dict() or {}) async for snap in query.stream(transaction=txn)
+        ]
+        request_ids = list(dict.fromkeys(env.request_id for env in passed))
+        requests: dict[str, RequestDoc] = {}
+        if request_ids:
+            refs = [self._request(team, rid) for rid in request_ids]
+            async for snap in self._db().get_all(refs, transaction=txn):
+                if snap.exists:
+                    requests[snap.id] = _request_from_doc(snap.to_dict() or {})
+        changed = stamp_deliveries(passed, requests, now)
+        # All reads are done; writes from here on.
+        txn.update(ref, {"cursor": to})
+        for doc in changed:
+            txn.set(self._request(team, doc.request_id), _request_to_doc(doc))
+
+    async def set_cursor(
+        self, team: str, member: str, stream: str, acked_seq: int, now: datetime
+    ) -> int:
+        async def body(txn: AsyncTransaction) -> int:
+            ref = self._stream(team, member, stream)
+            snap = await ref.get(transaction=txn)
+            head = _int_field(snap, "head")
+            cursor = _int_field(snap, "cursor")
+            if acked_seq > head:
+                raise BeyondHead()
+            if acked_seq > cursor:
+                await self._advance(txn, team, ref, cursor, acked_seq, now)
+                return acked_seq
+            return cursor
+
+        return await self._run(body)
+
+    # Audit --------------------------------------------------------------------------------
+    async def append_audit(self, entries: Sequence[AuditEntry]) -> None:
+        if not entries:
+            return
+        batch = self._db().batch()
+        for entry in entries:
+            batch.set(self._audit_col(entry.team).document(), _audit_to_doc(entry))
+        await batch.commit()
+
+    async def append_audit_capped(
+        self, team: str, entries: Sequence[AuditEntry], quota: Quota
+    ) -> bool:
+        async def body(txn: AsyncTransaction) -> bool:
+            try:
+                counts = await self._read_quotas(txn, team, [quota])
+            except QuotaExceeded:
+                return False
+            self._write_quotas(txn, team, [quota], counts)
+            self._write_audit(txn, entries)
+            return True
+
+        return await self._run(body)
+
+    async def list_audit(self, team: str, limit: int = 1000) -> list[AuditEntry]:
+        query = self._audit_col(team).order_by("time").limit(limit)
+        return [_audit_from_doc(snap.to_dict() or {}) async for snap in query.stream()]
+
+    async def count_quota(self, team: str, quota: Quota) -> bool:
+        async def body(txn: AsyncTransaction) -> bool:
+            try:
+                counts = await self._read_quotas(txn, team, [quota])
+            except QuotaExceeded:
+                return False
+            self._write_quotas(txn, team, [quota], counts)
+            return True
+
+        return await self._run(body)

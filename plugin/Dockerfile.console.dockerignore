@@ -1,0 +1,4 @@
+# Build context is multiagent/ (see Dockerfile.console). Allow-list: only what the image copies.
+*
+!plugin/dist/console-server.js
+!plugin/dist/console/

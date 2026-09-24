@@ -1,0 +1,281 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+@import "shadcn/tailwind.css";
+@import "@fontsource-variable/ibm-plex-sans/wght.css";
+@import "@fontsource/ibm-plex-mono/latin-400.css";
+@import "@fontsource/ibm-plex-mono/latin-500.css";
+
+/*
+  Team relay console tokens.
+
+  One accent, "signal" (a cobalt), marks what is moving: an edge in flight, the step a
+  request is waiting on, the focus ring, the selected filter. Status colours carry meaning
+  only: ok (online, answered), warn (idle, no response), bad (timed out, a tool error).
+  Everything else is a cool neutral ramp. IBM Plex Sans for the interface, Plex Mono for
+  identifiers (request ids, tool and capability names, params). Figures are tabular
+  wherever a number can change under the reader's eye.
+
+  Every colour is a CSS variable in a file; nothing is injected at runtime, so the page
+  runs under the console server's CSP (default-src 'self').
+*/
+
+@custom-variant dark (&:is(.dark *));
+
+@theme inline {
+  --font-sans: "IBM Plex Sans Variable", "IBM Plex Sans", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+
+  --color-canvas: var(--canvas);
+  --color-subtle: var(--subtle);
+  --color-faint: var(--faint);
+  --color-hairline: var(--hairline);
+  --color-signal: var(--signal);
+  --color-signal-soft: var(--signal-soft);
+  --color-ok: var(--ok);
+  --color-ok-soft: var(--ok-soft);
+  --color-warn: var(--warn);
+  --color-warn-soft: var(--warn-soft);
+  --color-bad: var(--bad);
+  --color-bad-soft: var(--bad-soft);
+
+  --radius-sm: calc(var(--radius) * 0.6);
+  --radius-md: calc(var(--radius) * 0.8);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) * 1.4);
+  --radius-2xl: calc(var(--radius) * 1.8);
+  --radius-3xl: calc(var(--radius) * 2.2);
+  --radius-4xl: calc(var(--radius) * 2.6);
+}
+
+:root {
+  --radius: 0.5rem;
+
+  --canvas: oklch(0.975 0.003 255);
+  --background: oklch(0.975 0.003 255);
+  --card: oklch(1 0 0);
+  --card-foreground: oklch(0.22 0.018 262);
+  --popover: oklch(1 0 0);
+  --popover-foreground: oklch(0.22 0.018 262);
+  --foreground: oklch(0.22 0.018 262);
+  --subtle: oklch(0.47 0.017 262);
+  --faint: oklch(0.63 0.013 262);
+  --muted: oklch(0.955 0.004 262);
+  --muted-foreground: oklch(0.47 0.017 262);
+  --border: oklch(0.915 0.006 262);
+  --hairline: oklch(0.94 0.004 262);
+  --input: oklch(0.9 0.006 262);
+
+  --primary: oklch(0.22 0.018 262);
+  --primary-foreground: oklch(0.985 0.002 262);
+  --secondary: oklch(0.955 0.004 262);
+  --secondary-foreground: oklch(0.22 0.018 262);
+  --accent: oklch(0.955 0.004 262);
+  --accent-foreground: oklch(0.22 0.018 262);
+  --destructive: oklch(0.56 0.19 27);
+
+  --signal: oklch(0.53 0.2 262);
+  --signal-soft: oklch(0.53 0.2 262 / 0.1);
+  --ok: oklch(0.58 0.13 155);
+  --ok-soft: oklch(0.58 0.13 155 / 0.12);
+  --warn: oklch(0.68 0.14 70);
+  --warn-soft: oklch(0.68 0.14 70 / 0.14);
+  --bad: oklch(0.56 0.19 27);
+  --bad-soft: oklch(0.56 0.19 27 / 0.1);
+
+  --ring: oklch(0.53 0.2 262);
+  color-scheme: light;
+}
+
+.dark {
+  --canvas: oklch(0.165 0.008 262);
+  --background: oklch(0.165 0.008 262);
+  --card: oklch(0.2 0.009 262);
+  --card-foreground: oklch(0.93 0.005 262);
+  --popover: oklch(0.225 0.01 262);
+  --popover-foreground: oklch(0.93 0.005 262);
+  --foreground: oklch(0.93 0.005 262);
+  --subtle: oklch(0.72 0.012 262);
+  --faint: oklch(0.56 0.012 262);
+  --muted: oklch(0.245 0.01 262);
+  --muted-foreground: oklch(0.72 0.012 262);
+  --border: oklch(0.29 0.011 262);
+  --hairline: oklch(0.255 0.01 262);
+  --input: oklch(0.31 0.011 262);
+
+  --primary: oklch(0.93 0.005 262);
+  --primary-foreground: oklch(0.2 0.009 262);
+  --secondary: oklch(0.245 0.01 262);
+  --secondary-foreground: oklch(0.93 0.005 262);
+  --accent: oklch(0.245 0.01 262);
+  --accent-foreground: oklch(0.93 0.005 262);
+  --destructive: oklch(0.68 0.17 25);
+
+  --signal: oklch(0.7 0.15 262);
+  --signal-soft: oklch(0.7 0.15 262 / 0.14);
+  --ok: oklch(0.74 0.14 158);
+  --ok-soft: oklch(0.74 0.14 158 / 0.13);
+  --warn: oklch(0.8 0.13 78);
+  --warn-soft: oklch(0.8 0.13 78 / 0.13);
+  --bad: oklch(0.69 0.17 25);
+  --bad-soft: oklch(0.69 0.17 25 / 0.14);
+
+  --ring: oklch(0.7 0.15 262);
+  color-scheme: dark;
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  html {
+    -webkit-text-size-adjust: 100%;
+    text-rendering: optimizeLegibility;
+  }
+  body {
+    @apply bg-canvas text-foreground antialiased;
+    font-family: var(--font-sans);
+    font-size: 13px;
+    line-height: 1.45;
+    font-feature-settings: "kern", "calt";
+  }
+  ::selection {
+    background: var(--signal-soft);
+  }
+  :focus-visible {
+    outline: 2px solid var(--ring);
+    outline-offset: 2px;
+  }
+}
+
+@utility tnum {
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "tnum", "zero" 0;
+}
+
+/* The one moving thing on the page: packets travelling along an edge in flight. */
+@keyframes relay-flow {
+  to {
+    stroke-dashoffset: -24;
+  }
+}
+
+.edge-flow {
+  stroke-dasharray: 2 10;
+  animation: relay-flow 0.9s linear infinite;
+}
+
+/* While the relay is unreachable the map shows the last known state and holds still. */
+.map-stale .edge-flow,
+.map-stale .presence-pulse {
+  animation-play-state: paused;
+}
+
+/* Live presence: a slow ring that breathes outward from an online session. */
+@keyframes presence-pulse {
+  0% {
+    opacity: 0.45;
+    transform: scale(1);
+  }
+  70%,
+  100% {
+    opacity: 0;
+    transform: scale(1.28);
+  }
+}
+
+.presence-pulse {
+  transform-box: fill-box;
+  transform-origin: center;
+  animation: presence-pulse 2.4s ease-out infinite;
+}
+
+/* The dot of an online session in a list: the same pulse, as a halo. */
+.dot-pulse {
+  animation: presence-pulse 2.4s ease-out infinite;
+}
+
+/* The step a request is waiting on. */
+@keyframes step-wait {
+  0%,
+  100% {
+    box-shadow: 0 0 0 0 var(--signal-soft);
+  }
+  50% {
+    box-shadow: 0 0 0 4px var(--signal-soft);
+  }
+}
+
+.step-wait {
+  animation: step-wait 1.6s ease-in-out infinite;
+}
+
+/* A request that just arrived: one soft wash that fades out. */
+@keyframes row-fresh {
+  from {
+    background-color: var(--signal-soft);
+  }
+  to {
+    background-color: transparent;
+  }
+}
+
+.row-fresh {
+  animation: row-fresh 1.6s ease-out 1;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .row-fresh {
+    animation: none;
+  }
+  .edge-flow {
+    animation: none;
+    stroke-dasharray: 5 5;
+  }
+  .presence-pulse,
+  .dot-pulse {
+    animation: none;
+    opacity: 0;
+  }
+  .step-wait {
+    animation: none;
+    box-shadow: 0 0 0 3px var(--signal-soft);
+  }
+}
+
+/* Progress, drawn by a native <progress> so no width is ever set inline. */
+.progress-bar {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  color: var(--signal);
+}
+.progress-bar::-webkit-progress-bar {
+  background: transparent;
+}
+.progress-bar::-webkit-progress-value {
+  background: var(--signal);
+  border-radius: 9999px;
+}
+.progress-bar::-moz-progress-bar {
+  background: var(--signal);
+  border-radius: 9999px;
+}

@@ -1,0 +1,15 @@
+{
+  "name": "team-relay-dev",
+  "owner": {
+    "name": "Team relay maintainers"
+  },
+  "description": "Local marketplace for the team relay plugin.",
+  "plugins": [
+    {
+      "name": "team-relay",
+      "source": "./plugin",
+      "description": "Ask teammates' Claude sessions questions and run named, parameterised operations for each other; answers are pushed into your session.",
+      "version": "0.1.0"
+    }
+  ]
+}

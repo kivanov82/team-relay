@@ -1,0 +1,7 @@
+# Build context is multiagent/ (see Dockerfile). Allow-list: only what the image copies.
+*
+!relay/pyproject.toml
+!relay/relay/
+!schema/manifest.schema.json
+**/__pycache__
+**/*.pyc

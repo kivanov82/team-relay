@@ -1,0 +1,21 @@
+# Relay access configuration: which identities may speak for which member of which team.
+# The relay decides who a caller is from a verified credential and this file, never from
+# anything the caller writes in a request body. Copy to config/team.local.yaml (git-ignored)
+# for real identities.
+#
+# Principals:
+#   google:<email>           a Google-signed ID token whose verified email matches
+#   token:sha256:<hex>       a static bearer token, stored only as its SHA-256; local
+#                            development only, refused when the relay runs on Cloud Run
+teams:
+  - id: demo
+    members:
+      - id: alice
+        principals:
+          - "google:alice@example.com"
+      - id: bob
+        principals:
+          - "google:bob@example.com"
+      - id: carol
+        principals:
+          - "google:carol@example.com"

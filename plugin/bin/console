@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# Launch the local, read-only team console (M2-SPEC §4.4): node dist/console-server.js.
+#
+# The server binds 127.0.0.1 only and prints http://127.0.0.1:<port>/#k=<key>; the key is
+# made for this launch and the console needs it for every API call. It proxies four
+# read-only GETs to the relay with your own credentials; nothing can be sent from it.
+#
+# Environment (not needed with --demo):
+#   RELAY_URL, RELAY_TEAM                  required
+#   RELAY_AUTH                             google (default: your gcloud identity) or token
+#   RELAY_GCLOUD_ACCOUNT                   optional; the gcloud account to use (google)
+#   RELAY_TOKEN_FILE or RELAY_TOKEN        required when RELAY_AUTH is token
+#   CONSOLE_PORT                           optional; default 4317, 0 picks a free port
+#   JOIN_REPO_URL                          optional; https URL of the repository new members
+#                                          clone (the console's join panel), also with --demo
+#                                          (checked, but the panel shows demo values)
+#
+# Usage: bin/console [--demo] [--open]
+#   --demo  a synthetic team (demo: alice, bob, carol) with looping activity, no relay
+#   --open  open the console in your default browser, through a private redirect file that
+#           is deleted after 10 s (the key never appears in a process argument)
+
+set -euo pipefail
+
+plugin_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+node_bin="$(command -v node || true)"
+if [[ -z "$node_bin" ]]; then
+  printf 'console: node is required (Node 22 or later)\n' >&2
+  exit 1
+fi
+exec "$node_bin" "$plugin_root/dist/console-server.js" "$@"

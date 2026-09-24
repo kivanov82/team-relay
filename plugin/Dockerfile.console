@@ -1,0 +1,36 @@
+# syntax=docker/dockerfile:1
+#
+# Cloud Run image for the hosted team console (M3-SPEC §3). The build context is
+# multiagent/ (the repository root), so build it from there:
+#
+#   docker build -f plugin/Dockerfile.console -t console .
+#
+# plugin/Dockerfile.console.dockerignore keeps everything but the two built artefacts out
+# of the context: dist/console-server.js (esbuild bundle, dependencies inlined) and
+# dist/console/ (the built UI). No source, no node_modules, no npm install, no config.
+#
+# The base image is pinned by digest (bump on purpose); the tag is
+# kept beside it for a human to read. Bump on purpose.
+#
+# The image holds no credentials: the relay is called with the runtime service account's
+# ID token from the metadata server (RELAY_AUTH=metadata), and IAP_AUDIENCE,
+# CONSOLE_PUBLIC_HOST, RELAY_URL and RELAY_TEAM are set at deploy.
+
+# node:22-slim
+FROM node:22-slim@sha256:83f487e0a63425e5b4d146fb5e5be574bcbe1b7b843d3ebafdd95eaf7767a7e5
+ENV NODE_ENV=production \
+    CONSOLE_MODE=hosted \
+    PORT=8080
+
+WORKDIR /app
+COPY plugin/dist/console-server.js ./console-server.js
+COPY plugin/dist/console/ ./console/
+# The bundle is an ES module, as it is under plugin/ (whose package.json says so).
+RUN printf '{"type":"module","private":true}\n' > package.json \
+    && chmod -R a+rX,go-w /app
+
+# Non-root (the image's own `node` user); the files stay root's, and nothing is written.
+USER node
+
+EXPOSE 8080
+CMD ["node", "console-server.js"]

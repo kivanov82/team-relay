@@ -1,0 +1,11 @@
+# What `gcloud builds submit` uploads from this directory: the relay and the schema only.
+# Team configs (config/*.local.yaml), the plugin, venvs and everything else stay here.
+/*
+!/relay/
+/relay/*
+!/relay/pyproject.toml
+!/relay/cloudbuild.yaml
+!/relay/Dockerfile
+!/relay/relay/
+/relay/relay/__pycache__/
+!/schema/

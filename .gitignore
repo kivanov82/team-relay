@@ -1,0 +1,25 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+build/
+
+# Node
+node_modules/
+coverage/
+
+# Local configuration: real member identities and tokens never enter git
+config/*.local.yaml
+.env
+.env.*
+*.token
+
+# Scratch
+.DS_Store
+.idea/
+
+# Deployment settings (scripts/*.sh read config/deploy.local.env)
+config/*.local.env

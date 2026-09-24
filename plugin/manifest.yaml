@@ -1,0 +1,66 @@
+# The team's capability manifest. Every member installs the same plugin; the install
+# wizard asks each member which of these they will run (and where the program that runs
+# each one lives), and the enabled subset is what teammates discover.
+#
+# Synthetic example operations. Parameters are enums, bounded numbers, booleans, or
+# strings with a length cap and an allow-list pattern: never free-form SQL, shell or paths.
+version: 1
+capabilities:
+  - name: staging_db_query
+    title: Query the staging database
+    description: Read-only lookup against one staging dataset, at most 100 rows.
+    environment: staging
+    default_enabled: false
+    timeout_seconds: 120
+    params:
+      dataset:
+        type: enum
+        values: [users, orders, events]
+        description: Which staging dataset to read.
+      field:
+        type: enum
+        values: [id, status, created_on, country]
+        description: Field to compare. Omit field, op and value to read without a filter.
+      op:
+        type: enum
+        values: [eq, ne, lt, gt]
+        default: eq
+        description: Comparison operator applied to field and value.
+      value:
+        type: string
+        max_length: 100
+        pattern: "^[A-Za-z0-9_.@-]{0,100}$"
+        description: Value to compare the field against. Letters, digits and _ . @ - only.
+      limit:
+        type: integer
+        min: 1
+        max: 100
+        default: 20
+        description: Maximum rows to return.
+    required: [dataset]
+
+  - name: service_health
+    title: Check a service's health
+    description: Reports the health endpoint and recent error count of one named service.
+    environment: staging
+    default_enabled: false
+    timeout_seconds: 60
+    params:
+      service:
+        type: enum
+        values: [api, worker, web]
+        description: Which service to check.
+    required: [service]
+
+  - name: production_db_count
+    title: Count rows in a production table
+    description: Returns a row count only, never row contents, for one production table.
+    environment: production
+    default_enabled: false
+    timeout_seconds: 60
+    params:
+      table:
+        type: enum
+        values: [users, orders]
+        description: Which production table to count.
+    required: [table]

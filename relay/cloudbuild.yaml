@@ -1,0 +1,6 @@
+# Cloud Build for the relay image (scripts/deploy.sh submits it). The upload is limited by
+# the repo root's .gcloudignore to relay/ and schema/, so no local config reaches the build.
+steps:
+  - name: gcr.io/cloud-builders/docker
+    args: ["build", "-f", "relay/Dockerfile", "-t", "${_IMAGE}", "."]
+images: ["${_IMAGE}"]

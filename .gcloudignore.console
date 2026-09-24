@@ -1,0 +1,11 @@
+# Upload for the hosted console image (scripts/deploy-console.sh): the built server and UI
+# bundle and their build files only. No source, no configs, no node_modules.
+/*
+!/plugin/
+/plugin/*
+!/plugin/Dockerfile.console
+!/plugin/cloudbuild.console.yaml
+!/plugin/dist/
+/plugin/dist/*
+!/plugin/dist/console-server.js
+!/plugin/dist/console/

@@ -1,0 +1,7 @@
+# Cloud Build for the hosted console image (M3-SPEC §3; scripts/deploy-console.sh submits
+# it). The build context is the repository root; the upload is limited by
+# .gcloudignore.console to the built bundles and these build files.
+steps:
+  - name: gcr.io/cloud-builders/docker
+    args: ["build", "-f", "plugin/Dockerfile.console", "-t", "${_IMAGE}", "."]
+images: ["${_IMAGE}"]

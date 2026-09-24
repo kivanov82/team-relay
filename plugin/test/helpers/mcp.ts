@@ -1,0 +1,74 @@
+// Spawn a bundled server over stdio with the MCP client SDK, playing Claude Code.
+
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
+import { fileURLToPath } from 'node:url';
+
+export const DIST = fileURLToPath(new URL('../../dist/', import.meta.url));
+export const FIXTURES = fileURLToPath(new URL('../fixtures/', import.meta.url));
+export const PLUGIN_ROOT = fileURLToPath(new URL('../../', import.meta.url));
+
+export type ChannelNotification = { content: string; meta: Record<string, string> };
+
+export type Spawned = {
+  client: Client;
+  notifications: ChannelNotification[];
+  otherNotifications: Array<{ method: string; params?: unknown }>;
+  stderr: () => string;
+  close: () => Promise<void>;
+};
+
+/**
+ * Minimal parent environment for a spawned server: only what node needs, plus `env`. The
+ * suites use static test tokens, so RELAY_AUTH is `token` unless `env` says otherwise (the
+ * default, `google`, is covered by identity.test.ts with a fake gcloud).
+ */
+export function baseEnv(env: Record<string, string>): Record<string, string> {
+  const out: Record<string, string> = { PATH: process.env.PATH ?? '/usr/bin:/bin', HOME: process.env.HOME ?? '/tmp', RELAY_AUTH: 'token' };
+  return { ...out, ...env };
+}
+
+export async function spawnServer(bundle: 'channel.js' | 'capabilities.js', env: Record<string, string>): Promise<Spawned> {
+  const transport = new StdioClientTransport({
+    command: process.execPath,
+    args: [DIST + bundle],
+    env: baseEnv(env),
+    stderr: 'pipe',
+  });
+  let err = '';
+  transport.stderr?.on('data', (c: Buffer) => (err += c.toString('utf8')));
+  const client = new Client({ name: 'test-claude-code', version: '0.0.0' }, { capabilities: {} });
+  const notifications: ChannelNotification[] = [];
+  const otherNotifications: Array<{ method: string; params?: unknown }> = [];
+  client.fallbackNotificationHandler = async (n) => {
+    if (n.method === 'notifications/claude/channel') notifications.push(n.params as ChannelNotification);
+    else otherNotifications.push(n);
+  };
+  await client.connect(transport);
+  return {
+    client,
+    notifications,
+    otherNotifications,
+    stderr: () => err,
+    close: async () => {
+      await client.close().catch(() => {});
+    },
+  };
+}
+
+export async function waitFor<T>(fn: () => T | undefined | false | null, timeoutMs = 10_000, what = 'condition'): Promise<T> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const v = fn();
+    if (v) return v;
+    if (Date.now() > deadline) throw new Error(`timed out waiting for ${what}`);
+    await new Promise((r) => setTimeout(r, 20));
+  }
+}
+
+export const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+export function textOf(result: unknown): string {
+  const r = result as { content?: Array<{ type: string; text?: string }> };
+  return (r.content ?? []).map((c) => c.text ?? '').join('');
+}

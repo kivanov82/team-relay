@@ -1,0 +1,290 @@
+#!/usr/bin/env bash
+# Launch the dedicated answering session (M1-SPEC §8.5, §11.13; M2-SPEC §4).
+#
+# The session loads only the relay channel (answerer role) and the capability server. It
+# may read local files (Read, Glob, Grep) except credential stores, which stay denied by
+# path; it has no shell, no file writing or editing and no web tools. It runs with its own
+# CLAUDE_CONFIG_DIR so none of your personal memory, CLAUDE.md, plugins or hooks load into
+# it. Claude Code also loads memory files from every ancestor of its working directory, so
+# the session runs from an empty directory outside $HOME, and the launcher refuses to start
+# when that directory or any ancestor holds CLAUDE.md, CLAUDE.local.md, .claude/CLAUDE.md,
+# .claude/rules/, .claude/settings.json or .claude/settings.local.json.
+#
+# The read-deny rules are a guard rail, not a sandbox: see the plugin README.
+#
+# Environment:
+#   RELAY_URL, RELAY_TEAM                  required
+#   RELAY_AUTH                             google (default) or token
+#   RELAY_GCLOUD_ACCOUNT                   optional (google): the gcloud account whose ID
+#                                          token identifies you (gcloud's active one otherwise)
+#   RELAY_TOKEN_FILE or RELAY_TOKEN        required when RELAY_AUTH is token (the file wins; a
+#                                          RELAY_TOKEN value is written to a mode-600 file,
+#                                          never into mcp.json); ignored for google
+#   ALLOW_PRODUCTION                       "true" to allow production-data capabilities
+#   CAP_<NAME>_ENABLED, CAP_<NAME>_RUNNER  per capability (NAME is the capability name uppercased)
+#   MANIFEST_PATH                          optional; defaults to the plugin's manifest.yaml
+#   ANSWERER_HOME                          optional; defaults to ~/.claude-team-relay/answerer
+#                                          (the session's config: mcp.json, settings.json,
+#                                          tool-event.json, config/, state/)
+#   ANSWERER_WORKDIR                       optional; the session's working directory, an absolute
+#                                          path outside $HOME, empty; defaults to
+#                                          ${TMPDIR:-/tmp}/team-relay-answerer-<uid>/work (mode 700,
+#                                          created when missing)
+#
+# Usage: bin/answerer [--print-command] [extra claude arguments...]
+#   --print-command  write the session files, then print the command instead of running it
+
+set -euo pipefail
+umask 077
+
+print_only=0
+if [[ $# -gt 0 && "$1" == "--print-command" ]]; then
+  print_only=1
+  shift
+fi
+
+die() {
+  printf 'answerer: %s\n' "$1" >&2
+  exit 1
+}
+
+plugin_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+
+[[ -n "${RELAY_URL:-}" ]] || die "RELAY_URL is required"
+[[ -n "${RELAY_TEAM:-}" ]] || die "RELAY_TEAM is required"
+relay_auth="${RELAY_AUTH:-google}"
+case "$relay_auth" in
+  google | token) ;;
+  *) die "RELAY_AUTH must be google or token" ;;
+esac
+if [[ "$relay_auth" == "token" && -z "${RELAY_TOKEN_FILE:-}" && -z "${RELAY_TOKEN:-}" ]]; then
+  die "RELAY_AUTH is token, so RELAY_TOKEN_FILE or RELAY_TOKEN is required"
+fi
+if [[ -n "${RELAY_GCLOUD_ACCOUNT:-}" && ! "$RELAY_GCLOUD_ACCOUNT" =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+$ ]]; then
+  die "RELAY_GCLOUD_ACCOUNT must be an account email address"
+fi
+
+node_bin="$(command -v node || true)"
+[[ -n "$node_bin" ]] || die "node is required (Node 22 or later)"
+
+[[ -n "${HOME:-}" ]] || die "HOME is required"
+home_phys="$(cd "$HOME" 2>/dev/null && pwd -P)" || die "HOME is not a directory"
+
+# --- The session's working directory (M1-SPEC §11.13) -----------------------------------
+
+# The physical path `path` would have, resolving the part that exists (symlinks included).
+physical_path() {
+  local path="$1" rest="" phys
+  while [[ ! -d "$path" ]]; do
+    if [[ -e "$path" || -L "$path" ]]; then
+      die "not a directory: $path"
+    fi
+    rest="/$(basename "$path")$rest"
+    path="$(dirname "$path")"
+  done
+  phys="$(cd "$path" && pwd -P)" || die "cannot resolve $path"
+  [[ "$phys" == "/" ]] && phys=""
+  printf '%s\n' "${phys}${rest:-}"
+}
+
+# The first file in `dir` that Claude Code would load into the session, if any.
+loaded_file_in() {
+  local dir="$1" name
+  for name in CLAUDE.md CLAUDE.local.md .claude/CLAUDE.md .claude/rules .claude/settings.json .claude/settings.local.json; do
+    if [[ -e "$dir/$name" || -L "$dir/$name" ]]; then
+      printf '%s\n' "$dir/$name"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# A directory this launcher owns: a real directory (not a symlink) owned by you, mode 700.
+own_private_dir() {
+  local dir="$1"
+  [[ -L "$dir" ]] && die "refusing to start: $dir is a symlink"
+  mkdir -p "$dir" || die "cannot create $dir"
+  [[ -d "$dir" && ! -L "$dir" && -O "$dir" ]] || die "refusing to start: $dir is not a directory owned by you"
+  chmod 700 "$dir"
+}
+
+uid="$(id -u)"
+if [[ -n "${ANSWERER_WORKDIR:-}" ]]; then
+  workdir="$ANSWERER_WORKDIR"
+  workdir_base=""
+else
+  tmp_root="${TMPDIR:-/tmp}"
+  while [[ "$tmp_root" == */ && "$tmp_root" != "/" ]]; do tmp_root="${tmp_root%/}"; done
+  workdir_base="$tmp_root/team-relay-answerer-$uid"
+  workdir="$workdir_base/work"
+fi
+[[ "$workdir" == /* ]] || die "ANSWERER_WORKDIR must be an absolute path"
+case "$workdir/" in
+  */./* | */../*) die "the working directory must not contain . or .. components: $workdir" ;;
+esac
+
+workdir_phys="$(physical_path "$workdir")"
+if [[ "$workdir_phys" == "$home_phys" || "$workdir_phys" == "$home_phys"/* || "$home_phys" == "" ]]; then
+  die "refusing to start: the working directory $workdir_phys is inside \$HOME ($home_phys), whose memory files would load into the session; set ANSWERER_WORKDIR (or TMPDIR) to a directory outside \$HOME"
+fi
+dir="$workdir_phys"
+while :; do
+  if hit="$(loaded_file_in "${dir:-/}")"; then
+    die "refusing to start: $hit would load into the answering session; choose another ANSWERER_WORKDIR"
+  fi
+  [[ -z "$dir" ]] && break
+  dir="${dir%/*}"
+done
+
+if [[ -n "$workdir_base" ]]; then
+  own_private_dir "$workdir_base"
+fi
+own_private_dir "$workdir"
+[[ "$(cd "$workdir" && pwd -P)" == "${workdir_phys:-/}" ]] || die "refusing to start: $workdir moved while it was being prepared"
+workdir="$workdir_phys"
+if [[ -n "$(ls -A "$workdir")" ]]; then
+  die "refusing to start: the working directory $workdir must be empty"
+fi
+
+# --- The session's configuration --------------------------------------------------------
+
+home="${ANSWERER_HOME:-$HOME/.claude-team-relay/answerer}"
+mkdir -p "$home" "$home/config" "$home/state"
+chmod 700 "$home" "$home/config" "$home/state"
+home="$(cd "$home" && pwd -P)"
+
+token_file=""
+if [[ "$relay_auth" == "google" ]]; then
+  # Your gcloud identity: no token is stored anywhere; drop one a token-mode run left behind.
+  rm -f "$home/token"
+elif [[ -n "${RELAY_TOKEN_FILE:-}" ]]; then
+  [[ -r "$RELAY_TOKEN_FILE" ]] || die "RELAY_TOKEN_FILE is not readable"
+  token_file="$(cd "$(dirname "$RELAY_TOKEN_FILE")" && pwd -P)/$(basename "$RELAY_TOKEN_FILE")"
+else
+  # Keep the token out of mcp.json and out of the session's environment: hand it over as a file.
+  token_file="$home/token"
+  printf '%s\n' "$RELAY_TOKEN" > "$token_file"
+  chmod 600 "$token_file"
+fi
+
+manifest_path="${MANIFEST_PATH:-$plugin_root/manifest.yaml}"
+[[ -r "$manifest_path" ]] || die "manifest not readable: $manifest_path"
+
+# JSON is written by node from the environment, so no value is ever spliced into JSON text.
+ANSWERER_OUT="$home" ANSWERER_NODE="$node_bin" ANSWERER_PLUGIN_ROOT="$plugin_root" \
+ANSWERER_AUTH="$relay_auth" ANSWERER_TOKEN_FILE="$token_file" ANSWERER_MANIFEST="$manifest_path" \
+  "$node_bin" --input-type=module -e '
+import { writeFileSync } from "node:fs";
+const e = process.env;
+const out = e.ANSWERER_OUT;
+const google = e.ANSWERER_AUTH === "google";
+const stateDir = out + "/state";
+const common = {
+  RELAY_URL: e.RELAY_URL,
+  RELAY_TEAM: e.RELAY_TEAM,
+  RELAY_AUTH: e.ANSWERER_AUTH,
+  MANIFEST_PATH: e.ANSWERER_MANIFEST,
+  ALLOW_PRODUCTION: e.ALLOW_PRODUCTION === "true" ? "true" : "false",
+};
+if (google) {
+  // gcloud runs inside the servers: it needs PATH, and any CLOUDSDK_* setting you use.
+  if (e.RELAY_GCLOUD_ACCOUNT) common.RELAY_GCLOUD_ACCOUNT = e.RELAY_GCLOUD_ACCOUNT;
+  if (e.PATH) common.PATH = e.PATH;
+  for (const [k, v] of Object.entries(e)) {
+    if (/^CLOUDSDK_[A-Z0-9_]+$/.test(k) && typeof v === "string") common[k] = v;
+  }
+} else {
+  common.RELAY_TOKEN_FILE = e.ANSWERER_TOKEN_FILE;
+}
+for (const [k, v] of Object.entries(e)) {
+  if (/^CAP_[A-Z][A-Z0-9_]*_(ENABLED|RUNNER)$/.test(k) && typeof v === "string") common[k] = v;
+}
+const root = e.ANSWERER_PLUGIN_ROOT;
+const mcp = {
+  mcpServers: {
+    relay: { command: e.ANSWERER_NODE, args: [root + "/dist/channel.js"], env: { ...common, RELAY_ROLE: "answerer", ANSWERER_STATE_DIR: stateDir } },
+    capabilities: { command: e.ANSWERER_NODE, args: [root + "/dist/capabilities.js"], env: { ...common } },
+  },
+};
+
+// M2-SPEC §4.2 and §7.5: reads are allowed, credential stores and secrets are not. Claude
+// Code consults path rules for Read only (it applies them to Glob and Grep; a Glob(...) or
+// Grep(...) path rule is accepted but never evaluated), so every rule here is a Read rule.
+// Paths in the home directory, home-anchored:
+const HOME_PATHS = [
+  "~/.ssh/**", "~/.gnupg/**", "~/.aws/**", "~/.config/gcloud/**", "~/.azure/**", "~/.kube/**",
+  "~/.docker/**", "~/.netrc", "~/.npmrc", "~/.pypirc", "~/.git-credentials", "~/.claude/**",
+  "~/.claude-team-relay/**", "~/Library/Keychains/**",
+  "~/.config/gh/**", "~/.zsh_history", "~/.bash_history", "~/.*_history",
+  "~/Library/Application Support/**/Cookies*", "~/Library/Application Support/Firefox/**",
+  "~/Library/Application Support/Google/Chrome/**", "~/.terraform.d/**", "~/.cargo/credentials*",
+  "~/.vault-token", "~/.pgpass", "~/.config/solana/**", "~/.foundry/**", "~/.ethereum/**",
+];
+// Files that can be anywhere. A "**/x" rule resolves from the session working directory
+// (empty here), so each also goes in home-anchored ("~/**/x") and root-anchored ("//**/x").
+const ANY_DEPTH = [
+  "**/.env", "**/.env.*", "**/.envrc", "**/*.pem", "**/*.key", "**/id_rsa*", "**/id_ed25519*",
+  "**/*.p12", "**/*.pfx", "**/*.keystore", "**/*.jks", "**/credentials.json", "**/*.tfvars",
+  "**/keystore/**",
+];
+// Literal paths (the files of this session) are escaped, so a glob character in them matches
+// only itself.
+const escapeGlob = (p) => p.replace(/[\\*?\[\]!#]/g, (c) => "\\" + c);
+const anchored = (p) => "/" + escapeGlob(p);
+const readDeny = [...HOME_PATHS];
+for (const p of ANY_DEPTH) readDeny.push(p, "~/" + p, "//" + p);
+readDeny.push("~/.claude.json", anchored(out) + "/**");
+if (e.ANSWERER_TOKEN_FILE) readDeny.push(anchored(e.ANSWERER_TOKEN_FILE));
+if (google && e.CLOUDSDK_CONFIG && e.CLOUDSDK_CONFIG.startsWith("/")) readDeny.push(anchored(e.CLOUDSDK_CONFIG) + "/**");
+const deny = ["Bash", "Write", "Edit", "NotebookEdit", "WebFetch", "WebSearch", "Agent", "Task"];
+for (const p of readDeny) deny.push("Read(" + p + ")");
+
+// M2-SPEC §4.3: every tool call (and failure) reports its name, outcome and duration. The
+// hook runs in the background (§7.4, "async": true on the handler), so it never delays a
+// tool call; Claude Code does not enforce "timeout" on an async hook, and the script gives
+// up by itself after 3 s.
+const hook = {
+  type: "command",
+  command: e.ANSWERER_NODE,
+  args: [root + "/dist/tool-event.js", "--config", out + "/tool-event.json"],
+  async: true,
+  timeout: 5,
+};
+const settings = {
+  permissions: {
+    deny,
+    allow: ["mcp__relay__*", "mcp__capabilities__*", "Read", "Glob", "Grep"],
+  },
+  hooks: {
+    PostToolUse: [{ matcher: "*", hooks: [hook] }],
+    PostToolUseFailure: [{ matcher: "*", hooks: [hook] }],
+  },
+};
+const toolEvent = { relay_url: e.RELAY_URL, relay_team: e.RELAY_TEAM, relay_auth: e.ANSWERER_AUTH, state_dir: stateDir };
+if (google && e.RELAY_GCLOUD_ACCOUNT) toolEvent.gcloud_account = e.RELAY_GCLOUD_ACCOUNT;
+if (!google) toolEvent.token_file = e.ANSWERER_TOKEN_FILE;
+const write = (name, value) => writeFileSync(out + "/" + name, JSON.stringify(value, null, 2) + "\n", { mode: 0o600 });
+write("mcp.json", mcp);
+write("settings.json", settings);
+write("tool-event.json", toolEvent);
+'
+chmod 600 "$home/mcp.json" "$home/settings.json" "$home/tool-event.json"
+
+cmd=(
+  env -u RELAY_TOKEN CLAUDE_CONFIG_DIR="$home/config"
+  claude
+  --mcp-config "$home/mcp.json"
+  --strict-mcp-config
+  --settings "$home/settings.json"
+  --disallowedTools Bash Write Edit NotebookEdit WebFetch WebSearch Agent Task
+  --dangerously-load-development-channels server:relay
+)
+
+cd "$workdir"
+if [[ $print_only -eq 1 ]]; then
+  printf 'cd %q &&' "$workdir"
+  printf ' %q' "${cmd[@]}" ${@+"$@"}
+  printf '\n'
+  exit 0
+fi
+exec "${cmd[@]}" ${@+"$@"}
