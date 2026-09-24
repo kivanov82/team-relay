@@ -4,9 +4,10 @@
 #
 # Usage: bash scripts/deploy.sh
 #
-# Changing membership: edit config/team.local.yaml, run scripts/gcp-bootstrap.sh (it adds a
-# secret version when the file changed), then this script (a revision pinned to that version,
-# and the invoker bindings reconciled to exactly the members in the file).
+# Membership lives in the relay's roster and owners change it in the console (M6-SPEC).
+# config/team.local.yaml holds the teams, their seed members (at least one owner each),
+# limits and delegates; after changing it, run scripts/gcp-bootstrap.sh (a new secret
+# version) and then this script (a revision pinned to that version).
 set -euo pipefail
 
 # Deployment settings come from config/deploy.local.env (git-ignored; copy
@@ -65,48 +66,32 @@ DIGEST="$(gcloud artifacts docker images describe "$IMAGE" --project="$PROJECT" 
   --format='value(image_summary.digest)')"
 IMAGE_BY_DIGEST="${IMAGE%:*}@${DIGEST}"
 
+OAUTH_SECRET="team-relay-oauth-client"
+OAUTH_VERSION="$(gcloud secrets versions list "$OAUTH_SECRET" --project="$PROJECT" \
+  --filter='state:ENABLED' --sort-by='~createTime' --limit=1 --format='value(name.basename())')"
+if [[ -z "$OAUTH_VERSION" ]]; then
+  echo "error: no enabled version of ${OAUTH_SECRET}; run OAUTH_CLIENT_FILE=... scripts/gcp-bootstrap.sh" >&2
+  exit 1
+fi
+
+# Reachable without Cloud Run IAM (M5-SPEC §5): the browser has to reach the sign-in pages
+# before anyone is signed in. Every other endpoint authenticates in the app (a device
+# credential, a Google ID token or a delegate), against the team's roster.
+#
 # --update-env-vars, never --set-env-vars. RELAY_AUDIENCE holds a comma, so the list uses
 # gcloud's alternate delimiter syntax (^;^).
-echo "Deploying ${SERVICE} (${IMAGE_BY_DIGEST}, team config v${SECRET_VERSION})"
+echo "Deploying ${SERVICE} (${IMAGE_BY_DIGEST}, team config v${SECRET_VERSION}, oauth v${OAUTH_VERSION})"
 gcloud run deploy "$SERVICE" \
   --project="$PROJECT" \
   --region="$REGION" \
   --image="$IMAGE_BY_DIGEST" \
   --service-account="$RUNTIME_EMAIL" \
-  --no-allow-unauthenticated \
+  --allow-unauthenticated \
   --min-instances=0 --max-instances=3 --cpu=1 --memory=512Mi --timeout=60 \
-  --set-secrets="/secrets/team/team.yaml=${SECRET}:${SECRET_VERSION}" \
-  --update-env-vars="^;^RELAY_AUTH_MODE=google;RELAY_AUDIENCE=${GCLOUD_CLIENT_ID},${URL};RELAY_FIRESTORE_DATABASE=${DATABASE};GOOGLE_CLOUD_PROJECT=${PROJECT};RELAY_TEAM_CONFIG=/secrets/team/team.yaml;RELAY_HOST=0.0.0.0;APP_VERSION=${SHA}" \
+  --set-secrets="/secrets/team/team.yaml=${SECRET}:${SECRET_VERSION},/secrets/oauth/client.json=${OAUTH_SECRET}:${OAUTH_VERSION}" \
+  --update-env-vars="^;^RELAY_AUTH_MODE=google;RELAY_AUDIENCE=${GCLOUD_CLIENT_ID},${URL};RELAY_FIRESTORE_DATABASE=${DATABASE};GOOGLE_CLOUD_PROJECT=${PROJECT};RELAY_TEAM_CONFIG=/secrets/team/team.yaml;RELAY_OAUTH_CLIENT_FILE=/secrets/oauth/client.json;RELAY_PUBLIC_URL=${URL};RELAY_HOST=0.0.0.0;APP_VERSION=${SHA}" \
   --quiet
-
-# Invokers: exactly the Google principals in the team config. Cloud Run IAM is the outer
-# gate; the relay's allowlist still decides who a caller is.
-# Members are users; read-only delegates (M3-SPEC §2, the hosted console) are service
-# accounts and need to reach the relay too.
-WANTED="$( {
-  sed -n 's/^[[:space:]]*-[[:space:]]*"google:\([^"]*\)".*/user:\1/p' "$TEAM_CONFIG"
-  sed -n 's/^[[:space:]]*-\{0,1\}[[:space:]]*principal:[[:space:]]*"google:\([^"]*\.gserviceaccount\.com\)".*/serviceAccount:\1/p' "$TEAM_CONFIG"
-} | sort -u)"
-CURRENT="$(gcloud run services get-iam-policy "$SERVICE" --project="$PROJECT" --region="$REGION" \
-  --flatten='bindings[].members' --format='csv[no-heading](bindings.role,bindings.members)' \
-  | sed -n 's/^roles\/run.invoker,//p' | sort -u)"
-for member in $WANTED; do
-  if grep -qx "$member" <<<"$CURRENT"; then
-    echo "   invoker ${member}: exists"
-  else
-    gcloud run services add-iam-policy-binding "$SERVICE" --project="$PROJECT" --region="$REGION" \
-      --member="$member" --role=roles/run.invoker --quiet >/dev/null
-    echo "   invoker ${member}: created"
-  fi
-done
-for member in $CURRENT; do
-  if ! grep -qx "$member" <<<"$WANTED"; then
-    gcloud run services remove-iam-policy-binding "$SERVICE" --project="$PROJECT" \
-      --region="$REGION" --member="$member" --role=roles/run.invoker --quiet >/dev/null
-    echo "   invoker ${member}: removed"
-  fi
-done
 
 echo
 echo "Deployed ${SERVICE}: ${URL}"
-echo "Members connect with RELAY_URL=${URL} RELAY_TEAM=<your team id> RELAY_AUTH=google"
+echo "Members install the plugin and run /team-relay:login (relay ${URL})."

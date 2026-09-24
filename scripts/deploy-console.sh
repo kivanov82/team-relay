@@ -81,28 +81,26 @@ gcloud run services add-iam-policy-binding "$SERVICE" --project="$PROJECT" --reg
   --member="serviceAccount:${IAP_AGENT}" --role=roles/run.invoker --quiet >/dev/null
 echo "   run.invoker for the IAP service agent: set"
 
-# Who may pass IAP: exactly the members in the team config.
-WANTED="$(sed -n 's/^[[:space:]]*-[[:space:]]*"google:\([^"]*\)".*/user:\1/p' "$TEAM_CONFIG" | sort -u)"
+# Who may pass IAP: any signed-in Google account (M6-SPEC §5). The relay's roster decides
+# membership; a non-member sees only the "not on this team" page, and no data.
 CURRENT="$(gcloud beta iap web get-iam-policy --project="$PROJECT" --region="$REGION" \
   --resource-type=cloud-run --service="$SERVICE" \
   --flatten='bindings[].members' --format='csv[no-heading](bindings.role,bindings.members)' \
   2>/dev/null | sed -n 's/^roles\/iap.httpsResourceAccessor,//p' | sort -u)"
-for member in $WANTED; do
-  if ! grep -qx "$member" <<<"$CURRENT"; then
-    gcloud beta iap web add-iam-policy-binding --project="$PROJECT" --region="$REGION" \
-      --resource-type=cloud-run --service="$SERVICE" --member="$member" \
-      --role=roles/iap.httpsResourceAccessor --quiet >/dev/null
-    echo "   iap access ${member}: created"
-  else
-    echo "   iap access ${member}: exists"
-  fi
-done
+if grep -qx "allAuthenticatedUsers" <<<"$CURRENT"; then
+  echo "   iap access allAuthenticatedUsers: exists"
+else
+  gcloud beta iap web add-iam-policy-binding --project="$PROJECT" --region="$REGION" \
+    --resource-type=cloud-run --service="$SERVICE" --member=allAuthenticatedUsers \
+    --role=roles/iap.httpsResourceAccessor --quiet >/dev/null
+  echo "   iap access allAuthenticatedUsers: created"
+fi
 for member in $CURRENT; do
-  if ! grep -qx "$member" <<<"$WANTED"; then
+  if [[ "$member" != "allAuthenticatedUsers" ]]; then
     gcloud beta iap web remove-iam-policy-binding --project="$PROJECT" --region="$REGION" \
       --resource-type=cloud-run --service="$SERVICE" --member="$member" \
       --role=roles/iap.httpsResourceAccessor --quiet >/dev/null
-    echo "   iap access ${member}: removed"
+    echo "   iap access ${member}: removed (the roster decides now)"
   fi
 done
 

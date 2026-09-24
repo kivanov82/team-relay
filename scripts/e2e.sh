@@ -10,6 +10,15 @@
 # include M4 (docs/M4-SPEC.md §2, §3): a permission request's `waiting` tool event shows on
 # the activity feed and the next event for that tool follows it, and the answering channel's
 # shared folder names come back in the directory.
+#
+# M5 and M6 (docs/M5-SPEC.md §8, docs/M6-SPEC.md §6): when relay/tests/fake_oauth_app.py is
+# there, the relay is started through it instead (the same app, with a fake Google sign-in
+# provider on the same 127.0.0.1 port; static tokens still work), the team file names alice
+# as the seed owner and gives each member a synthetic Google email, and test/e2e/m5.test.ts
+# runs when the relay answers GET /v1/login/start with 400: the whole sign-in through the real
+# login tool with a stub browser, streams with the stored credential, logout, an owner adding
+# a member through the console server, the new member signing in and appearing in the
+# directory, and removal refusing them within 30 s.
 # Extra arguments are passed to vitest. The tokens are never printed.
 set -euo pipefail
 
@@ -67,7 +76,33 @@ sha256() { printf %s "$1" | openssl dgst -sha256 -r | cut -d' ' -f1; }
 TOKEN_ALICE="$(new_token)"
 TOKEN_BOB="$(new_token)"
 TOKEN_CAROL="$(new_token)"
-cat >"$WORK/team.yaml" <<EOF
+FAKE_OAUTH=0
+[[ -f "$ROOT/relay/tests/fake_oauth_app.py" ]] && FAKE_OAUTH=1
+if [[ "$FAKE_OAUTH" -eq 1 ]]; then
+  # M6-SPEC §1: the seed owner is alice; the Google emails are synthetic (example.com).
+  cat >"$WORK/team.yaml" <<EOF
+teams:
+  - id: demo
+    members:
+      - id: alice
+        role: owner
+        principals: ["token:sha256:$(sha256 "$TOKEN_ALICE")", "google:alice@example.com"]
+      - id: bob
+        principals: ["token:sha256:$(sha256 "$TOKEN_BOB")", "google:bob@example.com"]
+      - id: carol
+        principals: ["token:sha256:$(sha256 "$TOKEN_CAROL")", "google:carol@example.com"]
+limits:
+  min_ack_timeout_seconds: 2
+  min_answer_timeout_seconds: 2
+  # The M2 scenarios poll /activity and /directory in tight loops (M2-SPEC §7.3's budget is
+  # 120 a minute by default; the relay allows up to 10000).
+  reads_per_minute: 10000
+  login_starts_per_minute: 1000
+  login_pages_per_minute: 1000
+  login_tokens_per_minute: 1000
+EOF
+else
+  cat >"$WORK/team.yaml" <<EOF
 teams:
   - id: demo
     members:
@@ -80,10 +115,9 @@ teams:
 limits:
   min_ack_timeout_seconds: 2
   min_answer_timeout_seconds: 2
-  # The M2 scenarios poll /activity and /directory in tight loops (M2-SPEC §7.3's budget is
-  # 120 a minute by default; the relay allows up to 10000).
   reads_per_minute: 10000
 EOF
+fi
 
 EMULATOR_STARTED=1
 FIRESTORE_HOST="$("$ROOT/scripts/emulator.sh" start "$EMULATOR_PORT" "$EMULATOR_NAME")"
@@ -92,6 +126,11 @@ RELAY_PORT="$("$PYTHON" -c 'import socket; s = socket.socket(); s.bind(("127.0.0
 RELAY_URL="http://127.0.0.1:${RELAY_PORT}"
 
 # The tokens are shell variables, not exported, so the relay's environment never holds them.
+if [[ "$FAKE_OAUTH" -eq 1 ]]; then
+  RELAY_MODULE=(-m tests.fake_oauth_app --port "$RELAY_PORT")
+else
+  RELAY_MODULE=(-m relay)
+fi
 (
   cd "$ROOT/relay"
   exec env -u K_SERVICE \
@@ -102,7 +141,7 @@ RELAY_URL="http://127.0.0.1:${RELAY_PORT}"
     FIRESTORE_EMULATOR_HOST="$FIRESTORE_HOST" \
     GOOGLE_CLOUD_PROJECT=demo-e2e \
     RELAY_LOG_LEVEL=warning \
-    "$PYTHON" -m relay
+    "$PYTHON" "${RELAY_MODULE[@]}"
 ) >"$WORK/relay.log" 2>&1 &
 RELAY_PID=$!
 
@@ -134,8 +173,18 @@ else
   echo "e2e: SKIPPING the M2 scenarios: the relay does not serve them yet (GET /v1/health: $health, GET /activity: $activity); running the M1 scenarios only" >&2
 fi
 
+# Does the relay serve M5 (docs/M5-SPEC.md §5: /v1/login/start without params is 400)?
+E2E_M5=0
+login_start="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$RELAY_URL/v1/login/start" || true)"
+if [[ "$FAKE_OAUTH" -eq 1 && "$login_start" == "400" ]]; then
+  E2E_M5=1
+  echo "e2e: the relay serves the login flow with a fake Google: running the M5 and M6 scenarios" >&2
+else
+  echo "e2e: SKIPPING the M5 and M6 scenarios (fake OAuth launcher: $FAKE_OAUTH, GET /v1/login/start: $login_start)" >&2
+fi
+
 pnpm -C "$ROOT/plugin" build
 
-export RELAY_URL E2E=1 E2E_M2
+export RELAY_URL E2E=1 E2E_M2 E2E_M5
 export E2E_TOKEN_ALICE="$TOKEN_ALICE" E2E_TOKEN_BOB="$TOKEN_BOB" E2E_TOKEN_CAROL="$TOKEN_CAROL"
 pnpm -C "$ROOT/plugin" test:e2e "$@"

@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# The deploy gate (M2-SPEC §6) against the live service, as the operator:
-#   no credentials            -> Cloud Run's 403 (IAM invoker in front)
-#   operator ID token /health -> 200 (the operator can invoke; health needs no member)
-#   operator ID token on API  -> the relay's 401 (the operator is not on the allowlist)
+# The deploy gate (M2-SPEC §6, M5-SPEC §5) against the live service:
+#   no credentials, /v1/health        -> 200 (reachable: the sign-in pages must be)
+#   no credentials, the API           -> the relay's own 401
+#   /v1/login/start without params    -> 400
+#   operator ID token on the API      -> 401 (the operator is on no roster)
 # The token lives in a variable for the one curl and is never printed.
 set -euo pipefail
 
@@ -25,10 +26,11 @@ check() {  # $1 label, $2 expected, $3 actual
   if [[ "$2" == "$3" ]]; then echo "ok    $1: $3"; else echo "FAIL  $1: expected $2, got $3"; fail=1; fi
 }
 
-check "unauthenticated /v1/health" 403 "$(curl -s -o /dev/null -w '%{http_code}' "$URL/v1/health")"
+check "unauthenticated /v1/health" 200 "$(curl -s -o /dev/null -w '%{http_code}' "$URL/v1/health")"
+check "unauthenticated /v1/teams/${TEAM}/me" 401 \
+  "$(curl -s -o /dev/null -w '%{http_code}' "$URL/v1/teams/${TEAM}/me")"
+check "bare /v1/login/start" 400 "$(curl -s -o /dev/null -w '%{http_code}' "$URL/v1/login/start")"
 TOKEN="$(gcloud auth print-identity-token --audiences="$URL" 2>/dev/null)"
-check "operator /v1/health" 200 \
-  "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer ${TOKEN}" "$URL/v1/health")"
 check "operator /v1/teams/${TEAM}/me" 401 \
   "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer ${TOKEN}" "$URL/v1/teams/${TEAM}/me")"
 unset TOKEN
