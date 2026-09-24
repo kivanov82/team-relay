@@ -2,3 +2,4 @@
 *
 !plugin/dist/console-server.js
 !plugin/dist/console/
+!plugin/relay.default.json

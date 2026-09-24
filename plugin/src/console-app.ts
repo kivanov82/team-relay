@@ -6,9 +6,12 @@
 //   refused (DNS rebinding).
 // - /api/* needs X-Console-Key equal to the per-launch key (compared in constant time):
 //   missing is 401, wrong is 403. No CORS headers, ever; a cross-site fetch is refused.
-// - A read-only proxy of exactly four GETs: /api/me, /api/directory, /api/activity and
-//   /api/requests/{id}. Nothing else is proxied, and no other method is accepted, so there
-//   is no way to send, ack or reply from the console.
+// - A read-only proxy of exactly five GETs: /api/me, /api/directory, /api/activity,
+//   /api/requests/{id} and /api/roster (M6-SPEC §3). The only writes are the owner's roster
+//   changes: POST /api/roster, PATCH and DELETE /api/roster/{member}, each with
+//   Content-Type: application/json and Sec-Fetch-Site: same-origin, and a body checked here
+//   before it is sent on. Nothing else is proxied, so there is no way to send, ack or reply
+//   from the console.
 // - GET /api/join, answered by the console server itself (never proxied): what a new member
 //   needs to install the plugin (relay URL, team, the repository to clone, marketplace and
 //   plugin names). Nothing secret; the same gate as the other /api routes.
@@ -18,16 +21,29 @@
 // - Binds 0.0.0.0; the Host must equal the service's public host exactly.
 // - No console key: every request, static files included, must carry a valid IAP assertion
 //   (x-goog-iap-jwt-assertion); anything else is a bare 401. The viewer's email from it is
-//   sent to the relay as X-Relay-On-Behalf-Of on each of the same four GETs.
+//   sent to the relay as X-Relay-On-Behalf-Of on each of the same routes. A viewer the relay
+//   does not know (M6-SPEC §4: any signed-in Google account reaches the page) gets 403
+//   {"error": "not_on_team", "email"} and no data.
 
 import { createHash, timingSafeEqual } from 'node:crypto';
 import { existsSync, readFileSync, realpathSync, statSync } from 'node:fs';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { extname, join, sep } from 'node:path';
-import { BadRequest, NotFound, type DemoTeam } from './console-demo.js';
+import { BadRequest, NotFound, RosterRefusal, type DemoTeam } from './console-demo.js';
 import { IAP_HEADER, type IapIdentity } from './iap.js';
-import { REQUEST_ID_RE, RelayError, RelayNetworkError, type RelayClient } from './relay-client.js';
+import {
+  MEMBER_RE,
+  REQUEST_ID_RE,
+  RelayError,
+  RelayNetworkError,
+  type AddMemberBody,
+  type RelayClient,
+  type RosterRole,
+  type UpdateMemberBody,
+} from './relay-client.js';
+import { normaliseRelayUrl } from './credentials.js';
+import { defaultRelayUrl } from './relay-default.js';
 
 export const CONTENT_SECURITY_POLICY = [
   "default-src 'self'",
@@ -81,6 +97,11 @@ export type ConsoleBackend = {
   directory(ctx?: ReadContext): Promise<unknown>;
   activity(q: { since?: string; limit?: number }, ctx?: ReadContext): Promise<unknown>;
   request(id: string, ctx?: ReadContext): Promise<unknown>;
+  /** M6-SPEC §2, §3: the roster, and the owner's changes to it. */
+  roster(ctx?: ReadContext): Promise<unknown>;
+  addMember(body: AddMemberBody, ctx?: ReadContext): Promise<unknown>;
+  updateMember(member: string, body: UpdateMemberBody, ctx?: ReadContext): Promise<unknown>;
+  removeMember(member: string, ctx?: ReadContext): Promise<unknown>;
 };
 
 export function relayBackend(client: RelayClient): ConsoleBackend {
@@ -94,6 +115,10 @@ export function relayBackend(client: RelayClient): ConsoleBackend {
     directory: (ctx) => client.directory(opts(ctx)),
     activity: (q, ctx) => client.activity(q, opts(ctx)),
     request: (id, ctx) => client.getRequest(id, opts(ctx)),
+    roster: (ctx) => client.roster(opts(ctx)),
+    addMember: (body, ctx) => client.addMember(body, opts(ctx)),
+    updateMember: (member, body, ctx) => client.updateMember(member, body, opts(ctx)),
+    removeMember: (member, ctx) => client.removeMember(member, opts(ctx)),
   };
 }
 
@@ -103,29 +128,132 @@ export function demoBackend(team: DemoTeam): ConsoleBackend {
     directory: async () => team.directory(),
     activity: async (q) => team.activity(q),
     request: async (id) => team.request(id),
+    roster: async () => team.roster(),
+    addMember: async (body) => team.addMember(body),
+    updateMember: async (member, body) => team.updateMember(member, body),
+    removeMember: async (member) => team.removeMember(member),
   };
+}
+
+// ---------------------------------------------------------------------------------------
+// The roster bodies (M6-SPEC §2), checked before anything reaches the relay.
+
+/** A lower-cased Google email address, as the roster stores it. */
+export const ROSTER_EMAIL_RE = /^[a-z0-9._%+-]{1,64}@[a-z0-9-]{1,63}(\.[a-z0-9-]{1,63})+$/;
+const ROLES: readonly RosterRole[] = ['owner', 'member'];
+/** The largest body a roster change may have. */
+export const ROSTER_BODY_LIMIT = 4096;
+
+export class BodyError extends Error {}
+
+function onlyKeys(body: Record<string, unknown>, allowed: string[]): void {
+  for (const k of Object.keys(body)) if (!allowed.includes(k)) throw new BodyError(`unknown field ${k.slice(0, 40)}`);
+}
+
+function email(v: unknown, field: string): string {
+  if (typeof v !== 'string') throw new BodyError(`${field} must be an email address`);
+  const e = v.trim().toLowerCase();
+  if (e.length > 254 || !ROSTER_EMAIL_RE.test(e)) throw new BodyError(`${field} must be an email address`);
+  return e;
+}
+
+function role(v: unknown): RosterRole {
+  if (typeof v !== 'string' || !ROLES.includes(v as RosterRole)) throw new BodyError('role must be "owner" or "member"');
+  return v as RosterRole;
+}
+
+export function checkAddMember(raw: unknown): AddMemberBody {
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) throw new BodyError('the body must be a JSON object');
+  const b = raw as Record<string, unknown>;
+  onlyKeys(b, ['member', 'email', 'role']);
+  if (typeof b.member !== 'string' || !MEMBER_RE.test(b.member)) {
+    throw new BodyError('member must be 2 to 32 characters: a lower-case letter, then lower-case letters, digits or _');
+  }
+  const out: AddMemberBody = { member: b.member, email: email(b.email, 'email') };
+  if (b.role !== undefined) out.role = role(b.role);
+  return out;
+}
+
+export function checkUpdateMember(raw: unknown): UpdateMemberBody {
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) throw new BodyError('the body must be a JSON object');
+  const b = raw as Record<string, unknown>;
+  onlyKeys(b, ['add_email', 'remove_email', 'role']);
+  const out: UpdateMemberBody = {};
+  if (b.add_email !== undefined) out.add_email = email(b.add_email, 'add_email');
+  if (b.remove_email !== undefined) out.remove_email = email(b.remove_email, 'remove_email');
+  if (b.role !== undefined) out.role = role(b.role);
+  if (Object.keys(out).length === 0) throw new BodyError('nothing to change: give add_email, remove_email or role');
+  return out;
 }
 
 /** GET /api/join: how to join the team, for the console's join panel. Nothing secret. */
 export type JoinInfo = {
   relay_url: string;
   team: string;
-  /** The team-relay repository to clone (JOIN_REPO_URL), or null to ask the team owner. */
+  /** The team-relay repository (JOIN_REPO_URL), or null. */
   repo_url: string | null;
+  /**
+   * What `/plugin marketplace add` takes (M5-SPEC §1): JOIN_MARKETPLACE (GitHub owner/repo,
+   * or an https git URL), else derived from JOIN_REPO_URL, else null (ask the team owner).
+   */
+  marketplace_source: string | null;
   marketplace: string;
   plugin: string;
+  /** True when relay_url is the plugin's own default, so a bare /team-relay:login reaches it. */
+  default_relay: boolean;
 };
 
 /** The marketplace at the repository root (.claude-plugin/marketplace.json) and its plugin. */
 export const JOIN_MARKETPLACE = 'team-relay-dev';
 export const JOIN_PLUGIN = 'team-relay';
 
-export function joinInfo(relayUrl: string, team: string, repoUrl: string | null): JoinInfo {
-  return { relay_url: relayUrl, team, repo_url: repoUrl, marketplace: JOIN_MARKETPLACE, plugin: JOIN_PLUGIN };
+const GITHUB_REPO_RE = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})\/[A-Za-z0-9._-]{1,100}$/;
+
+/** JOIN_MARKETPLACE: GitHub owner/repo or a plain https URL; unset or empty is null. */
+export function checkJoinMarketplace(raw: string | undefined): string | null {
+  const v = raw?.trim();
+  if (!v) return null;
+  if (GITHUB_REPO_RE.test(v) && !v.split('/').some((x) => x === '.' || x === '..')) return v;
+  try {
+    return checkJoinRepoUrl(v);
+  } catch {
+    throw new Error('JOIN_MARKETPLACE must be a GitHub owner/repo or a plain https URL');
+  }
+}
+
+/** A GitHub repository URL becomes owner/repo; any other URL stays as it is. */
+export function marketplaceFromRepoUrl(repoUrl: string | null): string | null {
+  if (!repoUrl) return null;
+  const m = /^https:\/\/github\.com\/([A-Za-z0-9-]{1,39})\/([A-Za-z0-9._-]{1,100}?)(?:\.git)?\/?$/i.exec(repoUrl);
+  return m ? `${m[1]}/${m[2]}` : repoUrl;
+}
+
+export function joinInfo(
+  relayUrl: string,
+  team: string,
+  repoUrl: string | null,
+  marketplaceSource: string | null = null,
+  defaultRelay: string | null = defaultRelayUrl(),
+): JoinInfo {
+  let isDefault = false;
+  try {
+    isDefault = defaultRelay !== null && normaliseRelayUrl(relayUrl) === normaliseRelayUrl(defaultRelay);
+  } catch {
+    isDefault = false;
+  }
+  return {
+    relay_url: relayUrl,
+    team,
+    repo_url: repoUrl,
+    marketplace_source: marketplaceSource ?? marketplaceFromRepoUrl(repoUrl),
+    marketplace: JOIN_MARKETPLACE,
+    plugin: JOIN_PLUGIN,
+    default_relay: isDefault,
+  };
 }
 
 /** --demo: nothing real, and no repository. */
-export const DEMO_JOIN: JoinInfo = joinInfo('https://relay.example.com', 'demo', null);
+export const DEMO_JOIN: JoinInfo = joinInfo('https://relay.example.com', 'demo', null, 'example/team-relay', null);
 
 /**
  * JOIN_REPO_URL: an https URL with a host and an optional plain path, nothing a shell would
@@ -159,8 +287,8 @@ const PLACEHOLDER = `<!doctype html>
 <h1>Team relay console</h1>
 <p>The console has not been built yet: <code>dist/console/</code> is missing. Build it from
 <code>console/</code> (it builds into <code>plugin/dist/console/</code>), then reload this page.</p>
-<p>The read-only API is running: <code>/api/me</code>, <code>/api/directory</code>,
-<code>/api/activity</code>, <code>/api/requests/{id}</code> and <code>/api/join</code>, with the key from this page's
+<p>The API is running: <code>/api/me</code>, <code>/api/directory</code>, <code>/api/activity</code>,
+<code>/api/requests/{id}</code>, <code>/api/roster</code> and <code>/api/join</code>, with the key from this page's
 address in an <code>X-Console-Key</code> header.</p>
 </body>
 </html>
@@ -224,6 +352,27 @@ function sendJson(res: ServerResponse, status: number, value: unknown, extra: Re
   send(res, status, JSON.stringify(value), 'application/json; charset=utf-8', { 'Cache-Control': 'no-store', ...extra });
 }
 
+/** The request body, at most `limit` bytes (else it rejects, and the rest is discarded). */
+function readBody(req: IncomingMessage, limit: number): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    let size = 0;
+    let over = false;
+    req.on('data', (c: Buffer) => {
+      if (over) return;
+      size += c.length;
+      if (size > limit) {
+        over = true;
+        chunks.length = 0;
+        return;
+      }
+      chunks.push(c);
+    });
+    req.on('end', () => (over ? reject(new Error('too large')) : resolve(Buffer.concat(chunks).toString('utf8'))));
+    req.on('error', reject);
+  });
+}
+
 function headerValue(req: IncomingMessage, name: string): string | undefined {
   const v = req.headers[name];
   return Array.isArray(v) ? undefined : v;
@@ -248,22 +397,128 @@ export function createConsoleServer(opts: ConsoleServerOptions): ConsoleServer {
     return host === `127.0.0.1:${port}` || host === `localhost:${port}`;
   }
 
+  /** A relay (or demo) failure as the console answers it. */
+  function failure(res: ServerResponse, err: unknown, path: string, viewer: string | undefined): void {
+    // M6-SPEC §4: hosted, a signed-in account the relay does not know gets no data, only this.
+    if (hosted && viewer !== undefined && err instanceof RelayError && (err.status === 401 || (err.status === 404 && path === '/api/me'))) {
+      return sendJson(res, 403, { error: 'not_on_team', email: viewer });
+    }
+    if (err instanceof NotFound || (err instanceof RelayError && err.status === 404)) return sendJson(res, 404, { error: 'not_found' });
+    if (err instanceof BadRequest) return sendJson(res, 400, { error: 'bad_request', detail: err.detail });
+    if (err instanceof RosterRefusal) {
+      return sendJson(res, 502, { error: 'relay_refused', relay_status: err.status, relay_error: err.code, detail: err.detail });
+    }
+    if (err instanceof RelayError) {
+      return sendJson(res, 502, {
+        error: 'relay_refused',
+        relay_status: err.status,
+        relay_error: err.code,
+        ...(err.detail ? { detail: err.detail.slice(0, 300) } : {}),
+      });
+    }
+    if (err instanceof RelayNetworkError) return sendJson(res, 502, { error: 'relay_unreachable', detail: err.message });
+    // Credentials (gcloud, the credential file) or anything else: the message never carries a token.
+    const detail = err instanceof Error ? err.message.slice(0, 300) : 'unexpected error';
+    return sendJson(res, 502, { error: 'relay_unavailable', detail });
+  }
+
+  /** M6-SPEC §3: POST /api/roster, PATCH and DELETE /api/roster/{member}. */
+  async function rosterChange(req: IncomingMessage, res: ServerResponse, url: URL, ctx: ReadContext, viewer: string | undefined): Promise<void> {
+    const path = url.pathname;
+    const one = /^\/api\/roster\/([^/]+)$/.exec(path);
+    const allowed = one ? ['PATCH', 'DELETE'] : ['POST'];
+    const method = req.method ?? '';
+    if (!allowed.includes(method)) {
+      req.resume();
+      return sendJson(res, 405, { error: 'method_not_allowed' }, { Allow: ['GET', ...allowed].filter((m) => !(one && m === 'GET')).join(', ') });
+    }
+    // A change is made only from the console's own page.
+    if (headerValue(req, 'sec-fetch-site') !== 'same-origin') {
+      req.resume();
+      return sendJson(res, 403, { error: 'forbidden', detail: 'Sec-Fetch-Site: same-origin is required' });
+    }
+    const type = headerValue(req, 'content-type') ?? '';
+    if (!/^application\/json\s*(;.*)?$/i.test(type)) {
+      req.resume();
+      return sendJson(res, 415, { error: 'unsupported_media_type', detail: 'Content-Type must be application/json' });
+    }
+    if ([...url.searchParams.keys()].length > 0) {
+      req.resume();
+      return sendJson(res, 400, { error: 'bad_request', detail: 'no query parameters here' });
+    }
+    const member = one ? one[1]! : null;
+    if (member !== null && !MEMBER_RE.test(member)) {
+      req.resume();
+      return sendJson(res, 404, { error: 'not_found' });
+    }
+    let text: string;
+    try {
+      text = await readBody(req, ROSTER_BODY_LIMIT);
+    } catch {
+      return sendJson(res, 413, { error: 'too_large', detail: `at most ${ROSTER_BODY_LIMIT} bytes` });
+    }
+    let raw: unknown = undefined;
+    if (text.trim() !== '') {
+      try {
+        raw = JSON.parse(text);
+      } catch {
+        return sendJson(res, 400, { error: 'bad_request', detail: 'the body is not JSON' });
+      }
+    }
+    let call: () => Promise<unknown>;
+    try {
+      if (method === 'POST') {
+        const body = checkAddMember(raw);
+        call = () => opts.backend.addMember(body, ctx);
+      } else if (method === 'PATCH') {
+        const body = checkUpdateMember(raw);
+        call = () => opts.backend.updateMember(member!, body, ctx);
+      } else {
+        if (raw !== undefined && (typeof raw !== 'object' || raw === null || Array.isArray(raw) || Object.keys(raw).length > 0)) {
+          throw new BodyError('a removal takes no body');
+        }
+        call = () => opts.backend.removeMember(member!, ctx);
+      }
+    } catch (err) {
+      return sendJson(res, 400, { error: 'bad_request', detail: err instanceof BodyError ? err.message : 'bad body' });
+    }
+    log(`roster ${method === 'POST' ? 'add' : method === 'PATCH' ? 'update' : 'remove'}${member ? ` ${member}` : ''}`);
+    try {
+      return sendJson(res, method === 'POST' ? 201 : 200, await call());
+    } catch (err) {
+      return failure(res, err, path, viewer);
+    }
+  }
+
   async function api(req: IncomingMessage, res: ServerResponse, url: URL, viewer: string | undefined): Promise<void> {
     // A page on another site cannot read these (no CORS), and is refused outright when the
     // browser says the request is cross-site.
     const site = headerValue(req, 'sec-fetch-site');
     if (site !== undefined && site !== 'same-origin' && site !== 'none') {
+      req.resume();
       return sendJson(res, 403, { error: 'forbidden', detail: 'cross-site request' });
     }
     if (!hosted) {
       const given = headerValue(req, 'x-console-key');
-      if (given === undefined || given === '') return sendJson(res, 401, { error: 'unauthenticated', detail: 'X-Console-Key is required' });
-      if (!keyMatches(given, opts.key!)) return sendJson(res, 403, { error: 'forbidden', detail: 'wrong console key' });
+      if (given === undefined || given === '') {
+        req.resume();
+        return sendJson(res, 401, { error: 'unauthenticated', detail: 'X-Console-Key is required' });
+      }
+      if (!keyMatches(given, opts.key!)) {
+        req.resume();
+        return sendJson(res, 403, { error: 'forbidden', detail: 'wrong console key' });
+      }
     }
     const ctx: ReadContext = viewer !== undefined ? { viewer } : {};
-    if (req.method !== 'GET') return sendJson(res, 405, { error: 'method_not_allowed', detail: 'the console is read-only' }, { Allow: 'GET' });
-
     const path = url.pathname;
+    const roster = path === '/api/roster' || /^\/api\/roster\/[^/]+$/.test(path);
+    if (req.method !== 'GET') {
+      if (roster) return rosterChange(req, res, url, ctx, viewer);
+      req.resume();
+      return sendJson(res, 405, { error: 'method_not_allowed', detail: 'the console is read-only' }, { Allow: 'GET' });
+    }
+    req.resume();
+
     const query = [...url.searchParams.keys()];
     if (path === '/api/join') {
       // Answered here, from the server's own configuration; the relay is not asked.
@@ -272,7 +527,7 @@ export function createConsoleServer(opts: ConsoleServerOptions): ConsoleServer {
       return sendJson(res, 200, opts.join);
     }
     let call: () => Promise<unknown>;
-    if (path === '/api/me' || path === '/api/directory') {
+    if (path === '/api/me' || path === '/api/directory' || path === '/api/roster') {
       if (query.length > 0) return sendJson(res, 400, { error: 'bad_request', detail: 'no query parameters here' });
       // Hosted, the viewer's own IAP-verified email rides along on /api/me so the join panel can
       // fill in their commands; it is theirs, and nobody else's is ever added.
@@ -284,7 +539,9 @@ export function createConsoleServer(opts: ConsoleServerOptions): ConsoleServer {
                 ? { ...(me as Record<string, unknown>), email: ctx.viewer }
                 : me;
             }
-          : () => opts.backend.directory(ctx);
+          : path === '/api/directory'
+            ? () => opts.backend.directory(ctx)
+            : () => opts.backend.roster(ctx);
     } else if (path === '/api/activity') {
       const q: { since?: string; limit?: number } = {};
       for (const k of query) {
@@ -316,15 +573,7 @@ export function createConsoleServer(opts: ConsoleServerOptions): ConsoleServer {
     try {
       return sendJson(res, 200, await call());
     } catch (err) {
-      if (err instanceof NotFound || (err instanceof RelayError && err.status === 404)) return sendJson(res, 404, { error: 'not_found' });
-      if (err instanceof BadRequest) return sendJson(res, 400, { error: 'bad_request', detail: err.detail });
-      if (err instanceof RelayError) {
-        return sendJson(res, 502, { error: 'relay_refused', relay_status: err.status, relay_error: err.code });
-      }
-      if (err instanceof RelayNetworkError) return sendJson(res, 502, { error: 'relay_unreachable', detail: err.message });
-      // Credentials (gcloud) or anything else: the message never carries a token.
-      const detail = err instanceof Error ? err.message.slice(0, 300) : 'unexpected error';
-      return sendJson(res, 502, { error: 'relay_unavailable', detail });
+      return failure(res, err, path, viewer);
     }
   }
 
@@ -369,9 +618,9 @@ export function createConsoleServer(opts: ConsoleServerOptions): ConsoleServer {
     send(res, 401, 'unauthorized\n', 'text/plain; charset=utf-8', { 'Cache-Control': 'no-store' });
 
   const server = createServer((req, res) => {
-    // A request body is never read; one that arrives anyway is discarded.
-    req.resume();
+    // Only a roster change's body is ever read (rosterChange); any other is discarded.
     if (!hostAllowed(req)) {
+      req.resume();
       send(res, 403, 'forbidden host\n', 'text/plain; charset=utf-8');
       return;
     }
@@ -382,11 +631,15 @@ export function createConsoleServer(opts: ConsoleServerOptions): ConsoleServer {
     const assertion = req.headers[IAP_HEADER];
     hosted.verify(Array.isArray(assertion) ? undefined : assertion).then(
       (identity) => {
-        if (!identity) return unauthorized(res);
+        if (!identity) {
+          req.resume();
+          return unauthorized(res);
+        }
         route(req, res, identity.email);
       },
       () => {
         log('iap: verification error');
+        req.resume();
         if (!res.headersSent) unauthorized(res);
       },
     );
@@ -397,16 +650,20 @@ export function createConsoleServer(opts: ConsoleServerOptions): ConsoleServer {
     try {
       url = new URL(req.url ?? '/', `http://127.0.0.1:${port}`);
     } catch {
+      req.resume();
       send(res, 400, 'bad request\n', 'text/plain; charset=utf-8');
       return;
     }
     // Only origin-form paths that are already normal: nothing the URL parser had to resolve.
     const rawPath = (req.url ?? '').split('?')[0];
+    const isApi = url.pathname === '/api' || url.pathname.startsWith('/api/');
+    if (!isApi) req.resume();
     if (!rawPath?.startsWith('/') || rawPath !== url.pathname) {
+      req.resume();
       send(res, 400, 'bad path\n', 'text/plain; charset=utf-8');
       return;
     }
-    if (url.pathname === '/api' || url.pathname.startsWith('/api/')) {
+    if (isApi) {
       api(req, res, url, viewer).catch((err: unknown) => {
         log(`api error: ${err instanceof Error ? err.message : 'unexpected'}`);
         if (!res.headersSent) sendJson(res, 500, { error: 'internal' });

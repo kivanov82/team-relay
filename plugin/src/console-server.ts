@@ -5,9 +5,10 @@
 // Binds 127.0.0.1 only (CONSOLE_PORT, default 4317; 0 picks a free one) and prints
 // http://127.0.0.1:<port>/#k=<key> on stdout, where the key is 32 random bytes made for this
 // launch. The console reads the key from the URL fragment (never sent to a server) and sends
-// it as X-Console-Key. Without --demo it proxies four read-only GETs to the relay with this
-// member's credentials (RELAY_URL, RELAY_TEAM, RELAY_AUTH, RELAY_GCLOUD_ACCOUNT,
-// RELAY_TOKEN / RELAY_TOKEN_FILE); with --demo it serves a synthetic team instead.
+// it as X-Console-Key. Without --demo it proxies its reads, and an owner's roster changes
+// (M6-SPEC §3), to the relay with this member's own sign-in: the credential /team-relay:login
+// stored (M5-SPEC §6), or RELAY_URL, RELAY_TEAM, RELAY_AUTH, RELAY_GCLOUD_ACCOUNT,
+// RELAY_TOKEN / RELAY_TOKEN_FILE; with --demo it serves a synthetic team instead.
 //
 // CONSOLE_MODE=hosted (M3-SPEC §3, the container only): listens on 0.0.0.0:$PORT, prints no
 // URL and makes no key. IAP is the gate: every request must carry a valid IAP assertion for
@@ -15,14 +16,16 @@
 // the relay as X-Relay-On-Behalf-Of, with the service account's own ID token
 // (RELAY_AUTH=metadata). No flags are accepted in hosted mode.
 //
-// Both modes answer GET /api/join themselves (the console's join panel): RELAY_URL,
-// RELAY_TEAM and JOIN_REPO_URL (optional; an https URL, else a startup error), or demo
+// Both modes answer GET /api/join themselves (the console's join panel): the relay and team,
+// JOIN_MARKETPLACE (optional; GitHub owner/repo or an https URL: what `/plugin marketplace
+// add` takes) and JOIN_REPO_URL (optional; an https URL, else a startup error), or demo
 // values with --demo.
 
 import { randomBytes } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import {
   DEMO_JOIN,
+  checkJoinMarketplace,
   checkJoinRepoUrl,
   checkPublicHost,
   createConsoleServer,
@@ -36,7 +39,7 @@ import { DemoTeam } from './console-demo.js';
 import { openInBrowser } from './console-open.js';
 import { IapKeySet, checkIapAudience, iapVerifier } from './iap.js';
 import { makeLogger } from './log.js';
-import { authModeFromEnv, configValue, relayClientFromEnv } from './relay-client.js';
+import { NotConnected, authModeFromEnv, configValue, relayClientFromEnv } from './relay-client.js';
 import { describeError } from './tool-util.js';
 
 const log = makeLogger('console');
@@ -45,11 +48,13 @@ const DEFAULT_PORT = 4317;
 const USAGE = `usage: bin/console [--demo] [--open]
   --demo  serve a synthetic team (demo: alice, bob, carol) instead of calling the relay
   --open  open the console in the default browser (by way of a private, short-lived file)
-Environment: CONSOLE_PORT (default ${DEFAULT_PORT}; 0 picks a free port), and without --demo
-RELAY_URL, RELAY_TEAM, RELAY_AUTH (google|token), RELAY_GCLOUD_ACCOUNT, RELAY_TOKEN_FILE or RELAY_TOKEN.
-JOIN_REPO_URL (optional, https): the team-relay repository the join panel tells new members to clone.
+Signs in as you with the credential /team-relay:login stored; nothing else is needed.
+Environment: CONSOLE_PORT (default ${DEFAULT_PORT}; 0 picks a free port), and optionally
+RELAY_URL, RELAY_TEAM, RELAY_AUTH (credential|google|token), RELAY_GCLOUD_ACCOUNT, RELAY_TOKEN_FILE or RELAY_TOKEN.
+JOIN_MARKETPLACE (optional; GitHub owner/repo or https URL) and JOIN_REPO_URL (optional, https):
+what the join panel tells new members to add as a plugin marketplace.
 CONSOLE_MODE=hosted is for the container only (PORT, CONSOLE_PUBLIC_HOST, IAP_AUDIENCE,
-RELAY_URL, RELAY_TEAM, RELAY_AUTH=metadata, JOIN_REPO_URL).`;
+RELAY_URL, RELAY_TEAM, RELAY_AUTH=metadata, JOIN_MARKETPLACE, JOIN_REPO_URL).`;
 
 function fail(message: string, code = 1): never {
   process.stderr.write(`console: ${message}\n`);
@@ -94,6 +99,7 @@ async function hosted(): Promise<void> {
   let join: JoinInfo;
   try {
     const repoUrl = checkJoinRepoUrl(env.JOIN_REPO_URL);
+    const marketplace = checkJoinMarketplace(env.JOIN_MARKETPLACE);
     publicHost = checkPublicHost(configValue(env.CONSOLE_PUBLIC_HOST));
     audience = checkIapAudience(configValue(env.IAP_AUDIENCE));
     // The hosted console reads as the service account (a relay delegate), never with a
@@ -102,7 +108,7 @@ async function hosted(): Promise<void> {
     const client = relayClientFromEnv(env);
     backend = relayBackend(client);
     team = client.team;
-    join = joinInfo(configValue(env.RELAY_URL) ?? '', team, repoUrl);
+    join = joinInfo(configValue(env.RELAY_URL) ?? '', team, repoUrl, marketplace);
   } catch (err) {
     fail(`configuration error: ${describeError(err)}`);
   }
@@ -116,7 +122,7 @@ async function hosted(): Promise<void> {
   } catch (err) {
     fail(`cannot listen on 0.0.0.0:${port} (${(err as NodeJS.ErrnoException).code ?? describeError(err)})`);
   }
-  log(`hosted: serving team ${team} for ${publicHost} on 0.0.0.0:${bound}, read-only, behind IAP`);
+  log(`hosted: serving team ${team} for ${publicHost} on 0.0.0.0:${bound}, behind IAP`);
   const stop = () => {
     void app.close().finally(() => process.exit(0));
     setTimeout(() => process.exit(0), 2000).unref();
@@ -133,8 +139,10 @@ async function main(): Promise<void> {
   const port = parsePort(process.env.CONSOLE_PORT);
 
   let repoUrl: string | null;
+  let marketplace: string | null;
   try {
     repoUrl = checkJoinRepoUrl(process.env.JOIN_REPO_URL);
+    marketplace = checkJoinMarketplace(process.env.JOIN_MARKETPLACE);
   } catch (err) {
     fail(`configuration error: ${describeError(err)}`);
   }
@@ -151,11 +159,12 @@ async function main(): Promise<void> {
     try {
       client = relayClientFromEnv(process.env);
     } catch (err) {
+      if (err instanceof NotConnected) fail('not signed in: run /team-relay:login in Claude Code first (or run with --demo)');
       fail(`configuration error: ${describeError(err)} (or run with --demo)`);
     }
     backend = relayBackend(client);
     label = `team ${client.team}`;
-    join = joinInfo(configValue(process.env.RELAY_URL) ?? '', client.team, repoUrl);
+    join = joinInfo(client.url, client.team, repoUrl, marketplace);
   }
 
   const key = randomBytes(32).toString('base64url');
@@ -168,7 +177,7 @@ async function main(): Promise<void> {
     fail(`cannot listen on 127.0.0.1:${port} (${(err as NodeJS.ErrnoException).code ?? describeError(err)})`);
   }
   const url = `http://127.0.0.1:${bound}/#k=${key}`;
-  log(`serving ${label} on 127.0.0.1:${bound}, read-only; stop with Ctrl-C`);
+  log(`serving ${label} on 127.0.0.1:${bound}; stop with Ctrl-C`);
   process.stdout.write(`${url}\n`);
   // §7.7: by way of a private redirect file, so the key is in no process's arguments.
   if (flags.open) openInBrowser(url, { log });

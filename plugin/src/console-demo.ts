@@ -427,6 +427,23 @@ export class NotFound extends Error {
   }
 }
 
+/** A roster change the relay would refuse (M6-SPEC §1, §2), answered in the relay's terms. */
+export class RosterRefusal extends Error {
+  constructor(
+    readonly status: number,
+    readonly code: string,
+    readonly detail: string,
+  ) {
+    super(detail);
+    this.name = 'RosterRefusal';
+  }
+}
+
+export type DemoRosterEntry = { member: string; emails: string[]; role: 'owner' | 'member'; added_by: string; added_at: string };
+
+/** M6-SPEC §1: at most this many members per team. */
+export const ROSTER_MAX = 50;
+
 export class BadRequest extends Error {
   constructor(readonly detail: string) {
     super(detail);
@@ -439,6 +456,8 @@ export class DemoTeam {
   private readonly manifests: Record<Member, Manifest | null>;
   private readonly environments = new Map<string, string>();
   private readonly publishedAt: string;
+  /** M6-SPEC §1, in memory: alice owns the demo team; bob and carol are members. */
+  private readonly rosterEntries: DemoRosterEntry[];
 
   constructor(
     private readonly now: () => number = Date.now,
@@ -460,6 +479,72 @@ export class DemoTeam {
       carol: { ...pick(['service_health', 'production_db_count']), shares: [] },
     };
     this.publishedAt = iso(this.epoch - 3_600_000);
+    const added = iso(this.epoch - 7 * DAY_MS);
+    this.rosterEntries = [
+      { member: 'alice', emails: ['alice@example.com'], role: 'owner', added_by: 'alice', added_at: added },
+      { member: 'bob', emails: ['bob@example.com'], role: 'member', added_by: 'alice', added_at: added },
+      { member: 'carol', emails: ['carol@example.com', 'carol.w@example.org'], role: 'member', added_by: 'alice', added_at: added },
+    ];
+  }
+
+  /**
+   * M6-SPEC §2 as alice (an owner) reads it: every member with emails and role. The demo keeps
+   * changes in memory, under the relay's invariants (§1): unique ids and emails, at most 50
+   * members, 1 to 5 emails each, and always at least one owner.
+   */
+  roster() {
+    return {
+      members: this.rosterEntries.map((e) => ({ member: e.member, emails: [...e.emails], role: e.role, added_by: e.added_by, added_at: e.added_at })),
+    };
+  }
+
+  private entry(member: string): DemoRosterEntry {
+    const e = this.rosterEntries.find((x) => x.member === member);
+    if (!e) throw new NotFound();
+    return e;
+  }
+
+  private emailTaken(email: string, except?: DemoRosterEntry): boolean {
+    return this.rosterEntries.some((e) => e !== except && e.emails.includes(email));
+  }
+
+  addMember(body: { member: string; email: string; role?: 'owner' | 'member' }) {
+    if (this.rosterEntries.some((e) => e.member === body.member)) throw new RosterRefusal(409, 'conflict', 'That member id is already on the team.');
+    if (this.emailTaken(body.email)) throw new RosterRefusal(409, 'conflict', 'That email already belongs to a member of the team.');
+    if (this.rosterEntries.length >= ROSTER_MAX) throw new RosterRefusal(409, 'roster_full', `A team has at most ${ROSTER_MAX} members.`);
+    const entry: DemoRosterEntry = { member: body.member, emails: [body.email], role: body.role ?? 'member', added_by: DEMO_ME, added_at: iso(this.now()) };
+    this.rosterEntries.push(entry);
+    return { ...entry, emails: [...entry.emails] };
+  }
+
+  updateMember(member: string, body: { add_email?: string; remove_email?: string; role?: 'owner' | 'member' }) {
+    const e = this.entry(member);
+    const emails = [...e.emails];
+    if (body.add_email !== undefined) {
+      if (this.emailTaken(body.add_email, e) || emails.includes(body.add_email)) throw new RosterRefusal(409, 'conflict', 'That email already belongs to a member of the team.');
+      if (emails.length >= 5) throw new RosterRefusal(409, 'too_many_emails', 'A member has at most 5 emails.');
+      emails.push(body.add_email);
+    }
+    if (body.remove_email !== undefined) {
+      if (!emails.includes(body.remove_email)) throw new RosterRefusal(404, 'not_found', 'That email is not one of theirs.');
+      if (emails.length === 1) throw new RosterRefusal(409, 'last_email', 'A member needs at least one email.');
+      emails.splice(emails.indexOf(body.remove_email), 1);
+    }
+    if (body.role === 'member' && e.role === 'owner' && this.rosterEntries.filter((x) => x.role === 'owner').length === 1) {
+      throw new RosterRefusal(409, 'last_owner', 'A team always has at least one owner.');
+    }
+    e.emails = emails;
+    if (body.role !== undefined) e.role = body.role;
+    return { member: e.member, emails: [...e.emails], role: e.role, added_by: e.added_by, added_at: e.added_at };
+  }
+
+  removeMember(member: string) {
+    const e = this.entry(member);
+    if (e.role === 'owner' && this.rosterEntries.filter((x) => x.role === 'owner').length === 1) {
+      throw new RosterRefusal(409, 'last_owner', 'A team always has at least one owner.');
+    }
+    this.rosterEntries.splice(this.rosterEntries.indexOf(e), 1);
+    return { member, removed: true };
   }
 
   /** Every request created by `now`; expired ones only when asked for (the feed passes them). */

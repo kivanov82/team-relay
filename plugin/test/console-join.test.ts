@@ -7,10 +7,12 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { spawn } from 'node:child_process';
 import { request as httpRequest } from 'node:http';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import {
   DEMO_JOIN,
+  checkJoinMarketplace,
   checkJoinRepoUrl,
+  marketplaceFromRepoUrl,
   createConsoleServer,
   demoBackend,
   joinInfo,
@@ -19,6 +21,7 @@ import {
 } from '../src/console-app.js';
 import { DemoTeam } from '../src/console-demo.js';
 import { RelayClient } from '../src/relay-client.js';
+import { defaultRelayUrl } from '../src/relay-default.js';
 import { FakeRelay, TOKEN_OF } from './helpers/fake-relay.js';
 import { DIST } from './helpers/mcp.js';
 
@@ -41,7 +44,7 @@ function req(port: number, path: string, opts: { method?: string; key?: string |
   });
 }
 
-const EXPECTED_KEYS = ['marketplace', 'plugin', 'relay_url', 'repo_url', 'team'];
+const EXPECTED_KEYS = ['default_relay', 'marketplace', 'marketplace_source', 'plugin', 'relay_url', 'repo_url', 'team'];
 
 describe('/api/join on the local console server', () => {
   let app: ConsoleServer;
@@ -86,8 +89,11 @@ describe('/api/join on the local console server', () => {
       relay_url: 'https://relay.team.example',
       team: 'demo',
       repo_url: 'https://github.com/example/multiagent.git',
+      // M5-SPEC §1: what /plugin marketplace add takes, from the GitHub URL.
+      marketplace_source: 'example/multiagent',
       marketplace: 'team-relay-dev',
       plugin: 'team-relay',
+      default_relay: false,
     });
     expect(Object.keys(r.json()).sort()).toEqual(EXPECTED_KEYS);
     expect(relay.requests).toHaveLength(0);
@@ -172,7 +178,7 @@ describe('JOIN_REPO_URL', () => {
 describe('dist/console-server.js: /api/join', () => {
   function start(args: string[], env: Record<string, string> = {}) {
     const child = spawn(process.execPath, [join(DIST, 'console-server.js'), ...args], {
-      env: { PATH: process.env.PATH ?? '', HOME: process.env.HOME ?? '/tmp', CONSOLE_PORT: '0', ...env },
+      env: { PATH: process.env.PATH ?? '', HOME: process.env.HOME ?? '/tmp', XDG_CONFIG_HOME: process.env.XDG_CONFIG_HOME ?? '', CONSOLE_PORT: '0', ...env },
       stdio: ['ignore', 'pipe', 'pipe'],
     });
     let stdout = '';
@@ -198,7 +204,15 @@ describe('dist/console-server.js: /api/join', () => {
       expect((await req(port, '/api/join')).status).toBe(401);
       const r = await req(port, '/api/join', { key });
       expect(r.status).toBe(200);
-      expect(r.json()).toEqual({ relay_url: 'https://relay.example.com', team: 'demo', repo_url: null, marketplace: 'team-relay-dev', plugin: 'team-relay' });
+      expect(r.json()).toEqual({
+        relay_url: 'https://relay.example.com',
+        team: 'demo',
+        repo_url: null,
+        marketplace_source: 'example/team-relay',
+        marketplace: 'team-relay-dev',
+        plugin: 'team-relay',
+        default_relay: false,
+      });
       expect(r.json()).toEqual(DEMO_JOIN);
     } finally {
       p.child.kill('SIGTERM');
@@ -223,14 +237,50 @@ describe('dist/console-server.js: /api/join', () => {
         relay_url: 'http://127.0.0.1:9',
         team: 'acme',
         repo_url: 'https://github.com/example/multiagent.git',
+        marketplace_source: 'example/multiagent',
         marketplace: 'team-relay-dev',
         plugin: 'team-relay',
+        default_relay: false,
       });
       expect(r.body).not.toContain(env.RELAY_TOKEN);
     } finally {
       p.child.kill('SIGTERM');
       expect(await p.exited).toBe(0);
     }
+  });
+
+  it('JOIN_MARKETPLACE wins over the repository URL; the default relay is flagged', async () => {
+    const p = start([], {
+      // google sign-in (the default without a stored one), with no gcloud on PATH: the first
+      // read fails locally and nothing reaches the default relay.
+      PATH: dirname(process.execPath),
+      RELAY_TEAM: 'demo',
+      JOIN_MARKETPLACE: 'someone/team-relay',
+      JOIN_REPO_URL: 'https://github.com/example/multiagent.git',
+    });
+    try {
+      const { port, key } = await launched(p);
+      const j = (await req(port, '/api/join', { key })).json();
+      expect(j.marketplace_source).toBe('someone/team-relay');
+      // No RELAY_URL: the plugin's default relay (relay.default.json).
+      expect(j.relay_url).toBe(defaultRelayUrl());
+      expect(j.default_relay).toBe(true);
+    } finally {
+      p.child.kill('SIGTERM');
+      expect(await p.exited).toBe(0);
+    }
+  });
+
+  it('refuses a JOIN_MARKETPLACE that is neither owner/repo nor a plain https URL', async () => {
+    for (const bad of ['owner', 'a/b/c', '../x', 'http://github.com/a/b', 'o/r;rm -rf', '-x/y']) {
+      expect(() => checkJoinMarketplace(bad), bad).toThrow(/JOIN_MARKETPLACE/);
+    }
+    expect(checkJoinMarketplace('owner/repo')).toBe('owner/repo');
+    expect(checkJoinMarketplace('https://git.example.com/team/relay.git')).toBe('https://git.example.com/team/relay.git');
+    expect(checkJoinMarketplace('')).toBeNull();
+    expect(marketplaceFromRepoUrl('https://github.com/o/r.git')).toBe('o/r');
+    expect(marketplaceFromRepoUrl('https://git.example.com/o/r.git')).toBe('https://git.example.com/o/r.git');
+    expect(marketplaceFromRepoUrl(null)).toBeNull();
   });
 
   it('answers repo_url null when JOIN_REPO_URL is unset', async () => {

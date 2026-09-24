@@ -53,7 +53,7 @@ function runHook(payload: unknown, opts: { args?: string[]; closeStdin?: boolean
   return new Promise((resolve) => {
     const started = Date.now();
     const child = spawn(process.execPath, [HOOK, ...(opts.args ?? ['--config', configPath])], {
-      env: { PATH: process.env.PATH ?? '', HOME: process.env.HOME ?? '/tmp' },
+      env: { PATH: process.env.PATH ?? '', HOME: process.env.HOME ?? '/tmp', XDG_CONFIG_HOME: process.env.XDG_CONFIG_HOME ?? '' },
       stdio: ['pipe', 'pipe', 'pipe'],
     });
     let stdout = '';

@@ -5,9 +5,11 @@
 #
 #   docker build -f plugin/Dockerfile.console -t console .
 #
-# plugin/Dockerfile.console.dockerignore keeps everything but the two built artefacts out
-# of the context: dist/console-server.js (esbuild bundle, dependencies inlined) and
-# dist/console/ (the built UI). No source, no node_modules, no npm install, no config.
+# plugin/Dockerfile.console.dockerignore keeps everything but the built artefacts out of the
+# context: dist/console-server.js (esbuild bundle, dependencies inlined), dist/console/ (the
+# built UI) and relay.default.json (the plugin's default relay URL, read at run time so the
+# join panel knows whether a bare /team-relay:login reaches this team's relay). No source,
+# no node_modules, no npm install, no config.
 #
 # The base image is pinned by digest (bump on purpose); the tag is
 # kept beside it for a human to read. Bump on purpose.
@@ -25,9 +27,12 @@ ENV NODE_ENV=production \
 WORKDIR /app
 COPY plugin/dist/console-server.js ./console-server.js
 COPY plugin/dist/console/ ./console/
+# The bundle reads ../relay.default.json relative to itself (src/relay-default.ts).
+COPY plugin/relay.default.json /relay.default.json
 # The bundle is an ES module, as it is under plugin/ (whose package.json says so).
 RUN printf '{"type":"module","private":true}\n' > package.json \
-    && chmod -R a+rX,go-w /app
+    && chmod -R a+rX,go-w /app \
+    && chmod a+r,go-w /relay.default.json
 
 # Non-root (the image's own `node` user); the files stay root's, and nothing is written.
 USER node

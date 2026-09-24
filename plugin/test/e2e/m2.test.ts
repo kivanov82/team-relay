@@ -282,7 +282,7 @@ describe.skipIf(!M2)('M2 end to end (plugin side)', () => {
 
   it('E. the console server proxies the real relay read-only, with the key', async () => {
     const child = spawn(process.execPath, [join(DIST, 'console-server.js')], {
-      env: { PATH: process.env.PATH ?? '', HOME: process.env.HOME ?? '/tmp', CONSOLE_PORT: '0', RELAY_URL: relayUrl(), RELAY_TEAM: 'demo', RELAY_AUTH: 'token', RELAY_TOKEN: tokenOf('carol') },
+      env: { PATH: process.env.PATH ?? '', HOME: process.env.HOME ?? '/tmp', XDG_CONFIG_HOME: process.env.XDG_CONFIG_HOME ?? '', CONSOLE_PORT: '0', RELAY_URL: relayUrl(), RELAY_TEAM: 'demo', RELAY_AUTH: 'token', RELAY_TOKEN: tokenOf('carol') },
       stdio: ['ignore', 'pipe', 'pipe'],
     });
     let out = '';

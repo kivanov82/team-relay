@@ -1,5 +1,5 @@
 // M2-SPEC §4.4: the console server. Loopback only, Host check, per-launch key, strict CSP,
-// a read-only proxy of exactly four GETs, static files or a placeholder, and --demo, whose
+// a proxy of its reads (the roster changes are in console-roster.test.ts), static files or a placeholder, and --demo, whose
 // synthetic stream must match the relay's §3.5 /activity and §3.1/§3.6 /directory shapes.
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -320,7 +320,8 @@ describe('console server: the gate', () => {
 
   it('maps relay failures without leaking anything', async () => {
     relay.fail((r) => r.path.endsWith('/directory'), 401, 1);
-    expect((await api(port, '/api/directory')).json()).toEqual({ error: 'relay_refused', relay_status: 401, relay_error: 'unauthenticated' });
+    // The relay's own code and detail (M6-SPEC §4: the Members panel shows why a change was refused).
+    expect((await api(port, '/api/directory')).json()).toEqual({ error: 'relay_refused', relay_status: 401, relay_error: 'unauthenticated', detail: 'injected' });
     expect((await api(port, `/api/requests/rq_${'0'.repeat(32)}`)).status).toBe(404);
     await relay.stop();
     const down = await api(port, '/api/me');
@@ -680,7 +681,7 @@ describe('console --demo backend', () => {
 describe('dist/console-server.js', () => {
   function start(args: string[], env: Record<string, string> = {}) {
     const child = spawn(process.execPath, [join(DIST, 'console-server.js'), ...args], {
-      env: { PATH: process.env.PATH ?? '', HOME: process.env.HOME ?? '/tmp', CONSOLE_PORT: '0', ...env },
+      env: { PATH: process.env.PATH ?? '', HOME: process.env.HOME ?? '/tmp', XDG_CONFIG_HOME: process.env.XDG_CONFIG_HOME ?? '', CONSOLE_PORT: '0', ...env },
       stdio: ['ignore', 'pipe', 'pipe'],
     });
     let stdout = '';
@@ -815,7 +816,7 @@ describe('--open (M2-SPEC §7.7): the key never appears in a process argument', 
       chmodSync(join(bin, name), 0o755);
     }
     const child = spawn(process.execPath, [join(DIST, 'console-server.js'), '--demo', '--open'], {
-      env: { PATH: `${bin}:${process.env.PATH ?? ''}`, HOME: process.env.HOME ?? '/tmp', CONSOLE_PORT: '0' },
+      env: { PATH: `${bin}:${process.env.PATH ?? ''}`, HOME: process.env.HOME ?? '/tmp', XDG_CONFIG_HOME: process.env.XDG_CONFIG_HOME ?? '', CONSOLE_PORT: '0' },
       stdio: ['ignore', 'pipe', 'pipe'],
     });
     let out = '';

@@ -365,8 +365,10 @@ describe('hosted console server (M3-SPEC §3)', () => {
       relay_url: 'https://team-relay-xyz.a.run.app',
       team: 'demo',
       repo_url: 'https://github.com/example/multiagent.git',
+      marketplace_source: 'example/multiagent',
       marketplace: 'team-relay-dev',
       plugin: 'team-relay',
+      default_relay: false,
     });
     expect((await get(port, '/api/join', { assertion: await sign(signer), method: 'POST' })).status).toBe(405);
     expect((await get(port, '/api/join?x=1', { assertion: await sign(signer) })).status).toBe(400);
@@ -633,7 +635,7 @@ describe('dist/console-server.js with CONSOLE_MODE=hosted', () => {
 
   function start(env: Record<string, string>, args: string[] = []) {
     const child = spawn(process.execPath, [join(DIST, 'console-server.js'), ...args], {
-      env: { PATH: process.env.PATH ?? '', HOME: process.env.HOME ?? '/tmp', CONSOLE_MODE: 'hosted', ...env },
+      env: { PATH: process.env.PATH ?? '', HOME: process.env.HOME ?? '/tmp', XDG_CONFIG_HOME: process.env.XDG_CONFIG_HOME ?? '', CONSOLE_MODE: 'hosted', ...env },
       stdio: ['ignore', 'pipe', 'pipe'],
     });
     let stdout = '';
