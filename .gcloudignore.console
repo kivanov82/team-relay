@@ -5,6 +5,7 @@
 /plugin/*
 !/plugin/Dockerfile.console
 !/plugin/cloudbuild.console.yaml
+!/plugin/relay.default.json
 !/plugin/dist/
 /plugin/dist/*
 !/plugin/dist/console-server.js
