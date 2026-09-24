@@ -441,7 +441,7 @@ describe('never moving a stored sign-in to another relay (M5-SPEC §9 item 1; se
   it('the attacker relay of the review cannot take over a credential stored for the configured relay', async () => {
     const evil = await new AttackerRelay().start();
     try {
-      const mine = sample({ relay_url: 'https://team-relay-1042359757530.europe-west3.run.app', credential: `trc_${'L'.repeat(43)}` });
+      const mine = sample({ relay_url: 'https://other-relay.example.com', credential: `trc_${'L'.repeat(43)}` });
       writeCredential(credFile(), mine);
       const before = readFileSync(credFile(), 'utf8');
       const opened: string[] = [];
@@ -454,7 +454,7 @@ describe('never moving a stored sign-in to another relay (M5-SPEC §9 item 1; se
         },
       }).catch((e: unknown) => e);
       expect(err).toBeInstanceOf(LoginError);
-      expect((err as Error).message).toMatch(/signed in to another relay \(https:\/\/team-relay-1042359757530\.europe-west3\.run\.app\)/);
+      expect((err as Error).message).toMatch(/signed in to another relay \(https:\/\/other-relay\.example\.com\)/);
       expect((err as Error).message).toMatch(/run \/team-relay:logout first, then \/team-relay:login/);
       expect((err as Error).message).not.toContain(mine.credential);
       // Refused before anything happened: no browser, no listener, nothing at the attacker.

@@ -153,7 +153,7 @@ describe('login tool (M5-SPEC §2, §6, §9)', () => {
 
   it('refuses to replace a credential from another relay than the configured one, with a clear message', async () => {
     writeCredential(credFile(), {
-      relay_url: 'https://team-relay-1042359757530.europe-west3.run.app',
+      relay_url: 'https://other-relay.example.com',
       team: 'demo',
       member: 'alice',
       credential: `trc_${'L'.repeat(43)}`,
@@ -163,7 +163,7 @@ describe('login tool (M5-SPEC §2, §6, §9)', () => {
     const s = await asker();
     const r = await call(s, 'login');
     expect(r.isError).toBe(true);
-    expect(r.text).toMatch(/^not signed in: this computer is signed in to another relay \(https:\/\/team-relay-1042359757530\.europe-west3\.run\.app\) than the one configured for this session/);
+    expect(r.text).toMatch(/^not signed in: this computer is signed in to another relay \(https:\/\/other-relay\.example\.com\) than the one configured for this session/);
     expect(r.text).toMatch(/run \/team-relay:logout first, then \/team-relay:login/);
     expect(r.text).not.toContain('L'.repeat(43));
     await sleep(200);
