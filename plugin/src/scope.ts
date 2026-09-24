@@ -1,10 +1,13 @@
-// The scope folder (M8-SPEC §1): the working session's folder, which its automatic answerer
-// may read without asking. It is the channel server's working directory, resolved. It must
-// not be /, $HOME or an ancestor of $HOME, nor inside the credential deny list or the team
-// relay's or Claude Code's config directories; if it is, the host still answers but with no
-// automatic folder access (every read needs the member's approval) and shares no folder.
+// The scope folder (M8-SPEC §1, §7 item 3): the working session's folder, which its automatic
+// answerer may read without asking. It is the channel server's working directory, resolved.
+// It qualifies only when it is inside a git work tree (a `.git` in it, or in an ancestor that
+// is below $HOME: never $HOME's own, never one above it), is not /, $HOME or an ancestor of
+// $HOME, is not a direct child of $HOME, is not under ~/Library or any ~/.* entry and does not
+// contain one (symlinks resolved both ways), and is not inside the credential deny list or the
+// team relay's or Claude Code's config directories. Otherwise the host still answers but with
+// no automatic folder access (every read needs the member's approval) and shares no folder.
 
-import { statSync } from 'node:fs';
+import { existsSync, readdirSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, dirname, isAbsolute, join, normalize } from 'node:path';
 import { configDir } from './answering-lock.js';
@@ -65,5 +68,40 @@ export function scopeFolder(cwd: string, env: NodeJS.ProcessEnv): Scope {
     credentialDirs: relayCredentialDirs(env),
   });
   if (hit) return refuse(`it is inside a credential location on the deny list (${hit})`);
+  if (dirname(path) === homeReal || dirname(normalize(cwd)) === normalize(home)) return refuse('it is a folder directly in your home directory');
+  const hidden = homeEntries(homeReal);
+  for (const e of hidden) {
+    if (within(path, e.path) || within(path, e.real)) return refuse(`it is inside ~/${e.name}`);
+    if (within(e.real, path)) return refuse(`it contains ~/${e.name}`);
+  }
+  if (!inGitWorkTree(path, homeReal)) return refuse('it is not inside a git work tree (no .git in it or in a folder above it, below your home directory)');
   return { path, qualifies: true, reason: null, share: shareName(path) };
+}
+
+/** ~/Library and every ~/.* entry, with where each resolves to. */
+function homeEntries(homeReal: string): Array<{ name: string; path: string; real: string }> {
+  let names: string[];
+  try {
+    names = readdirSync(homeReal);
+  } catch {
+    names = [];
+  }
+  // Library is checked even when it cannot be listed.
+  const wanted = new Set(['Library', ...names.filter((n) => n.startsWith('.') && n !== '.' && n !== '..')]);
+  return [...wanted].map((name) => {
+    const path = join(homeReal, name);
+    return { name, path, real: realOr(path) };
+  });
+}
+
+/**
+ * A `.git` (a directory, or the file a linked work tree or submodule has) in `path` or in a
+ * folder above it, looking no higher than the last folder below $HOME (and never at /).
+ */
+export function inGitWorkTree(path: string, homeReal: string): boolean {
+  for (let d = path; ; d = dirname(d)) {
+    if (d === '/' || within(homeReal, d)) return false;
+    if (existsSync(join(d, '.git'))) return true;
+    if (dirname(d) === d) return false;
+  }
 }

@@ -2,7 +2,7 @@
 // src/deny-list.ts is the launcher's, entry for entry).
 
 import { describe, expect, it } from 'vitest';
-import { mkdirSync, mkdtempSync, readFileSync, realpathSync, symlinkSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ANY_DEPTH, HOME_PATHS, credentialHit, readDenyRules } from '../src/deny-list.js';
@@ -20,9 +20,98 @@ describe('scope folder (M8-SPEC §1)', () => {
   it('an ordinary project folder qualifies and is shared by its name', () => {
     const { home, env } = fakeHome();
     const proj = join(home, 'src', 'my app');
-    mkdirSync(proj, { recursive: true });
+    mkdirSync(join(proj, '.git'), { recursive: true });
     const s = scopeFolder(proj, env);
     expect(s).toEqual({ path: proj, qualifies: true, reason: null, share: 'my_app' });
+  });
+
+  describe('M8-SPEC §7 item 3: only a folder inside a git work tree, away from home\'s own folders', () => {
+    it('a sub-folder of a repository qualifies; a linked work tree\'s .git file counts', () => {
+      const { home, env } = fakeHome();
+      const repo = join(home, 'code', 'api');
+      mkdirSync(join(repo, '.git'), { recursive: true });
+      mkdirSync(join(repo, 'src', 'handlers'), { recursive: true });
+      expect(scopeFolder(join(repo, 'src', 'handlers'), env)).toMatchObject({ qualifies: true, share: 'handlers' });
+      const wt = join(home, 'code', 'api-wt');
+      mkdirSync(wt, { recursive: true });
+      writeFileSync(join(wt, '.git'), `gitdir: ${join(repo, '.git', 'worktrees', 'api-wt')}\n`);
+      expect(scopeFolder(wt, env).qualifies).toBe(true);
+    });
+
+    it('a folder in no repository does not qualify', () => {
+      const { home, env } = fakeHome();
+      const d = join(home, 'Downloads', 'stuff');
+      mkdirSync(d, { recursive: true });
+      expect(scopeFolder(d, env)).toMatchObject({ qualifies: false, share: null });
+      expect(scopeFolder(d, env).reason).toMatch(/^it is not inside a git work tree/);
+    });
+
+    it("$HOME's own repository (dotfiles) does not make every folder in it qualify", () => {
+      const { home, env } = fakeHome();
+      mkdirSync(join(home, '.git'));
+      const d = join(home, 'notes', 'misc');
+      mkdirSync(d, { recursive: true });
+      expect(scopeFolder(d, env).reason).toMatch(/^it is not inside a git work tree/);
+    });
+
+    it('a repository above $HOME does not count either', () => {
+      const { root, home, env } = fakeHome();
+      mkdirSync(join(root, '.git'));
+      const d = join(home, 'code', 'x');
+      mkdirSync(d, { recursive: true });
+      expect(scopeFolder(d, env).qualifies).toBe(false);
+    });
+
+    it('a repository outside $HOME qualifies (a .git in it or above it, never at /)', () => {
+      const { root, env } = fakeHome();
+      const repo = join(root, 'srv', 'repo');
+      mkdirSync(join(repo, '.git'), { recursive: true });
+      mkdirSync(join(repo, 'pkg'));
+      expect(scopeFolder(join(repo, 'pkg'), env).qualifies).toBe(true);
+      const bare = join(root, 'srv', 'loose');
+      mkdirSync(bare);
+      expect(scopeFolder(bare, env).qualifies).toBe(false);
+    });
+
+    it('refuses a direct child of $HOME, even a repository', () => {
+      const { home, env } = fakeHome();
+      const d = join(home, 'project');
+      mkdirSync(join(d, '.git'), { recursive: true });
+      expect(scopeFolder(d, env)).toMatchObject({ qualifies: false, reason: 'it is a folder directly in your home directory' });
+    });
+
+    it('refuses anything under ~/Library or a ~/.* folder, even a repository', () => {
+      const { home, env } = fakeHome();
+      for (const sub of ['Library/Mobile Documents/proj', '.local/share/proj', '.cache/x/proj', '.dotfiles/nvim']) {
+        const d = join(home, sub);
+        mkdirSync(join(d, '.git'), { recursive: true });
+        const s = scopeFolder(d, env);
+        expect(s.qualifies, sub).toBe(false);
+        expect(s.reason, sub).toMatch(/^it is inside ~\/(Library|\.\w+)$/);
+      }
+    });
+
+    it('resolves symlinks both ways: a link into ~/.x, and a folder that holds where ~/.x points', () => {
+      const { root, home, env } = fakeHome();
+      // A project reached by a link but living under ~/.local.
+      const hidden = join(home, '.local', 'code', 'proj');
+      mkdirSync(join(hidden, '.git'), { recursive: true });
+      mkdirSync(join(home, 'code'));
+      symlinkSync(hidden, join(home, 'code', 'proj-link'));
+      expect(scopeFolder(join(home, 'code', 'proj-link'), env).reason).toBe('it is inside ~/.local');
+      // ~/.aws is a link to a folder inside a repository elsewhere: that repository contains it.
+      const repo = join(root, 'work', 'infra');
+      mkdirSync(join(repo, '.git'), { recursive: true });
+      mkdirSync(join(repo, 'aws-config'));
+      symlinkSync(join(repo, 'aws-config'), join(home, '.aws'));
+      expect(scopeFolder(repo, env)).toMatchObject({ qualifies: false, reason: 'it contains ~/.aws' });
+      // ~/Library the same way.
+      const repo2 = join(root, 'work', 'lib');
+      mkdirSync(join(repo2, '.git'), { recursive: true });
+      mkdirSync(join(repo2, 'Library'));
+      symlinkSync(join(repo2, 'Library'), join(home, 'Library'));
+      expect(scopeFolder(repo2, env).reason).toBe('it contains ~/Library');
+    });
   });
 
   it('resolves symlinks: the folder is where the link points', () => {

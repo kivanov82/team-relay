@@ -84,7 +84,8 @@ describe.skipIf(!ENABLED)('M8 end to end: answers ship on their own, within the 
   beforeAll(async () => {
     const tmp = realpathSync(mkdtempSync(join(tmpdir(), 'e2e-m8-')));
     const proj = join(tmp, 'orders-service');
-    mkdirSync(proj);
+    // M8-SPEC §7 item 3: a folder qualifies only inside a git work tree.
+    mkdirSync(join(proj, '.git'), { recursive: true });
     writeFileSync(join(proj, 'NOTES.md'), 'The staging bucket lives in europe-west3.\n');
     bob = await BobSession.start(proj, tmp);
     alice = await Party.start('m8-alice', 'channel.js', channelEnv('alice', 'asker'));

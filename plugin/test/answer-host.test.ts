@@ -46,7 +46,8 @@ beforeEach(async () => {
   xdg = join(tmp, 'xdg');
   mkdirSync(xdg, { mode: 0o700 });
   proj = join(tmp, 'project');
-  mkdirSync(proj);
+  // M8-SPEC §7 item 3: a folder qualifies only inside a git work tree.
+  mkdirSync(join(proj, '.git'), { recursive: true });
   writeFileSync(join(proj, 'NOTES.md'), 'The staging bucket lives in europe-west3.\n');
 });
 afterEach(async () => {
