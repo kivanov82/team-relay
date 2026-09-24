@@ -86,7 +86,7 @@ block, all optional:
 | `broadcasts_per_minute` | 5 | broadcasts one member may create per calendar minute |
 | `audited_refusals_per_minute` | 60 | refused mutations per member per minute written to the audit log; the rest go to stdout (`refusal_not_audited`) |
 | `concurrent_polls` | 2 | long-polls (`wait > 0`) at once per member and stream, per relay instance |
-| `reads_per_minute` | 120 | reads of `/activity` and `/directory` together, per member and calendar minute (M2-SPEC §7.3) |
+| `reads_per_minute` | 120 | reads of `/activity`, `/directory` and `/inbox/summary` together, per member and calendar minute (M2-SPEC §7.3, M7-SPEC §1) |
 | `login_starts_per_minute` | 20 | `GET /v1/login/start` per client IP and calendar minute (M5-SPEC §2) |
 | `login_pages_per_minute` | 30 | `GET /v1/login/callback` and `POST /v1/login/choose` together, per client IP and minute |
 | `login_tokens_per_minute` | 20 | `POST /v1/login/token` per client IP and minute |
@@ -403,8 +403,8 @@ delegates:
   for every rule: masking and visibility, the read budget (`reads_per_minute` is the
   member's, shared with their own reads), the other-team `404`.
 - **Authorisation:** a delegate may call only `GET` `/v1/teams/{team}/me`, `/directory`,
-  `/activity` and `/requests/{id}` (`DELEGATE_ROUTES` in `relay/app.py`, matched on the route
-  template). Every other route, including stream reads (which would move presence and
+  `/activity`, `/requests/{id}`, `/roster` (M6) and `/inbox/summary` (M7)
+  (`DELEGATE_ROUTES` in `relay/app.py`, matched on the route template). Every other route, including stream reads (which would move presence and
   cursors), cursor moves, manifests and every request mutation: `403 forbidden`, before the
   body is read. Order of refusals: `401` → `404` (another team's URL) → `403`.
 - **Logs, not audit:** each delegated read logs `delegated_read` with `delegate`, `team`,
@@ -417,6 +417,27 @@ delegates:
   something only from a delegate.
 - A delegate's principal is a Google identity, so delegates work only in `google` mode; the
   tests stand one in with a verifier that maps a test token to a service-account principal.
+
+## The inbox summary (M7-SPEC §1, 24 Sep 2026)
+
+A question sent while its recipient's answering session is not running waits in their inbox
+(delivery is durable); this says so.
+
+- `GET /v1/teams/{team}/inbox/summary`, the caller's own inbox (a delegate: the member it
+  names): `{"pending": n, "more": bool, "oldest_at": "…"|null, "from": ["alice", …],
+  "answering": {"last_seen": "…"|null}}`. `pending` counts unexpired messages after the
+  member's `inbox` cursor, reading at most 50 (so at most 50); `more` is true when that read
+  was full and the stream holds later messages (they may have expired since). `oldest_at` is
+  the oldest counted message's time; `from` its distinct senders in order, at most 5;
+  `answering.last_seen` the answering session's presence.
+- A peek: it never moves a cursor (not even past expired messages), stamps no delivery and
+  writes no presence, so any session may call it. It is not a stream read (no long-poll, no
+  poll cap). It counts against `reads_per_minute`; over it, `429 rate_limited` (stdout only).
+  The store's `read_stream(..., advance=False)` is the primitive (both stores, in the
+  contract tests).
+- The directory's entries gain `inbox_waiting` (the same count, at most 50), computed with
+  the team's stats and cached with them for 10 s: team-wide metadata, like presence. A member
+  added since the cached entry was computed shows `0` until it is recomputed.
 
 ## Endpoints added in M2 (23 Sep 2026)
 
@@ -569,8 +590,8 @@ delegates:
 
 - No background sweeper, by design (§4): an asker who never polls `replies` gets no notices
   until they do, or until someone reads the request.
-- The read budget costs one small transaction per `/activity` or `/directory` read (the
-  counter document), like the request limits; it is the price of a limit that holds across
+- The read budget costs one small transaction per `/activity`, `/directory` or
+  `/inbox/summary` read (the counter document), like the request limits; it is the price of a limit that holds across
   instances.
 - Only the per-minute counts above are limited. Idempotent replays, acks that change
   nothing and reply replays are audited without a cap (each needs a request the caller
@@ -585,5 +606,8 @@ delegates:
   anyway). With the relay open to the internet (M5-SPEC §5) this is a cost, not an access,
   exposure; Cloud Armor or a per-IP limit on `401`s would be the next step if it ever
   matters.
+- A directory recomputation (at most every 10 s per team and instance) reads each member's
+  inbox (at most 50 messages each) besides the stats query: a cost that grows with the team,
+  bounded by the roster cap.
 - The console's "not on this team" page (M6-SPEC §4) sees the M3 contract: a delegated call
   for an email on no roster is `401 unauthenticated`, as before.
