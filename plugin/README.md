@@ -13,10 +13,10 @@ Each member runs two sessions:
 
 - **Working session** (your normal `claude`): the plugin's `relay` channel in *asker* role.
   Tools `list_teammates`, `ask_question`, `invoke_capability`, `request_status`, and
-  `login`, `whoami` for signing in (signing out is the `/team-relay:logout` command, never a
-  tool); answers,
+  `login`, `login_wait`, `whoami` for signing in (signing out is the `/team-relay:logout`
+  command, never a tool); answers,
   "no response yet" and "acknowledged but not answered" notices arrive as
-  `<channel source="relay" ...>` events.
+  `<channel source="relay" ...>` events, in a session started with the channel (below).
 - **Answering session** (`bin/answerer`): a separate, locked-down `claude` that receives
   teammates' questions and capability calls, acknowledges, answers and replies.
 
@@ -58,6 +58,39 @@ claude --dangerously-load-development-channels plugin:team-relay@team-relay-dev
 A SessionStart hook adds one line of context: who you are on the relay and who your
 teammates are, or `Not connected: run /team-relay:login`.
 
+### Sessions without the channel
+
+The plugin is installed for your user, so **every** Claude Code session on the machine starts
+its `relay` server, but Claude Code shows `<channel>` events only in a session started with the
+channel flag (and it sends the same MCP `initialize` either way, so the server cannot learn it
+from the protocol). A session without the flag that read your `replies` stream would
+acknowledge answers it can never show, and they would be lost. So only a *channel session*
+reads a stream (`src/channel-mode.ts`):
+
+1. `TEAM_RELAY_CHANNEL=1` or `0` in the server's environment decides, if set.
+   `bin/answerer` sets `1` in the answering session's `mcp.json`.
+2. Otherwise the server looks at up to 4 ancestor processes (`/proc/<pid>/cmdline` on Linux,
+   else `ps -o ppid=,args=` and `ps -o comm=`, run with `execFile`, never a shell). The nearest
+   `claude` process decides: it is a channel session only when its argv has
+   `--dangerously-load-development-channels` or `--channels` (a space- or comma-separated list,
+   or the `=` form, any number of times) with an entry `plugin:team-relay@<marketplace>`
+   (`server:relay` for the answering role). The plugin name comes from the install path, so a
+   renamed plugin matches its own name.
+3. Anything that cannot be inspected is not a channel session: it never consumes.
+
+A session without the channel never polls or acknowledges any stream. Its tools all work
+(`list_teammates`, `ask_question`, `invoke_capability`, `request_status`, `whoami`, `login`,
+`login_wait`), and every result says plainly, in `channel_note` (a sentence at the end of an
+error): "This session was not started with the team-relay channel, so teammates' answers are not
+shown here. Start one with: claude --dangerously-load-development-channels
+plugin:team-relay@team-relay-dev" (the marketplace the plugin is installed from, when its path
+names one). `ask_question` and `invoke_capability` still send, and add `where_answers_appear`:
+the answer goes to a channel session (one running now, or the next one you start: it waits in
+your `replies` stream), and `request_status` shows here who has acknowledged and answered. The
+SessionStart line ends with the same note. A refused credential shows on the next tool call
+instead of on the stream. Presence is recorded from stream reads, so only the channel session
+shows you online, which is right: it is the one that receives.
+
 ### Signing in (M5-SPEC §2, §6, §9)
 
 `/team-relay:login` runs the asker channel's `login` tool, loopback + PKCE in the style of
@@ -79,10 +112,10 @@ member's sign-in there silently; `test/login.test.ts` keeps that attack as a reg
 2. It opens your browser at `{relay}/v1/login/start?port&state&code_challenge&device`,
    through a private mode-600 redirect file (the URL never appears in a process argument,
    M2-SPEC §7.7; `TEAM_RELAY_OPEN_COMMAND` names another opener), and returns the URL at once
-   in the tool result, in case no browser opens, with the rule that it is for you alone: the
-   model shows it to you once and never repeats it to anyone else (whoever finishes a
-   sign-in at that link decides who your computer is signed in as). `whoami` never repeats
-   it.
+   in the tool result as a plain string, in case no browser opens, with the rule that it is for
+   you alone: the model shows it to you once, raw, on a line of its own (not as a markdown link),
+   and never repeats it to anyone else (whoever finishes a sign-in at that link decides who your
+   computer is signed in as). `whoami` never repeats it.
 3. On the relay you sign in with Google, see the teams your account belongs to, and choose
    one. The relay sends the browser to `http://127.0.0.1:<port>/callback?code&state`.
 4. Only `GET /callback` with `Host: 127.0.0.1:<port>` and exactly one `state` equal to ours
@@ -95,11 +128,17 @@ member's sign-in there silently; `test/login.test.ts` keeps that attack as a reg
    `~/.config/team-relay/`), `{relay_url, team, member, credential, expires_at, email}`
    (`email`, the Google account, when the relay reports it), the directory mode 700 and the
    file mode 600, written atomically. A file or directory others could read, one owned by
-   someone else, or a symlink is refused, never used. The channel pushes a
-   `<channel source="relay" type="status">` line, "Connected as <member> (<email>) on team
-   <team>" (§9 item 3; without the email from a relay that does not report it), and its
+   someone else, or a symlink is refused, never used. `/team-relay:login` then calls
+   `login_wait` (no arguments), which blocks until the sign-in completes or fails, or 180 s
+   pass, and returns "Connected as <member> (<email>) on team <team>" (§9 item 3; without the
+   email from a relay that does not report it) or why it did not complete; it waits for the
+   connection too, so the teammate tools work as soon as it returns. It needs no channel
+   event, so it works in a session without the channel. In a channel session the channel
+   also pushes the same line as a `<channel source="relay" type="status">` event, and the
    stream starts without a restart. When the new credential is a different member or team
-   than the one it replaced, the line says so plainly, and `whoami` repeats it as `changed`.
+   than the one it replaced, the result says so plainly (`changed`), and `whoami` repeats it.
+   A newer `login` in the same session replaces the one being waited for, and `login_wait`
+   follows it. (`TEAM_RELAY_LOGIN_WAIT_SECONDS`, 1 to 180, shortens the wait for tests.)
    A credential minted but not stored (another relay's credential appeared meanwhile, or an
    answer that fails the checks) is revoked at the relay.
 
@@ -107,7 +146,7 @@ With no stored sign-in the channel starts anyway, waits quietly (it looks for th
 2 s, so a login from another session counts too), and every teammate tool answers `Not
 connected: run /team-relay:login`. A credential the relay refuses (401: signed out, expired,
 or removed from the team) is never retried in a loop: the tools and a status line say to run
-`/team-relay:login` again, and a new login reconnects. `whoami` says who you are signed in
+`/team-relay:login` again (a status line only in a channel session), and a new login reconnects. `whoami` says who you are signed in
 as ("Connected as <member> (<email>) on team <team>"). The credential is only ever sent to
 the relay it came from.
 

@@ -83,9 +83,13 @@ the team owner must have added your Google email. Then, in Claude Code:
    shows your team's). While channels are in research preview, start Claude Code with
    `claude --dangerously-load-development-channels plugin:team-relay@team-relay-dev`
    (for a team on another relay than the plugin's default, put `RELAY_URL=https://<relay>`
-   in front; the join panel shows the full command).
-2. **Sign in:** `/team-relay:login`. Your browser opens on the relay; sign in with Google,
-   pick the team, done. The session says "Connected as <you> (<your email>) on team <team>".
+   in front; the join panel shows the full command). Teammates' answers appear only in a
+   session started that way. The plugin is installed for your user, so your other Claude Code
+   sessions have its tools too, but they never read your answers (that would lose them): they
+   say so, and your answers wait for a session with the channel.
+2. **Sign in:** `/team-relay:login`. Your browser opens on the relay (the session also shows
+   the link, in case no tab opened); sign in with Google, pick the team, done. The session
+   waits for it and says "Connected as <you> (<your email>) on team <team>".
 3. **Start answering:** `/team-relay:answering` prints the one command that starts your
    answering session; run it in a second terminal. It reads none of your files by default:
    put `ANSWERER_READ_DIRS=~/src/app:~/notes` in front to share folders (teammates see the
@@ -154,6 +158,10 @@ the whole sign-in against a fake Google, and an owner adding and removing a memb
 
 Working end to end and deployed for a team of three. Known limits:
 - Custom channels need Claude Code's development flag during the channels research preview.
+  Claude Code does not tell a channel server whether its session was started with the flag,
+  so the plugin reads the `claude` process's command line (`plugin/README.md`, "Sessions
+  without the channel"). If that check gets it wrong, `TEAM_RELAY_CHANNEL=1` or `0` in the
+  environment Claude Code starts with decides.
 - gcloud sign-in (`RELAY_AUTH=google`) still uses gcloud's own ID-token audience, so a token
   sent to some other service could be replayed to the relay within its hour. The device
   credential from `/team-relay:login` does not have this problem.
