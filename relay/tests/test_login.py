@@ -598,7 +598,9 @@ async def test_a_principal_on_two_teams_chooses_one(kind: str, clock: FakeClock)
         chooser = await to_chooser(api.client, api.fake, EMAILS["alice"])
         assert chooser.teams == [api.team, other]
         assert ">alicia<" in chooser.response.text and ">alice<" in chooser.response.text
-        assert "checked required" in chooser.response.text
+        # M6-SPEC §7.5: with more than one team, none is preselected; the member picks.
+        assert " checked" not in chooser.response.text
+        assert chooser.response.text.count(" required>") == 2
         query = await continue_as(api.client, chooser, other)
         body = (await token(api.client, query["code"], chooser.started.verifier)).json()
         assert (body["team"], body["member"]) == (other, "alicia")

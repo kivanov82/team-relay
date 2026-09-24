@@ -221,9 +221,11 @@ def chooser_page(
     *, email: str, device: str, choices: Sequence[LoginChoice], csrf: str, action: str
 ) -> str:
     single = len(choices) == 1
+    # M6-SPEC §7.5: preselected only when there is exactly one; with several, the member
+    # picks (the radios are required, and the relay refuses a POST without a team).
+    checked = " checked" if single else ""
     options = []
-    for index, choice in enumerate(choices):
-        checked = " checked" if single or index == 0 else ""
+    for choice in choices:
         options.append(
             '<label class="choice">'
             f'<input type="radio" name="team" value="{escape(choice.team)}"{checked} required>'
