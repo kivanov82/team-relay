@@ -112,4 +112,35 @@ describe('the deny list', () => {
     expect(credentialHit('/x/creds/credentials.json', ctx)).toBe('**/credentials.json');
     expect(credentialHit('/x/relay/f', { ...ctx, credentialDirs: ['/x/relay'] })).toBe('/x/relay/**');
   });
+
+  it('M8-SPEC §7 item 2: credential files and folders are denied at any depth, not only in home', () => {
+    const ctx = { home: '/home/u' };
+    const cases: Array<[string, string]> = [
+      ['/work/app/.npmrc', '**/.npmrc'],
+      ['/work/app/.netrc', '**/.netrc'],
+      ['/work/app/sub/.pypirc', '**/.pypirc'],
+      ['/work/app/.git-credentials', '**/.git-credentials'],
+      ['/work/app/keys/id_ecdsa', '**/id_ecdsa*'],
+      ['/work/app/keys/id_ecdsa.pub', '**/id_ecdsa*'],
+      ['/work/app/keys/id_dsa', '**/id_dsa*'],
+      ['/work/app/putty.ppk', '**/*.ppk'],
+      ['/work/infra/terraform.tfstate', '**/*.tfstate'],
+      ['/work/infra/terraform.tfstate.backup', '**/*.tfstate.*'],
+      ['/work/app/.aws/credentials', '**/.aws/**'],
+      ['/work/app/.aws', '**/.aws/**'],
+      ['/work/app/deploy/.kube/config', '**/.kube/**'],
+    ];
+    for (const [path, rule] of cases) expect(credentialHit(path, ctx), path).toBe(rule);
+    // Rules for Claude Code: each any-depth entry three ways.
+    const rules = readDenyRules();
+    for (const r of ['**/.npmrc', '**/*.tfstate', '**/.aws/**', '**/.kube/**', '**/id_dsa*', '**/*.ppk']) {
+      expect(rules).toContain(`Read(${r})`);
+      expect(rules).toContain(`Read(~/${r})`);
+      expect(rules).toContain(`Read(//${r})`);
+    }
+    // Look-alikes that are not credential files stay readable.
+    for (const path of ['/work/app/npmrc.md', '/work/app/tfstate.md', '/work/app/aws/config.ts', '/work/app/kube.yaml']) {
+      expect(credentialHit(path, ctx), path).toBeNull();
+    }
+  });
 });

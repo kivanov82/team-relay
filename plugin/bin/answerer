@@ -205,7 +205,8 @@ const HOME_PATHS = [
 const ANY_DEPTH = [
   "**/.env", "**/.env.*", "**/.envrc", "**/*.pem", "**/*.key", "**/id_rsa*", "**/id_ed25519*",
   "**/*.p12", "**/*.pfx", "**/*.keystore", "**/*.jks", "**/credentials.json", "**/*.tfvars",
-  "**/keystore/**",
+  "**/keystore/**", "**/.npmrc", "**/.netrc", "**/.pypirc", "**/.git-credentials", "**/id_ecdsa*",
+  "**/id_dsa*", "**/*.ppk", "**/*.tfstate", "**/*.tfstate.*", "**/.aws/**", "**/.kube/**",
 ];
 // Literal paths are escaped, so a glob character in them matches only itself.
 const escapeGlob = (p) => p.replace(/[\\*?\[\]!#]/g, (c) => "\\" + c);

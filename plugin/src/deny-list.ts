@@ -26,7 +26,8 @@ export const HOME_PATHS = [
 export const ANY_DEPTH = [
   '**/.env', '**/.env.*', '**/.envrc', '**/*.pem', '**/*.key', '**/id_rsa*', '**/id_ed25519*',
   '**/*.p12', '**/*.pfx', '**/*.keystore', '**/*.jks', '**/credentials.json', '**/*.tfvars',
-  '**/keystore/**',
+  '**/keystore/**', '**/.npmrc', '**/.netrc', '**/.pypirc', '**/.git-credentials', '**/id_ecdsa*',
+  '**/id_dsa*', '**/*.ppk', '**/*.tfstate', '**/*.tfstate.*', '**/.aws/**', '**/.kube/**',
 ] as const;
 
 /** A literal path escaped, so a glob character in it matches only itself. */
