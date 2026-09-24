@@ -30,6 +30,22 @@ that need a transaction live in exactly one primitive each:
   code, the credential it mints (revoking the member's least recently used live credentials
   beyond MAX_LIVE_CREDENTIALS) or revoke the credential a reused code minted, in one
   transaction (M5-SPEC §2 step 7, §3).
+- :meth:`Store.create_team`: read the team and its creator's account, run a pure function,
+  count the quotas, and write the team, its first owner, the creator's account (the team
+  counted as created by it, and the owner's membership) and the audit, in one transaction
+  (M9-SPEC §2). Two creations of one id: one wins, the other's function sees the team.
+- :meth:`Store.delete_team`: read the team and its creator's account, run a pure function,
+  and write the team's new version (``deleted``: from then on no credential, roster change
+  or login of it counts), take it off its creator's account and write the admin audit, in
+  one transaction (M9-SPEC §1, §4).
+- :meth:`Store.purge_team`: remove a deleted team's documents in bounded batches, each a
+  transaction that first checks the team is still deleted; resumable.
+
+Teams (M9-SPEC §1) are ``teams/{team}`` records. A team the API created is ``seed=False``; the
+team file's teams are seed teams, and a record written before M9 (``roster_version`` only)
+reads as an active seed team. For the teams the API created (and only those), each Google
+email's memberships are indexed in ``accounts/{sha256(email)}``, kept exact by the roster
+transactions, so "which teams is this email on" is one read.
 
 Every write of an existing request keeps its ``updated_at`` monotonic (M2-SPEC §7.1): the
 store stamps it, inside the transaction that writes the request, as the later of the value
@@ -47,10 +63,12 @@ filters by business rules; expiry filtering on reads is done where noted.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, Literal, Protocol
+
+from .jsonutil import sha256_hex
 
 StreamName = Literal["inbox", "replies"]
 STREAMS: tuple[str, ...] = ("inbox", "replies")
@@ -254,6 +272,135 @@ class RosterOutcome[T]:
     result: T
     version: int
     revoked: list[str]  # credential keys revoked with a removal or an email's removal
+
+
+# Teams (M9-SPEC §1) ----------------------------------------------------------------------
+
+TEAM_ACTIVE = "active"
+TEAM_DELETED = "deleted"
+
+
+@dataclass
+class TeamRecord:
+    """``teams/{team}``. ``seed`` is True for a team of the team file; ``members`` and
+    ``owners`` are the roster's counts as of its last change (None before one). A deleted
+    team keeps its id reserved until ``reserved_until``; ``purge_complete`` says its
+    documents are gone."""
+
+    id: str
+    name: str
+    status: str = TEAM_ACTIVE
+    seed: bool = True
+    created_at: datetime | None = None
+    created_by_member: str | None = None
+    created_by_email_sha256: str | None = None
+    roster_version: int = 0
+    members: int | None = None
+    owners: int | None = None
+    deleted_at: datetime | None = None
+    deleted_by_email_sha256: str | None = None
+    reserved_until: datetime | None = None
+    purge_complete: bool = False
+
+    @property
+    def active(self) -> bool:
+        return self.status == TEAM_ACTIVE
+
+
+@dataclass
+class AccountRecord:
+    """``accounts/{sha256(email)}``: the teams created through the API that the email is on
+    (team -> member), and those it created and has not deleted (the per-account limit)."""
+
+    key: str
+    memberships: dict[str, str] = field(default_factory=dict)
+    created: list[str] = field(default_factory=list)
+
+
+def account_key(email: str) -> str:
+    """The account index's document id for a Google email: the SHA-256 of its lower-cased
+    form (the same value the audit keeps, :func:`relay.roster.email_hash`)."""
+    return sha256_hex(email.lower())
+
+
+@dataclass
+class AdminAuditEntry:
+    """``admin_audit/{auto}`` (M9-SPEC §4): relay-wide, outside any team, so it outlives a
+    deleted team. Never an email: the actor's SHA-256 only."""
+
+    time: datetime
+    actor_email_sha256: str
+    action: str
+    team: str
+    outcome: str
+    expire_at: datetime
+    detail: str | None = None
+
+
+@dataclass
+class TeamCreation[T]:
+    """What a :meth:`Store.create_team` function asks the store to write: the team (whole)
+    and its first owner, or nothing (``team`` None)."""
+
+    result: T
+    team: TeamRecord | None = None
+    owner: RosterEntry | None = None
+    audit: list[AuditEntry] = field(default_factory=list)
+    admin_audit: list[AdminAuditEntry] = field(default_factory=list)
+
+
+@dataclass
+class TeamDeletion[T]:
+    """What a :meth:`Store.delete_team` function asks the store to write: the team's new
+    version (or None to leave it) and admin audit entries."""
+
+    result: T
+    team: TeamRecord | None = None
+    admin_audit: list[AdminAuditEntry] = field(default_factory=list)
+
+
+class TeamGone(Exception):
+    """The team is deleted: a roster change or a credential for it writes nothing."""
+
+
+def roster_memberships(entries: Mapping[str, RosterEntry]) -> dict[str, str]:
+    """email -> member over a roster's entries."""
+    found: dict[str, str] = {}
+    for member, entry in entries.items():
+        for email in entry.emails:
+            found.setdefault(email, member)
+    return found
+
+
+def membership_changes(
+    before: Mapping[str, RosterEntry], put: Sequence[RosterEntry], remove: Sequence[str]
+) -> dict[str, str | None]:
+    """The emails whose membership a roster change moves: email -> its member after the
+    change, or None when it leaves the team. Pure, for both stores' account index."""
+    after = dict(before)
+    for member in remove:
+        after.pop(member, None)
+    for entry in put:
+        after[entry.member] = entry
+    old, new = roster_memberships(before), roster_memberships(after)
+    return {e: new.get(e) for e in sorted(set(old) | set(new)) if old.get(e) != new.get(e)}
+
+
+def roster_counts(
+    before: Mapping[str, RosterEntry], put: Sequence[RosterEntry], remove: Sequence[str]
+) -> tuple[int, int]:
+    """``(members, owners)`` after a roster change."""
+    after = dict(before)
+    for member in remove:
+        after.pop(member, None)
+    for entry in put:
+        after[entry.member] = entry
+    return len(after), sum(1 for e in after.values() if e.role == "owner")
+
+
+# A purge batch removes at most this many documents, in one transaction (Firestore allows
+# 500 writes in one).
+PURGE_BATCH = 400
 
 
 # Device credentials (M5-SPEC §3) ---------------------------------------------------------
@@ -499,6 +646,8 @@ type MutateFn[T] = Callable[[RequestDoc | None], Mutation[T]]
 type RosterFn[T] = Callable[[RosterState], RosterChange[T]]
 type LoginFn[T] = Callable[[LoginDoc | None], LoginChange[T]]
 type RedeemFn[T] = Callable[[LoginCode | None], Redemption[T]]
+type TeamCreateFn[T] = Callable[[TeamRecord | None, AccountRecord | None], TeamCreation[T]]
+type TeamDeleteFn[T] = Callable[[TeamRecord | None], TeamDeletion[T]]
 
 
 class Store(Protocol):
@@ -644,25 +793,83 @@ class Store(Protocol):
     async def mutate_roster[T](
         self, team: str, fn: RosterFn[T], now: datetime, quotas: Sequence[Quota] = ()
     ) -> RosterOutcome[T]:
-        """Read the roster and the retired ids, run ``fn`` (pure; raising writes nothing).
+        """Read the team, the roster and the retired ids; a deleted team raises
+        :class:`TeamGone` (nothing written). Run ``fn`` (pure; raising writes nothing).
         When it changed something: every quota must be under its limit (else
         :class:`QuotaExceeded`, nothing written) and is counted; ``put`` entries are
         written, ``remove`` members deleted with every live credential of theirs revoked
         (``revoked_at = now``), every live credential :func:`revocable_by_email` by a
-        ``revoke_email`` pair revoked, ``retire`` ids written, ``roster_version`` incremented,
-        the audit written; all in one transaction."""
+        ``revoke_email`` pair revoked, ``retire`` ids written, ``roster_version`` incremented
+        and the team's ``members``/``owners`` counts set, the audit written, and for a team
+        the API created (``seed`` False) every account whose membership moved
+        (:func:`membership_changes`) updated; all in one transaction."""
+        ...
+
+    # Teams (M9-SPEC §1) --------------------------------------------------------------
+    async def get_teams(self, teams: Sequence[str]) -> dict[str, TeamRecord]:
+        """The team records that exist, in one batched read. A document holding only a
+        ``roster_version`` (written before M9) reads as an active seed team."""
+        ...
+
+    async def list_teams(self, after: str | None, limit: int) -> list[TeamRecord]:
+        """Up to ``limit`` team records with ``seed`` False, by id, after ``after``."""
+        ...
+
+    async def ensure_seed_team(self, team: str, name: str, now: datetime) -> TeamRecord:
+        """Make ``teams/{team}`` a seed team's record: fill what a record written before M9
+        lacks (id, name, status, ``seed``, ``created_at``, the roster counts), and mark a
+        team the API created that the file now lists as ``seed``. A deleted record is left
+        as it is. One transaction; returns the record."""
+        ...
+
+    async def create_team[T](
+        self, team: str, email_sha256: str, fn: TeamCreateFn[T], quotas: Sequence[Quota] = ()
+    ) -> T:
+        """Read the team (None when absent) and the account ``email_sha256``; run ``fn``
+        (pure; raising writes nothing). When it returns a team: every quota (relay-wide
+        counters) must be under its limit (else :class:`QuotaExceeded`, nothing written)
+        and is counted; the team is written whole (a deleted record is replaced), its owner
+        entry written as its only roster entry, the account gets the team in ``created`` and
+        the owner's membership for each of the owner's emails, and the audit and admin
+        audit are written; one transaction."""
+        ...
+
+    async def delete_team[T](self, team: str, fn: TeamDeleteFn[T]) -> T:
+        """Read the team (None when absent) and its creator's account; run ``fn`` (pure).
+        When it returns a new version: write it; when that version is deleted and the stored
+        one was not, take the team off its creator's ``created``; write the admin audit; one
+        transaction."""
+        ...
+
+    async def purge_team(self, team: str, budget: int) -> bool:
+        """Remove up to ``budget`` of the deleted team's documents (every one under
+        ``teams/{team}``, each credential's pointer, and each roster email's membership in
+        the account index), in transactions of at most PURGE_BATCH that each first check the
+        team is still deleted. True when nothing is left (the record is then marked
+        ``purge_complete``); False when the budget ran out or the team is not deleted."""
+        ...
+
+    async def get_account(self, email_sha256: str) -> AccountRecord | None: ...
+
+    async def append_admin_audit(self, entries: Sequence[AdminAuditEntry]) -> None: ...
+
+    async def list_admin_audit(self, limit: int = 1000) -> list[AdminAuditEntry]:
+        """Oldest first. For operators and tests; the HTTP API never exposes it."""
         ...
 
     # Device credentials (M5-SPEC §3) -------------------------------------------------
     async def find_credential(self, teams: Sequence[str], key: str) -> CredentialRecord | None:
-        """The credential ``key`` in whichever of ``teams`` holds it (revoked or expired
-        ones included; the caller decides), in one batched read."""
+        """The credential ``key`` (revoked or expired ones included; the caller decides): in
+        whichever of ``teams`` holds it, else in the team its pointer
+        (``credential_teams/{key}``, written with every credential since M9) names. One
+        batched read, plus one more when only the pointer found it."""
         ...
 
     async def touch_credential(
         self, team: str, key: str, last_used_at: datetime, expire_at: datetime
     ) -> None:
-        """Record a use (the rolling expiry) unless the credential is gone or revoked."""
+        """Record a use (the rolling expiry, the pointer's with it) unless the credential is
+        gone or revoked."""
         ...
 
     async def list_credentials(self, team: str, member: str) -> list[CredentialRecord]:
@@ -686,9 +893,10 @@ class Store(Protocol):
 
     async def redeem_code[T](self, key: str, fn: RedeemFn[T], now: datetime) -> RedeemOutcome[T]:
         """Read code ``key`` (None when absent), run ``fn`` (pure; raising writes nothing),
-        then atomically: write the code's new version; create the credential (revoking the
-        member's live credentials beyond MAX_LIVE_CREDENTIALS - 1 by
-        :func:`credentials_over_cap`); revoke ``revoke`` when it is live; write the audit."""
+        then atomically: write the code's new version; create the credential and its pointer
+        (revoking the member's live credentials beyond MAX_LIVE_CREDENTIALS - 1 by
+        :func:`credentials_over_cap`); revoke ``revoke`` when it is live; write the audit. A
+        credential for a deleted team raises :class:`TeamGone` (nothing written)."""
         ...
 
     async def count_login_quota(self, quota: Quota) -> bool:

@@ -14,6 +14,9 @@ from .store import (
     DELIVERY_SCAN_LIMIT,
     MAX_LIVE_CREDENTIALS,
     STREAM_SCAN_LIMIT,
+    TEAM_DELETED,
+    AccountRecord,
+    AdminAuditEntry,
     AuditEntry,
     BeyondHead,
     CreateOutcome,
@@ -37,9 +40,16 @@ from .store import (
     RosterOutcome,
     RosterState,
     StreamPage,
+    TeamCreateFn,
+    TeamDeleteFn,
+    TeamGone,
+    TeamRecord,
+    account_key,
     credentials_over_cap,
+    membership_changes,
     monotonic_updated_at,
     revocable_by_email,
+    roster_counts,
     stamp_deliveries,
 )
 
@@ -62,7 +72,10 @@ class MemoryStore:
         self._audit: list[AuditEntry] = []
         self._counters: dict[tuple[str, str], int] = {}
         self._roster: dict[str, dict[str, RosterEntry]] = {}
-        self._roster_version: dict[str, int] = {}
+        # teams/{team}: roster_version lives on the record, as in Firestore.
+        self._teams: dict[str, TeamRecord] = {}
+        self._accounts: dict[str, AccountRecord] = {}
+        self._admin_audit: list[AdminAuditEntry] = []
         self._retired: dict[str, dict[str, RetiredId]] = {}
         self._credentials: dict[tuple[str, str], CredentialRecord] = {}
         self._logins: dict[str, LoginDoc] = {}
@@ -317,23 +330,40 @@ class MemoryStore:
     # Roster ---------------------------------------------------------------------------
     async def roster_version(self, team: str) -> int:
         async with self._lock:
-            return self._roster_version.get(team, 0)
+            record = self._teams.get(team)
+            return record.roster_version if record is not None else 0
 
     async def read_roster(self, team: str) -> RosterState:
         async with self._lock:
             return self._roster_state(team)
 
     def _roster_state(self, team: str) -> RosterState:
+        record = self._teams.get(team)
         return RosterState(
-            version=self._roster_version.get(team, 0),
+            version=record.roster_version if record is not None else 0,
             entries=copy.deepcopy(self._roster.get(team, {})),
             retired=copy.deepcopy(self._retired.get(team, {})),
         )
+
+    def _index(self, team: str, changes: dict[str, str | None]) -> None:
+        """Apply membership changes to the account index (a team the API created)."""
+        for email, member in changes.items():
+            key = account_key(email)
+            account = self._accounts.setdefault(key, AccountRecord(key=key))
+            if member is None:
+                account.memberships.pop(team, None)
+            else:
+                account.memberships[team] = member
+            if not account.memberships and not account.created:
+                del self._accounts[key]
 
     async def mutate_roster[T](
         self, team: str, fn: RosterFn[T], now: datetime, quotas: Sequence[Quota] = ()
     ) -> RosterOutcome[T]:
         async with self._lock:
+            record = self._teams.get(team)
+            if record is not None and record.status == TEAM_DELETED:
+                raise TeamGone(team)
             state = self._roster_state(team)
             version = state.version
             change = fn(state)  # raising here leaves everything untouched
@@ -341,34 +371,201 @@ class MemoryStore:
                 return RosterOutcome(result=change.result, version=version, revoked=[])
             self._take(team, quotas)
             entries = self._roster.setdefault(team, {})
+            before = copy.deepcopy(entries)
             revoked: list[str] = []
             for member in change.remove:
                 entries.pop(member, None)
-                for (t, key), record in sorted(self._credentials.items()):
-                    if t == team and record.member == member and record.live(now):
-                        record.revoked = True
-                        record.revoked_at = now
+                for (t, key), cred in sorted(self._credentials.items()):
+                    if t == team and cred.member == member and cred.live(now):
+                        cred.revoked = True
+                        cred.revoked_at = now
                         revoked.append(key)
             for member, email_sha256 in change.revoke_email:
-                for (t, key), record in sorted(self._credentials.items()):
+                for (t, key), cred in sorted(self._credentials.items()):
                     if (
                         t == team
-                        and record.live(now)
-                        and revocable_by_email(record, member, email_sha256)
+                        and cred.live(now)
+                        and revocable_by_email(cred, member, email_sha256)
                     ):
-                        record.revoked = True
-                        record.revoked_at = now
+                        cred.revoked = True
+                        cred.revoked_at = now
                         revoked.append(key)
             for entry in change.put:
                 entries[entry.member] = copy.deepcopy(entry)
             retired = self._retired.setdefault(team, {})
             for tomb in change.retire:
                 retired[tomb.member] = copy.deepcopy(tomb)
-            self._roster_version[team] = version + 1
+            if record is None:
+                record = self._teams[team] = TeamRecord(id=team, name=team)
+            record.roster_version = version + 1
+            record.members, record.owners = roster_counts(before, change.put, change.remove)
+            if not record.seed:
+                self._index(team, membership_changes(before, change.put, change.remove))
             self._audit.extend(copy.deepcopy(change.audit))
             return RosterOutcome(
                 result=change.result, version=version + 1, revoked=sorted(set(revoked))
             )
+
+    # Teams ----------------------------------------------------------------------------
+    async def get_teams(self, teams: Sequence[str]) -> dict[str, TeamRecord]:
+        async with self._lock:
+            return {t: copy.deepcopy(self._teams[t]) for t in teams if t in self._teams}
+
+    async def list_teams(self, after: str | None, limit: int) -> list[TeamRecord]:
+        async with self._lock:
+            found = sorted(
+                (r for r in self._teams.values() if not r.seed and (after is None or r.id > after)),
+                key=lambda r: r.id,
+            )
+            return copy.deepcopy(found[:limit])
+
+    async def ensure_seed_team(self, team: str, name: str, now: datetime) -> TeamRecord:
+        async with self._lock:
+            record = self._teams.get(team)
+            if record is None:
+                record = self._teams[team] = TeamRecord(id=team, name=name)
+            if record.status == TEAM_DELETED:
+                return copy.deepcopy(record)
+            record.seed = True
+            if record.created_at is None:
+                record.created_at = now
+                record.name = name
+            if record.members is None or record.owners is None:
+                entries = self._roster.get(team, {})
+                record.members, record.owners = roster_counts(entries, [], [])
+            return copy.deepcopy(record)
+
+    async def create_team[T](
+        self, team: str, email_sha256: str, fn: TeamCreateFn[T], quotas: Sequence[Quota] = ()
+    ) -> T:
+        async with self._lock:
+            creation = fn(
+                copy.deepcopy(self._teams.get(team)),
+                copy.deepcopy(self._accounts.get(email_sha256)),
+            )
+            if creation.team is None:
+                return creation.result
+            if creation.team.id != team:
+                raise RuntimeError("a creation may only write its own team")
+            for quota in quotas:
+                if self._login_counters.get(quota.key, 0) >= quota.limit:
+                    raise QuotaExceeded(quota)
+            for quota in quotas:
+                self._login_counters[quota.key] = self._login_counters.get(quota.key, 0) + 1
+            self._teams[team] = copy.deepcopy(creation.team)
+            owner = creation.owner
+            self._roster[team] = {owner.member: copy.deepcopy(owner)} if owner else {}
+            account = self._accounts.setdefault(email_sha256, AccountRecord(key=email_sha256))
+            if team not in account.created:
+                account.created.append(team)
+            if owner is not None:
+                for email in owner.emails:
+                    key = account_key(email)
+                    self._accounts.setdefault(key, AccountRecord(key=key)).memberships[team] = (
+                        owner.member
+                    )
+            self._audit.extend(copy.deepcopy(creation.audit))
+            self._admin_audit.extend(copy.deepcopy(creation.admin_audit))
+            return creation.result
+
+    async def delete_team[T](self, team: str, fn: TeamDeleteFn[T]) -> T:
+        async with self._lock:
+            current = copy.deepcopy(self._teams.get(team))
+            deletion = fn(current)
+            if deletion.team is not None:
+                if deletion.team.id != team:
+                    raise RuntimeError("a deletion may only write its own team")
+                was_deleted = current is not None and current.status == TEAM_DELETED
+                self._teams[team] = copy.deepcopy(deletion.team)
+                creator = current.created_by_email_sha256 if current else None
+                if deletion.team.status == TEAM_DELETED and not was_deleted and creator:
+                    account = self._accounts.get(creator)
+                    if account is not None and team in account.created:
+                        account.created.remove(team)
+                        if not account.memberships and not account.created:
+                            del self._accounts[creator]
+            self._admin_audit.extend(copy.deepcopy(deletion.admin_audit))
+            return deletion.result
+
+    def _team_documents(self, team: str) -> list[tuple[str, Any]]:
+        """Everything under ``teams/{team}`` except its record, as (kind, key) pairs, in
+        the order a purge removes them: the roster first (its emails leave the index)."""
+        docs: list[tuple[str, Any]] = [("roster", m) for m in sorted(self._roster.get(team, {}))]
+        docs += [("credential", k) for (t, k) in sorted(self._credentials) if t == team]
+        docs += [("member", k) for k in sorted(self._members) if k[0] == team]
+        for key in sorted(self._streams):
+            if key[0] == team:
+                docs += [("message", (key, seq)) for seq in sorted(self._streams[key].messages)]
+                docs.append(("stream", key))
+        for key in sorted(self._requests):
+            if key[0] == team:
+                docs += [("progress", key)] * len(self._progress.get(key, []))
+                docs.append(("request", key))
+        for key in sorted(self._progress):
+            if key[0] == team and key not in self._requests:
+                docs += [("progress", key)] * len(self._progress[key])
+        docs += [("idempotency", k) for k in sorted(self._idempotency) if k[0] == team]
+        docs += [("counter", k) for k in sorted(self._counters) if k[0] == team]
+        docs += [("retired", m) for m in sorted(self._retired.get(team, {}))]
+        docs += [("audit", i) for i in range(sum(1 for e in self._audit if e.team == team))]
+        return docs
+
+    def _remove(self, team: str, kind: str, key: Any) -> None:
+        if kind == "roster":
+            entry = self._roster[team].pop(key)
+            self._index(team, {email: None for email in entry.emails})
+        elif kind == "credential":
+            del self._credentials[(team, key)]
+        elif kind == "member":
+            del self._members[key]
+        elif kind == "message":
+            stream_key, seq = key
+            del self._streams[stream_key].messages[seq]
+        elif kind == "stream":
+            del self._streams[key]
+        elif kind == "progress":
+            bucket = self._progress[key]
+            bucket.pop()
+            if not bucket:
+                del self._progress[key]
+        elif kind == "request":
+            del self._requests[key]
+        elif kind == "idempotency":
+            del self._idempotency[key]
+        elif kind == "counter":
+            del self._counters[key]
+        elif kind == "retired":
+            del self._retired[team][key]
+        elif kind == "audit":
+            index = next(i for i, e in enumerate(self._audit) if e.team == team)
+            del self._audit[index]
+
+    async def purge_team(self, team: str, budget: int) -> bool:
+        async with self._lock:
+            record = self._teams.get(team)
+            if record is None or record.status != TEAM_DELETED:
+                return False
+            docs = self._team_documents(team)
+            for kind, key in docs[:budget]:
+                self._remove(team, kind, key)
+            if len(docs) > budget:
+                return False
+            self._roster.pop(team, None)
+            self._retired.pop(team, None)
+            record.purge_complete = True
+            return True
+
+    async def get_account(self, email_sha256: str) -> AccountRecord | None:
+        async with self._lock:
+            return copy.deepcopy(self._accounts.get(email_sha256))
+
+    async def append_admin_audit(self, entries: Sequence[AdminAuditEntry]) -> None:
+        async with self._lock:
+            self._admin_audit.extend(copy.deepcopy(list(entries)))
+
+    async def list_admin_audit(self, limit: int = 1000) -> list[AdminAuditEntry]:
+        async with self._lock:
+            return copy.deepcopy(self._admin_audit[:limit])
 
     # Device credentials ---------------------------------------------------------------
     async def find_credential(self, teams: Sequence[str], key: str) -> CredentialRecord | None:
@@ -376,6 +573,10 @@ class MemoryStore:
             for team in teams:
                 record = self._credentials.get((team, key))
                 if record is not None:
+                    return copy.deepcopy(record)
+            # The pointer: every credential here was minted by redeem_code, which writes one.
+            for (_, k), record in self._credentials.items():
+                if k == key:
                     return copy.deepcopy(record)
             return None
 
@@ -429,6 +630,10 @@ class MemoryStore:
     async def redeem_code[T](self, key: str, fn: RedeemFn[T], now: datetime) -> RedeemOutcome[T]:
         async with self._lock:
             plan = fn(copy.deepcopy(self._codes.get(key)))
+            if plan.credential is not None:
+                team_record = self._teams.get(plan.credential.team)
+                if team_record is not None and team_record.status == TEAM_DELETED:
+                    raise TeamGone(plan.credential.team)  # before any write
             revoked: list[CredentialRecord] = []
             if plan.code is not None:
                 if plan.code.key != key:

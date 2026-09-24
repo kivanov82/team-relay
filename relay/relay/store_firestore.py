@@ -24,6 +24,15 @@ Representation choices:
 - A request document stays well under Firestore's 1 MiB: a question is at most 8000
   characters, each recipient carries at most a 2000-character answer preview and 50 tool
   events, and a team has at most 50 members.
+- Teams (M9-SPEC §1): ``teams/{team}`` also holds the team's record (id, name, status,
+  ``seed``, who created it and when, the roster counts, and once deleted when and until when
+  its id stays reserved). A document with ``roster_version`` alone predates M9 and reads as
+  an active seed team. Team documents never expire. ``accounts/{sha256(email)}`` indexes
+  the memberships of the teams the API created and the teams an account created;
+  ``credential_teams/{key}`` points a credential at its team (``expire_at`` rolls with the
+  credential's); ``admin_audit`` is relay-wide. Team creations count against the relay-wide
+  counters in ``login_limits``. The team listing orders by document id alone, so none of
+  this needs an index beyond the automatic ones.
 """
 
 from __future__ import annotations
@@ -39,12 +48,18 @@ from google.api_core import exceptions as gexc
 from google.cloud import firestore
 from google.cloud.firestore_v1.async_transaction import AsyncTransaction
 from google.cloud.firestore_v1.base_query import FieldFilter
+from google.cloud.firestore_v1.field_path import FieldPath
 
 from .jsonutil import canonical_json
 from .store import (
     DELIVERY_SCAN_LIMIT,
     MAX_LIVE_CREDENTIALS,
+    PURGE_BATCH,
     STREAM_SCAN_LIMIT,
+    TEAM_ACTIVE,
+    TEAM_DELETED,
+    AccountRecord,
+    AdminAuditEntry,
     AuditEntry,
     BeyondHead,
     CreateOutcome,
@@ -70,15 +85,24 @@ from .store import (
     RosterOutcome,
     RosterState,
     StreamPage,
+    TeamCreateFn,
+    TeamDeleteFn,
+    TeamGone,
+    TeamRecord,
     ToolEvent,
+    account_key,
     credentials_over_cap,
+    membership_changes,
     monotonic_updated_at,
     revocable_by_email,
+    roster_counts,
     stamp_deliveries,
 )
 
 _TXN_ATTEMPTS = 8
 _MAX_SCAN_PAGE = 250
+# One team listing reads team documents in pages of this many (seed teams are skipped).
+_TEAM_PAGE = 200
 
 
 def _dt(value: Any) -> datetime | None:
@@ -485,6 +509,88 @@ def _code_from_doc(key: str, doc: dict[str, Any]) -> LoginCode:
     )
 
 
+def _team_to_doc(record: TeamRecord) -> dict[str, Any]:
+    return {
+        "id": record.id,
+        "name": record.name,
+        "status": record.status,
+        "seed": record.seed,
+        "created_at": record.created_at,
+        "created_by_member": record.created_by_member,
+        "created_by_email_sha256": record.created_by_email_sha256,
+        "roster_version": record.roster_version,
+        "members": record.members,
+        "owners": record.owners,
+        "deleted_at": record.deleted_at,
+        "deleted_by_email_sha256": record.deleted_by_email_sha256,
+        "reserved_until": record.reserved_until,
+        "purge_complete": record.purge_complete,
+    }
+
+
+def _team_from_doc(team: str, doc: dict[str, Any]) -> TeamRecord:
+    # A document written before M9 holds roster_version alone: an active seed team.
+    return TeamRecord(
+        id=team,
+        name=doc.get("name") or team,
+        status=doc.get("status") or TEAM_ACTIVE,
+        seed=doc.get("seed", True) is not False,
+        created_at=_dt(doc.get("created_at")),
+        created_by_member=doc.get("created_by_member"),
+        created_by_email_sha256=doc.get("created_by_email_sha256"),
+        roster_version=int(doc.get("roster_version") or 0),
+        members=doc.get("members"),
+        owners=doc.get("owners"),
+        deleted_at=_dt(doc.get("deleted_at")),
+        deleted_by_email_sha256=doc.get("deleted_by_email_sha256"),
+        reserved_until=_dt(doc.get("reserved_until")),
+        purge_complete=bool(doc.get("purge_complete")),
+    )
+
+
+def _account_to_doc(record: AccountRecord) -> dict[str, Any]:
+    return {
+        # Lists, not maps: the documents stay free of field-name escaping.
+        "memberships": [
+            {"team": team, "member": record.memberships[team]}
+            for team in sorted(record.memberships)
+        ],
+        "created": list(record.created),
+    }
+
+
+def _account_from_doc(key: str, doc: dict[str, Any]) -> AccountRecord:
+    return AccountRecord(
+        key=key,
+        memberships={m["team"]: m["member"] for m in doc.get("memberships") or []},
+        created=list(doc.get("created") or []),
+    )
+
+
+def _admin_audit_to_doc(entry: AdminAuditEntry) -> dict[str, Any]:
+    return {
+        "time": entry.time,
+        "actor_email_sha256": entry.actor_email_sha256,
+        "action": entry.action,
+        "team": entry.team,
+        "outcome": entry.outcome,
+        "detail": entry.detail,
+        "expire_at": entry.expire_at,
+    }
+
+
+def _admin_audit_from_doc(doc: dict[str, Any]) -> AdminAuditEntry:
+    return AdminAuditEntry(
+        time=_dt(doc["time"]),  # type: ignore[arg-type]
+        actor_email_sha256=doc["actor_email_sha256"],
+        action=doc["action"],
+        team=doc["team"],
+        outcome=doc["outcome"],
+        detail=doc.get("detail"),
+        expire_at=_dt(doc["expire_at"]),  # type: ignore[arg-type]
+    )
+
+
 class FirestoreStore:
     def __init__(
         self,
@@ -548,6 +654,34 @@ class FirestoreStore:
 
     def _login_counter(self, key: str):
         return self._db().collection("login_limits").document(key)
+
+    def _account(self, key: str):
+        return self._db().collection("accounts").document(key)
+
+    def _pointer(self, key: str):
+        return self._db().collection("credential_teams").document(key)
+
+    def _admin_audit_col(self):
+        return self._db().collection("admin_audit")
+
+    async def _read_accounts(
+        self, txn: AsyncTransaction, keys: Sequence[str]
+    ) -> dict[str, AccountRecord | None]:
+        """The account documents ``keys`` (None for a missing one), read in ``txn``."""
+        keys = list(dict.fromkeys(keys))
+        found: dict[str, AccountRecord | None] = {key: None for key in keys}
+        if keys:
+            refs = [self._account(key) for key in keys]
+            async for snap in self._db().get_all(refs, transaction=txn):
+                if snap.exists:
+                    found[snap.id] = _account_from_doc(snap.id, snap.to_dict() or {})
+        return found
+
+    def _write_account(self, txn: AsyncTransaction, record: AccountRecord) -> None:
+        if record.memberships or record.created:
+            txn.set(self._account(record.key), _account_to_doc(record))
+        else:
+            txn.delete(self._account(record.key))
 
     # Transactions -------------------------------------------------------------------------
     async def _run[T](self, body: Callable[[AsyncTransaction], Awaitable[T]]) -> T:
@@ -947,7 +1081,9 @@ class FirestoreStore:
         snap = await self._team(team).get(field_paths=["roster_version"])
         return _int_field(snap, "roster_version")
 
-    async def _read_roster(self, txn: AsyncTransaction, team: str) -> RosterState:
+    async def _read_roster(
+        self, txn: AsyncTransaction, team: str
+    ) -> tuple[RosterState, TeamRecord | None]:
         snap = await self._team(team).get(transaction=txn)
         entries = {
             doc.id: _roster_from_doc(doc.to_dict() or {})
@@ -957,13 +1093,15 @@ class FirestoreStore:
             doc.id: _retired_from_doc(doc.to_dict() or {})
             async for doc in self._retired_col(team).stream(transaction=txn)
         }
-        return RosterState(
+        record = _team_from_doc(team, snap.to_dict() or {}) if snap.exists else None
+        state = RosterState(
             version=_int_field(snap, "roster_version"), entries=entries, retired=retired
         )
+        return state, record
 
     async def read_roster(self, team: str) -> RosterState:
         async def body(txn: AsyncTransaction) -> RosterState:
-            return await self._read_roster(txn, team)
+            return (await self._read_roster(txn, team))[0]
 
         return await self._run(body)
 
@@ -971,7 +1109,10 @@ class FirestoreStore:
         self, team: str, fn: RosterFn[T], now: datetime, quotas: Sequence[Quota] = ()
     ) -> RosterOutcome[T]:
         async def body(txn: AsyncTransaction) -> RosterOutcome[T]:
-            state = await self._read_roster(txn, team)
+            state, record = await self._read_roster(txn, team)
+            if record is not None and record.status == TEAM_DELETED:
+                raise TeamGone(team)
+            before = dict(state.entries)
             change = fn(state)
             if not change.changed:
                 return RosterOutcome(result=change.result, version=state.version, revoked=[])
@@ -987,13 +1128,19 @@ class FirestoreStore:
                     .where(filter=FieldFilter("member", "==", member))
                 )
                 async for snap in query.stream(transaction=txn):
-                    record = _credential_from_doc(snap.id, snap.to_dict() or {})
-                    if not record.live(now):
+                    cred = _credential_from_doc(snap.id, snap.to_dict() or {})
+                    if not cred.live(now):
                         continue
                     if member in change.remove or any(
-                        revocable_by_email(record, member, h) for h in by_email.get(member, ())
+                        revocable_by_email(cred, member, h) for h in by_email.get(member, ())
                     ):
-                        to_revoke.add(record.key)
+                        to_revoke.add(cred.key)
+            # M9-SPEC §1: the account index, for a team the API created only.
+            moved: dict[str, str | None] = {}
+            accounts: dict[str, AccountRecord | None] = {}
+            if record is not None and not record.seed:
+                moved = membership_changes(before, change.put, change.remove)
+                accounts = await self._read_accounts(txn, [account_key(e) for e in moved])
             # All reads are done; writes from here on.
             self._write_quotas(txn, team, quotas, counts)
             for key in sorted(to_revoke):
@@ -1004,7 +1151,20 @@ class FirestoreStore:
                 txn.set(self._roster_col(team).document(entry.member), _roster_to_doc(entry))
             for tomb in change.retire:
                 txn.set(self._retired_col(team).document(tomb.member), _retired_to_doc(tomb))
-            txn.set(self._team(team), {"roster_version": state.version + 1}, merge=True)
+            members, owners = roster_counts(before, change.put, change.remove)
+            txn.set(
+                self._team(team),
+                {"roster_version": state.version + 1, "members": members, "owners": owners},
+                merge=True,
+            )
+            for email, member in moved.items():
+                key = account_key(email)
+                account = accounts.get(key) or AccountRecord(key=key)
+                if member is None:
+                    account.memberships.pop(team, None)
+                else:
+                    account.memberships[team] = member
+                self._write_account(txn, account)
             self._write_audit(txn, change.audit)
             return RosterOutcome(
                 result=change.result, version=state.version + 1, revoked=sorted(to_revoke)
@@ -1012,16 +1172,261 @@ class FirestoreStore:
 
         return await self._run(body)
 
+    # Teams --------------------------------------------------------------------------------
+    async def get_teams(self, teams: Sequence[str]) -> dict[str, TeamRecord]:
+        ids = list(dict.fromkeys(teams))
+        if not ids:
+            return {}
+        found: dict[str, TeamRecord] = {}
+        async for snap in self._db().get_all([self._team(t) for t in ids]):
+            if snap.exists:
+                found[snap.id] = _team_from_doc(snap.id, snap.to_dict() or {})
+        return {t: found[t] for t in ids if t in found}
+
+    async def list_teams(self, after: str | None, limit: int) -> list[TeamRecord]:
+        out: list[TeamRecord] = []
+        position = after
+        while len(out) < limit:
+            query = self._db().collection("teams").order_by(FieldPath.document_id())
+            if position is not None:
+                query = query.where(
+                    filter=FieldFilter(FieldPath.document_id(), ">", self._team(position))
+                )
+            page = [snap async for snap in query.limit(_TEAM_PAGE).stream()]
+            for snap in page:
+                position = snap.id
+                record = _team_from_doc(snap.id, snap.to_dict() or {})
+                if not record.seed:
+                    out.append(record)
+                    if len(out) >= limit:
+                        break
+            if len(page) < _TEAM_PAGE:
+                break
+        return out
+
+    async def ensure_seed_team(self, team: str, name: str, now: datetime) -> TeamRecord:
+        async def body(txn: AsyncTransaction) -> TeamRecord:
+            snap = await self._team(team).get(transaction=txn)
+            doc = (snap.to_dict() or {}) if snap.exists else {}
+            record = _team_from_doc(team, doc)
+            if record.status == TEAM_DELETED:
+                return record
+            update: dict[str, Any] = {}
+            if doc.get("id") != team:
+                update["id"] = team
+            if doc.get("status") is None:
+                update["status"] = TEAM_ACTIVE
+            if doc.get("seed") is not True:
+                update["seed"] = True
+            if doc.get("created_at") is None:
+                update["created_at"] = now
+                update["name"] = name
+            if doc.get("members") is None or doc.get("owners") is None:
+                entries = {
+                    e.id: _roster_from_doc(e.to_dict() or {})
+                    async for e in self._roster_col(team).stream(transaction=txn)
+                }
+                update["members"], update["owners"] = roster_counts(entries, [], [])
+            if update:
+                txn.set(self._team(team), update, merge=True)
+            return _team_from_doc(team, {**doc, **update})
+
+        return await self._run(body)
+
+    async def create_team[T](
+        self, team: str, email_sha256: str, fn: TeamCreateFn[T], quotas: Sequence[Quota] = ()
+    ) -> T:
+        async def body(txn: AsyncTransaction) -> T:
+            snap = await self._team(team).get(transaction=txn)
+            current = _team_from_doc(team, snap.to_dict() or {}) if snap.exists else None
+            creator = (await self._read_accounts(txn, [email_sha256]))[email_sha256]
+            creation = fn(current, creator)
+            if creation.team is None:
+                return creation.result
+            if creation.team.id != team:
+                raise RuntimeError("a creation may only write its own team")
+            owner = creation.owner
+            owner_keys = [account_key(e) for e in owner.emails] if owner is not None else []
+            others = await self._read_accounts(txn, [k for k in owner_keys if k != email_sha256])
+            counts = []
+            for quota in quotas:  # relay-wide counters; raising writes nothing
+                qsnap = await self._login_counter(quota.key).get(transaction=txn)
+                count = _int_field(qsnap, "count")
+                if count >= quota.limit:
+                    raise QuotaExceeded(quota)
+                counts.append(count)
+            # All reads are done; writes from here on.
+            for quota, count in zip(quotas, counts, strict=True):
+                txn.set(
+                    self._login_counter(quota.key),
+                    {"count": count + 1, "expire_at": quota.expire_at},
+                )
+            txn.set(self._team(team), _team_to_doc(creation.team))
+            if owner is not None:
+                txn.set(self._roster_col(team).document(owner.member), _roster_to_doc(owner))
+            accounts = {email_sha256: creator or AccountRecord(key=email_sha256)}
+            for key, record in others.items():
+                accounts[key] = record or AccountRecord(key=key)
+            if team not in accounts[email_sha256].created:
+                accounts[email_sha256].created.append(team)
+            if owner is not None:
+                for key in owner_keys:
+                    accounts[key].memberships[team] = owner.member
+            for record in accounts.values():
+                self._write_account(txn, record)
+            self._write_audit(txn, creation.audit)
+            for entry in creation.admin_audit:
+                txn.set(self._admin_audit_col().document(), _admin_audit_to_doc(entry))
+            return creation.result
+
+        return await self._run(body)
+
+    async def delete_team[T](self, team: str, fn: TeamDeleteFn[T]) -> T:
+        async def body(txn: AsyncTransaction) -> T:
+            snap = await self._team(team).get(transaction=txn)
+            current = _team_from_doc(team, snap.to_dict() or {}) if snap.exists else None
+            creator_key = current.created_by_email_sha256 if current is not None else None
+            creator = None
+            if creator_key:
+                creator = (await self._read_accounts(txn, [creator_key]))[creator_key]
+            deletion = fn(current)
+            # All reads are done; writes from here on.
+            if deletion.team is not None:
+                if deletion.team.id != team:
+                    raise RuntimeError("a deletion may only write its own team")
+                was_deleted = current is not None and current.status == TEAM_DELETED
+                txn.set(self._team(team), _team_to_doc(deletion.team))
+                if deletion.team.status == TEAM_DELETED and not was_deleted and creator:
+                    if team in creator.created:
+                        creator.created.remove(team)
+                        self._write_account(txn, creator)
+            for entry in deletion.admin_audit:
+                txn.set(self._admin_audit_col().document(), _admin_audit_to_doc(entry))
+            return deletion.result
+
+        return await self._run(body)
+
+    async def _still_deleted(self, txn: AsyncTransaction, team: str) -> bool:
+        snap = await self._team(team).get(transaction=txn)
+        return snap.exists and (snap.to_dict() or {}).get("status") == TEAM_DELETED
+
+    async def _purge_roster(self, team: str) -> int | None:
+        """Delete every roster entry and take its emails' memberships of ``team`` off the
+        account index, in one transaction (a team has at most 50 entries). None when the
+        team is not deleted."""
+
+        async def body(txn: AsyncTransaction) -> int | None:
+            if not await self._still_deleted(txn, team):
+                return None
+            entries = {
+                e.id: _roster_from_doc(e.to_dict() or {})
+                async for e in self._roster_col(team).stream(transaction=txn)
+            }
+            keys = [account_key(email) for entry in entries.values() for email in entry.emails]
+            accounts = await self._read_accounts(txn, keys)
+            # All reads are done; writes from here on.
+            for record in accounts.values():
+                if record is not None and team in record.memberships:
+                    record.memberships.pop(team)
+                    self._write_account(txn, record)
+            for member in entries:
+                txn.delete(self._roster_col(team).document(member))
+            return len(entries)
+
+        return await self._run(body)
+
+    async def _purge_batch(self, team: str, refs: Sequence[Any]) -> bool:
+        async def body(txn: AsyncTransaction) -> bool:
+            if not await self._still_deleted(txn, team):
+                return False
+            for ref in refs:
+                txn.delete(ref)
+            return True
+
+        return await self._run(body)
+
+    async def _descendants(self, team: str, limit: int) -> list[Any]:
+        """Up to ``limit`` document references anywhere under ``teams/{team}``."""
+        refs: list[Any] = []
+        async for collection in self._team(team).collections():
+            if len(refs) >= limit:
+                break
+            query = (
+                collection.recursive().select([FieldPath.document_id()]).limit(limit - len(refs))
+            )
+            refs.extend([snap.reference async for snap in query.stream()])
+        return refs
+
+    async def purge_team(self, team: str, budget: int) -> bool:
+        removed = await self._purge_roster(team)
+        if removed is None:
+            return False
+        # Credentials with their pointers, then everything else under the team.
+        credentials = self._team(team).collection("credentials")
+        while removed < budget:
+            size = min(PURGE_BATCH // 2, budget - removed)
+            query = credentials.select([FieldPath.document_id()]).limit(size)
+            snaps = [snap async for snap in query.stream()]
+            if not snaps:
+                break
+            refs = [snap.reference for snap in snaps] + [self._pointer(s.id) for s in snaps]
+            if not await self._purge_batch(team, refs):
+                return False
+            removed += len(snaps)
+        while removed < budget:
+            refs = await self._descendants(team, min(PURGE_BATCH, budget - removed))
+            if not refs:
+                break
+            if not await self._purge_batch(team, refs):
+                return False
+            removed += len(refs)
+        if await self._descendants(team, 1):
+            return False
+
+        async def mark(txn: AsyncTransaction) -> bool:
+            if not await self._still_deleted(txn, team):
+                return False
+            txn.update(self._team(team), {"purge_complete": True})
+            return True
+
+        return await self._run(mark)
+
+    async def get_account(self, email_sha256: str) -> AccountRecord | None:
+        snap = await self._account(email_sha256).get()
+        return _account_from_doc(snap.id, snap.to_dict() or {}) if snap.exists else None
+
+    async def append_admin_audit(self, entries: Sequence[AdminAuditEntry]) -> None:
+        if not entries:
+            return
+        batch = self._db().batch()
+        for entry in entries:
+            batch.set(self._admin_audit_col().document(), _admin_audit_to_doc(entry))
+        await batch.commit()
+
+    async def list_admin_audit(self, limit: int = 1000) -> list[AdminAuditEntry]:
+        query = self._admin_audit_col().order_by("time").limit(limit)
+        return [_admin_audit_from_doc(snap.to_dict() or {}) async for snap in query.stream()]
+
     # Device credentials -------------------------------------------------------------------
     async def find_credential(self, teams: Sequence[str], key: str) -> CredentialRecord | None:
-        if not teams:
-            return None
+        teams = list(dict.fromkeys(teams))
         found: dict[str, CredentialRecord] = {}
-        async for snap in self._db().get_all([self._credential(t, key) for t in teams]):
-            if snap.exists:
-                record = _credential_from_doc(snap.id, snap.to_dict() or {})
+        pointer: str | None = None
+        refs = [self._credential(t, key) for t in teams] + [self._pointer(key)]
+        async for snap in self._db().get_all(refs):
+            if not snap.exists:
+                continue
+            doc = snap.to_dict() or {}
+            if snap.reference.parent.id == "credential_teams":
+                pointer = doc.get("team") if isinstance(doc.get("team"), str) else None
+            else:
+                record = _credential_from_doc(snap.id, doc)
                 found[record.team] = record
-        return next((found[t] for t in teams if t in found), None)
+        hit = next((found[t] for t in teams if t in found), None)
+        if hit is not None or pointer is None or pointer in teams:
+            return hit
+        snap = await self._credential(pointer, key).get()
+        return _credential_from_doc(snap.id, snap.to_dict() or {}) if snap.exists else None
 
     async def touch_credential(
         self, team: str, key: str, last_used_at: datetime, expire_at: datetime
@@ -1032,6 +1437,7 @@ class FirestoreStore:
             if not snap.exists or (snap.to_dict() or {}).get("revoked"):
                 return
             txn.update(ref, {"last_used_at": last_used_at, "expire_at": expire_at})
+            txn.set(self._pointer(key), {"team": team, "expire_at": expire_at})
 
         await self._run(body)
 
@@ -1087,6 +1493,8 @@ class FirestoreStore:
             ref = self._code(key)
             snap = await ref.get(transaction=txn)
             plan = fn(_code_from_doc(key, snap.to_dict() or {}) if snap.exists else None)
+            if plan.credential is not None and await self._still_deleted(txn, plan.credential.team):
+                raise TeamGone(plan.credential.team)  # M9-SPEC §1: before any write
             over: list[CredentialRecord] = []
             reused: CredentialRecord | None = None
             if plan.code is not None and plan.code.key != key:
@@ -1123,6 +1531,10 @@ class FirestoreStore:
                 txn.create(
                     self._credential(plan.credential.team, plan.credential.key),
                     _credential_to_doc(plan.credential),
+                )
+                txn.set(
+                    self._pointer(plan.credential.key),
+                    {"team": plan.credential.team, "expire_at": plan.credential.expire_at},
                 )
             self._write_audit(txn, plan.audit)
             return RedeemOutcome(result=plan.result, revoked=revoked)
