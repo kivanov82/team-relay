@@ -7,19 +7,21 @@ answer is pushed into the asker's session over a Claude Code channel. The contra
 §2 and §4 (Google identity, tool events, the console), `../docs/M4-SPEC.md` (what the
 answering session may read, and how a member grants more), `../docs/M5-SPEC.md` (install
 with no questions, sign in with `/team-relay:login`, and its §9 corrections after the security
-review), `../docs/M6-SPEC.md` (owners manage members in the console) and
-`../docs/M7-SPEC.md` §2 (say when questions are waiting).
+review), `../docs/M6-SPEC.md` (owners manage members in the console),
+`../docs/M7-SPEC.md` §2 (say when questions are waiting) and `../docs/M8-SPEC.md` (answers
+ship on their own, within the folder you are working in).
 
-Each member runs two sessions:
-
-- **Working session** (your normal `claude`): the plugin's `relay` channel in *asker* role.
-  Tools `list_teammates`, `ask_question`, `invoke_capability`, `request_status`, and
-  `login`, `login_wait`, `whoami` for signing in (signing out is the `/team-relay:logout`
-  command, never a tool); answers,
-  "no response yet" and "acknowledged but not answered" notices arrive as
-  `<channel source="relay" ...>` events, in a session started with the channel (below).
-- **Answering session** (`bin/answerer`): a separate, locked-down `claude` that receives
-  teammates' questions and capability calls, acknowledges, answers and replies.
+- **Working session** (your normal `claude`, started with the channel): the plugin's `relay`
+  channel in *asker* role. Tools `list_teammates`, `ask_question`, `invoke_capability`,
+  `request_status`, `login`, `login_wait`, `whoami` and `review_approvals` (signing out is the
+  `/team-relay:logout` command, never a tool); answers, "no response yet" and "acknowledged
+  but not answered" notices arrive as `<channel source="relay" ...>` events. **It also answers
+  your teammates on its own** (M8, below): each question runs a short-lived, locked-down
+  headless Claude in the session's folder; ordinary answers ship automatically, anything else
+  waits for you (`/team-relay:approvals`).
+- **Answering session** (`bin/answerer`, optional since M8): a separate, locked-down
+  interactive `claude` that receives teammates' questions and capability calls, acknowledges,
+  answers and replies, in its own terminal. Only one answerer runs per computer.
 
 ## Install
 
@@ -41,7 +43,8 @@ Commands (`commands/*.md`, namespaced by the plugin name):
 |---|---|
 | `/team-relay:login` | Calls the `login` tool, which takes no arguments: signs this computer in to the configured relay (below). |
 | `/team-relay:logout` | Runs `node "${CLAUDE_PLUGIN_ROOT}/dist/logout.js"` itself (the `` !`…` `` form, when the command expands): revokes this computer's credential at its relay, then deletes it. |
-| `/team-relay:answering` | Prints the one command that starts your answering session (`"${CLAUDE_PLUGIN_ROOT}/bin/answerer"`), and the settings that share folders and offer capabilities (generated from `manifest.yaml`). |
+| `/team-relay:approvals` | Calls the `review_approvals` tool (no arguments): each answer or step waiting for your approval opens as a dialog (MCP elicitation), and you decide there (M8, below). |
+| `/team-relay:answering` | Optional: prints the one command that starts a manual answering session (`"${CLAUDE_PLUGIN_ROOT}/bin/answerer"`), and the settings that share folders and offer capabilities (generated from `manifest.yaml`). |
 | `/team-relay:console` | Prints the command that opens the local console (`"${CLAUDE_PLUGIN_ROOT}/bin/console" --open`). |
 
 Every command is `disable-model-invocation: true`: only you run them, never the model on its
@@ -186,7 +189,134 @@ it needs `RELAY_TEAM` (and `RELAY_URL` for another relay). `token` is for the lo
 and tests only (the relay refuses static tokens on Cloud Run). Unset, the credential file is
 used when there is one, else `google`.
 
+## Answering automatically (M8-SPEC)
+
+A channel working session answers the questions and capability calls teammates send you, on
+its own, within the folder it works in. Nothing to start; `TEAM_RELAY_AUTO_ANSWER=0` in the
+environment Claude Code starts with turns it off for that session.
+
+**Who answers.** One answerer per computer: the session that holds
+`~/.config/team-relay/answering.lock` (`$XDG_CONFIG_HOME/team-relay/…` when that is set; an
+exclusively created file holding the pid, stale when that pid is gone, broken under a second
+exclusive file so two sessions cannot both take a stale one). Only the holder reads your
+`inbox` stream. A second channel session does not answer (its `whoami` says who does) and
+takes over within 30 s of the first one ending. `bin/answerer` refuses to start while a
+working session answers, and its channel server takes the same lock, so the two never both
+consume your inbox.
+
+**The scope folder** is the session's working directory, resolved (symlinks). Its name is
+published as your shared folder while the session answers. It must not be `/`, `$HOME` or
+above it, nor inside the credential deny list, `~/.claude`, `$CLAUDE_CONFIG_DIR`,
+`~/.claude-team-relay` or the team relay's config directory; then the session still answers,
+but reads nothing without asking, and shares no folder.
+
+**One question, one short-lived answerer.** For each question the host acks at the relay at
+once (the asker sees "acknowledged"), then, one at a time, runs:
+
+```
+cd <scope folder>   # or, when it does not qualify, an empty private directory
+claude -p --output-format json --mcp-config <run>/mcp.json --strict-mcp-config \
+  --settings <run>/settings.json --setting-sources '' --permission-mode default \
+  --permission-prompt-tool mcp__host__permission --no-session-persistence \
+  --tools Read,Glob,Grep --append-system-prompt '<fixed rubric>' \
+  --disallowedTools Bash Write Edit NotebookEdit WebFetch WebSearch Agent Task
+```
+
+with the question on stdin (never in a process argument), framed between markers made of a
+random nonce as teammate data. `node dist/answer-dry-run.js` in a folder prints exactly this
+for that folder (with the settings and MCP config); `--run --offline` also runs it against a
+closed local API port, so Claude Code parses every flag, loads both MCP servers and binds the
+permission tool without a model call. What was checked against Claude Code 2.1.282 and its
+docs (24 Sep 2026):
+
+- `-p` uses your normal login (OAuth or keychain; only `--bare` would skip it). The run's
+  environment is yours reduced to what Claude Code needs to run and sign in (`PATH`, `HOME`,
+  locale, proxies, `ANTHROPIC_*`, `CLAUDE_CODE_USE_{VERTEX,BEDROCK,FOUNDRY}`, cloud provider
+  settings, `CLAUDE_CONFIG_DIR`): nothing of the working session (its session ids, messaging
+  socket) and nothing of the relay's sign-in reaches it. Auto memory is off
+  (`CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`).
+- `--setting-sources ''` is accepted and loads no user, project or local settings: none of
+  your hooks, no plugin you installed (the run's init lists only Claude Code's built-in ones),
+  no CLAUDE.md, and nothing from the folder's own `.claude/` or `.mcp.json`. `--settings`
+  still applies, and its hooks run. `--strict-mcp-config` keeps every MCP server but the two
+  below out.
+- Without `--tools`, a `-p` session also has scheduling, messaging, remote-trigger, workflow,
+  worktree and skill tools; `--tools Read,Glob,Grep` leaves exactly those three built-ins
+  (MCP tools are unaffected).
+- `--permission-prompt-tool`: Claude Code calls `mcp__host__permission` with `{tool_name,
+  input, tool_use_id}` for any tool use no rule decides (deny rules are applied first) and
+  expects one text block with `{"behavior":"allow","updatedInput":<input>}` or
+  `{"behavior":"deny","message":"…"}`; anything else is a deny.
+- In the default permission mode a read inside the working directory needs no approval, and a
+  symlink inside it that points outside still prompts; deny rules match either the link or its
+  target.
+
+`mcp.json` (mode 600 in a mode-700 private directory the run cannot read) has exactly two
+servers: `host` (`dist/answer-tools.js`: `reply`, `request_approval`, `permission`), which
+talks back to the host over a Unix socket (mode 600, in a mode-700 `mkdtemp` directory) and
+must first present that run's own 32-byte token; and `capabilities` (the M1 capability server),
+when you enabled any capability (`CAP_<NAME>_ENABLED` and `CAP_<NAME>_RUNNER` in the
+environment your working session starts with). `settings.json` allows `mcp__host__reply`,
+`mcp__host__request_approval` and `Read(//<scope>/**)` (when the folder qualifies), and denies
+the tools above plus the whole credential deny list of `bin/answerer` (it applies inside the
+folder too: `.env`, `*.pem`, `credentials.json` …), the host's private directory, the relay
+credential and `$CLAUDE_CONFIG_DIR`. Its only hooks post tool events (name, outcome,
+duration) for the asker's console. A run has 10 minutes of its own time (time spent waiting
+for you does not count) and ends with the question's answer deadline.
+
+**What ships on its own, and what waits for you** (§3), decided by the host, not the model:
+
+| Ships automatically | Waits for your approval |
+|---|---|
+| Reading files inside the scope folder (minus the deny list) | Any read outside it, and every capability tool: the `permission` tool holds the call |
+| An answer the answerer did not flag, that passes the secret screen, when nothing needed approval during the run | An answer the answerer flags (`needs_approval`: people, customers, credentials, infrastructure, production, not grounded, unsure) or asks approval for (`request_approval`) |
+| | An answer the secret screen flags (private keys; provider tokens and API keys by prefix and entropy; `.env`-style `KEY=value` with secret-like keys; connection strings with a password) |
+| | An answer produced after anything needed approval during the run |
+
+Denied without asking you: credential paths (even when the model names them), any other
+built-in tool, a capability tool for a question (capabilities run only for a capability call,
+with exactly its params and request id). A capability call therefore asks you twice: before
+it runs, and before its result is sent.
+
+**Deciding.** When something starts waiting, the working session gets a status event
+(`team-relay: alice asked: "…" — an answer is waiting for your approval (1 pending). Run
+/team-relay:approvals.`; the question is quoted as teammate data, on one line, neutralised
+and cut at 200 characters), a desktop notification with a fixed text, and the asker's console
+a `waiting` tool event ("waiting for bob"). `/team-relay:approvals` then shows each item as a
+dialog (MCP elicitation: Claude Code 2.1.282 advertises it and renders flat forms of strings,
+numbers, booleans and single-choice enums): the teammate's text quoted, what is asked (the
+path, the capability and its params, or the draft exactly as it would be sent), and one
+choice: Allow / Deny, or Send / Don't send / Decline politely ("I couldn't answer this
+automatically; <you> hasn't approved it."). The dialog's own Decline or Esc leaves it pending.
+The decision is yours, in the dialog: the model that runs the command only gets the counts.
+A Claude Code without elicitation gets the approvals on a local page instead (127.0.0.1, a
+random port and a per-launch key, the console server's rules), opened in your browser through
+the same private redirect file as `bin/console --open`; the command says so. Anything you have
+not decided is denied when the question's answer deadline passes or after 30 minutes,
+whichever is sooner; a lapse sends nothing (the relay's "acknowledged but not answered"
+applies).
+
+**Seeing it.** `whoami` adds `answering_automatically`, `answering_folder`,
+`approvals_pending` and `approvals_notice`; the SessionStart line of any session says "N
+answers waiting for your approval: run /team-relay:approvals in your channel working
+session"; the local console's header shows the count (`GET /api/approvals/summary`, answered
+by the console server from `~/.config/team-relay/approvals.json`, which holds only the host's
+pid and the count). The hosted console cannot see a laptop's queue: it shows the `waiting`
+tool events.
+
+| Variable (in the environment Claude Code starts with) | |
+|---|---|
+| `TEAM_RELAY_AUTO_ANSWER=0` | this channel session does not answer automatically |
+| `TEAM_RELAY_CLAUDE_BIN` | absolute path of the `claude` to run (default: `claude` on `PATH`) |
+| `TEAM_RELAY_ANSWER_MODEL` | a model for the answerer (default: Claude Code's) |
+| `TEAM_RELAY_DESKTOP_NOTIFY=0` | no desktop notification (the status event still comes) |
+| `CAP_<NAME>_ENABLED`, `CAP_<NAME>_RUNNER`, `ALLOW_PRODUCTION`, `MANIFEST_PATH` | the capabilities you offer, as for `bin/answerer` |
+
 ## Running the answering session
+
+Optional since M8: a channel working session answers on its own (above). The manual session
+is the alternative when you want to answer in a terminal of your own; start your working
+sessions with `TEAM_RELAY_AUTO_ANSWER=0`, since only one answerer runs per computer.
 
 ```
 # after /team-relay:login: no relay settings needed
@@ -525,7 +655,13 @@ fetches a fresh one once when the relay answers 401.
 - **The answering session reads nothing by default**: only folders you share, and files or
   folders you allow in Claude Code's own dialog for that session; credential stores stay
   denied whatever you answer. These are permission rules, not an OS sandbox (see above).
-- **The desktop notice is fixed text**; no teammate or hook-input text reaches it.
+- **Automatic answers stay in the folder** (M8): the answerer reads the scope folder minus
+  the deny list and nothing else without your decision; it has no shell, no writing or
+  editing and no web; its settings, hooks, plugins and MCP servers are only the plugin's own.
+  What it sends is decided by the host's table above, never by the model alone, and nothing
+  it wants beyond that happens before you decide in a dialog (or the local page) that the
+  model cannot answer for you. A tool call approves nothing; unanswered approvals are denied.
+- **The desktop notices are fixed text**; no teammate or hook-input text reaches them.
 - **Tool events carry a name, an outcome (`ok`, `error`, or `waiting` for your permission)
   and a duration**, never a tool's input, output, error text or path.
 - Network errors, 5xx and 429 (`rate_limited`, `too_many_polls`) are retried with
@@ -537,17 +673,20 @@ fetches a fresh one once when the relay answers 401.
 pnpm install
 pnpm typecheck
 pnpm test             # builds dist/ first; the stdio suites drive node dist/*.js
-pnpm build            # esbuild → dist/{channel,capabilities,session-start,tool-event,notify-desktop,console-server,credential-info,logout}.js (committed); never touches dist/console/
+pnpm build            # esbuild → dist/{channel,capabilities,session-start,tool-event,notify-desktop,console-server,credential-info,logout,answer-tools,answering-lock-info,answer-dry-run}.js (committed); never touches dist/console/
 pnpm generate         # manifest.yaml → commands/answering.md, and plugin.json (no userConfig) and .mcp.json
 pnpm generate --check # fails when those files are out of date
-../scripts/e2e.sh     # the M1 gate, the M2 scenarios, and the M5/M6 sign-in and roster scenarios when the relay serves them
+../scripts/e2e.sh     # the M1 gate, the M2 scenarios, the M5/M6 sign-in and roster scenarios when the relay serves them, M7 and M8
 ```
 
 `pnpm test` never runs `test/e2e/`. `../scripts/e2e.sh` (Docker and `../relay/.venv` needed)
 starts a Firestore emulator on 127.0.0.1:8682 and the relay with throwaway static tokens and a
 fake Google sign-in (`relay/tests/fake_oauth_app.py`), builds `dist/`, runs `pnpm test:e2e`
 with `E2E=1`, and tears everything down on exit. The sign-in scenarios drive the real login
-tool with a headless stub browser (`test/fixtures/fake-browser.mjs`).
+tool with a headless stub browser (`test/fixtures/fake-browser.mjs`). The automatic answerer's
+tests (`test/answer-host.test.ts`, `test/e2e/m8.test.ts`) run the host with a stub `claude`
+(`test/fixtures/stub-claude.mjs`, through `TEAM_RELAY_CLAUDE_BIN`) that reads the prompt, starts
+the run's MCP servers and calls the host's tools as the question scripts it; no model is called.
 
 After changing `manifest.yaml`, run `pnpm generate` and commit the result; after changing
 `src/`, run `pnpm build` and commit `dist/`.
