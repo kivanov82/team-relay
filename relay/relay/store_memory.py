@@ -241,7 +241,15 @@ class MemoryStore:
 
     # Streams --------------------------------------------------------------------------
     async def read_stream(
-        self, team: str, member: str, stream: str, after: int | None, limit: int, now: datetime
+        self,
+        team: str,
+        member: str,
+        stream: str,
+        after: int | None,
+        limit: int,
+        now: datetime,
+        *,
+        advance: bool = True,
     ) -> StreamPage:
         async with self._lock:
             state = self._streams.get((team, member, stream), _Stream())
@@ -260,7 +268,7 @@ class MemoryStore:
                     out.append(copy.deepcopy(env))
                 elif not out:
                     expired_through = seq
-            if start == state.cursor and expired_through > state.cursor:
+            if advance and start == state.cursor and expired_through > state.cursor:
                 self._advance(team, state, expired_through, now)  # (§11.5) under the lock
             return StreamPage(messages=out, cursor=state.cursor, head=state.head)
 

@@ -324,8 +324,8 @@ async def test_the_read_budget_is_configurable_and_per_member(memory_store, cloc
         assert r.status_code == 429
         assert r.json() == {
             "error": "rate_limited",
-            "detail": "At most 3 reads of the activity feed and the directory a minute; "
-            "try again shortly.",
+            "detail": "At most 3 reads of the activity feed, the directory and the inbox "
+            "summary a minute; try again shortly.",
         }
         assert (await get(c, "bob", "/directory")).status_code == 200
         clock.advance(60)

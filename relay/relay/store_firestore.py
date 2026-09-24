@@ -795,7 +795,15 @@ class FirestoreStore:
 
     # Streams ------------------------------------------------------------------------------
     async def read_stream(
-        self, team: str, member: str, stream: str, after: int | None, limit: int, now: datetime
+        self,
+        team: str,
+        member: str,
+        stream: str,
+        after: int | None,
+        limit: int,
+        now: datetime,
+        *,
+        advance: bool = True,
     ) -> StreamPage:
         ref = self._stream(team, member, stream)
         snap = await ref.get()
@@ -832,7 +840,7 @@ class FirestoreStore:
                 break
             # Past a full page of expired envelopes, read bigger pages: fewer round trips.
             page = min(page * 2, _MAX_SCAN_PAGE)
-        if start == cursor and expired_through > cursor:
+        if advance and start == cursor and expired_through > cursor:
             cursor = await self._advance_cursor(team, ref, expired_through, now)
         return StreamPage(messages=out, cursor=cursor, head=head)
 

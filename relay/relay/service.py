@@ -94,6 +94,13 @@ STATS_READ_CAP = 500
 STATS_CACHE_TTL = timedelta(seconds=10)
 
 
+# M7-SPEC §1, the inbox summary: at most this many waiting messages are read (a count at the
+# cap is reported with "more" when the stream holds later ones), and at most this many
+# distinct senders are named.
+INBOX_SUMMARY_CAP = 50
+INBOX_SUMMARY_SENDERS = 5
+
+
 EMPTY_STATS: dict[str, Any] = {
     "asked": 0,
     "answered": 0,
@@ -130,11 +137,13 @@ class Caller:
 
 @dataclass(frozen=True)
 class _TeamStats:
-    """One team's directory stats as computed at ``at`` (M2-SPEC §7.3)."""
+    """One team's directory stats as computed at ``at`` (M2-SPEC §7.3), with each member's
+    count of waiting inbox messages (M7-SPEC §1), cached with them."""
 
     at: datetime
     members: dict[str, dict[str, Any]]
     complete: bool
+    waiting: dict[str, int]
 
 
 def new_request_id() -> str:
@@ -415,7 +424,8 @@ class RelayService:
         raise ApiError(
             429,
             "rate_limited",
-            f"At most {limit} reads of the activity feed and the directory a minute; "
+            f"At most {limit} reads of the activity feed, the directory and the inbox summary "
+            "a minute; "
             "try again shortly.",
         )
 
@@ -443,6 +453,8 @@ class RelayService:
                     },
                     # A member added since the cached stats were computed has none yet.
                     "stats": dict(stats.members.get(m) or EMPTY_STATS),
+                    # M7-SPEC §1: unexpired messages past their inbox cursor, at most 50.
+                    "inbox_waiting": stats.waiting.get(m, 0),
                 }
             )
         # False when the 24-hour window held more requests than one stats read covers
@@ -459,10 +471,47 @@ class RelayService:
         cached = self._stats_cache.get(team)
         if cached is not None and timedelta(0) <= now - cached.at < STATS_CACHE_TTL:
             return cached
-        members, complete = await self._stats(team, list(await self._members(team)), now)
-        fresh = _TeamStats(at=now, members=members, complete=complete)
+        roster = list(await self._members(team))
+        members, complete = await self._stats(team, roster, now)
+        waiting: dict[str, int] = {}
+        for m in roster:
+            messages, _ = await self._inbox_waiting(team, m, now)
+            waiting[m] = len(messages)
+        fresh = _TeamStats(at=now, members=members, complete=complete, waiting=waiting)
         self._stats_cache[team] = fresh
         return fresh
+
+    async def _inbox_waiting(
+        self, team: str, member: str, now: datetime
+    ) -> tuple[list[Envelope], bool]:
+        """M7-SPEC §1: the unexpired messages after the member's inbox cursor, at most
+        INBOX_SUMMARY_CAP, oldest first, and whether the stream holds later ones beyond that
+        read. A peek: it never moves the cursor, stamps nothing and writes no presence."""
+        page = await self.store.read_stream(
+            team, member, "inbox", None, INBOX_SUMMARY_CAP, now, advance=False
+        )
+        messages = page.messages
+        more = len(messages) >= INBOX_SUMMARY_CAP and messages[-1].seq < page.head
+        return messages, more
+
+    async def inbox_summary(self, caller: Caller) -> dict[str, Any]:
+        """M7-SPEC §1: what waits in the caller's inbox for their answering session, and when
+        that session last polled. Counts against the read budget; never writes presence and
+        never moves a cursor, so any session (or a delegate) may ask."""
+        await self._count_read(caller, "inbox_summary")
+        now = self.now()
+        messages, more = await self._inbox_waiting(caller.team, caller.member, now)
+        docs = await self.store.get_members(caller.team, [caller.member])
+        doc = docs.get(caller.member)
+        answering = doc.presence.get("inbox") if doc else None
+        senders = list(dict.fromkeys(env.sender for env in messages))[:INBOX_SUMMARY_SENDERS]
+        return {
+            "pending": len(messages),
+            "more": more,
+            "oldest_at": format_time(messages[0].time) if messages else None,
+            "from": senders,
+            "answering": {"last_seen": format_time(answering)},
+        }
 
     async def _stats(
         self, team: str, members: list[str], now: datetime

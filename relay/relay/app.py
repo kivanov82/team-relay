@@ -60,7 +60,7 @@ MAX_BODY_BYTES = 256 * 1024
 
 ON_BEHALF_HEADER = "x-relay-on-behalf-of"
 MAX_ON_BEHALF_LENGTH = 320
-# M3-SPEC §2: the console's four reads, by route template. Nothing that moves presence or
+# M3-SPEC §2: the console's reads, by route template. Nothing that moves presence or
 # cursors (stream reads) and nothing that writes.
 DELEGATE_ROUTES = frozenset(
     {
@@ -70,6 +70,9 @@ DELEGATE_ROUTES = frozenset(
         "/v1/teams/{team}/requests/{request_id}",
         # M6-SPEC §3: the console's Members panel reads the roster (masked as for the member).
         "/v1/teams/{team}/roster",
+        # M7-SPEC §1: what waits for the member's answering session. A peek, not a stream
+        # read: it moves no cursor and writes no presence.
+        "/v1/teams/{team}/inbox/summary",
     }
 )
 # M6-SPEC §3: with scope manage-roster, a delegate may also make these, by (method, route).
@@ -490,6 +493,10 @@ def create_app(
     async def activity(request: Request, caller: Caller = CallerDep) -> dict[str, Any]:
         q = request.query_params
         return await service.activity(caller, q.get("since"), q.get("limit"))
+
+    @app.get("/v1/teams/{team}/inbox/summary")
+    async def inbox_summary(caller: Caller = CallerDep) -> dict[str, Any]:
+        return await service.inbox_summary(caller)
 
     @app.post("/v1/teams/{team}/requests")
     async def create_request(request: Request, caller: Caller = CallerDep) -> JSONResponse:

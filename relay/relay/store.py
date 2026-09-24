@@ -580,7 +580,15 @@ class Store(Protocol):
 
     # Streams -------------------------------------------------------------------------
     async def read_stream(
-        self, team: str, member: str, stream: str, after: int | None, limit: int, now: datetime
+        self,
+        team: str,
+        member: str,
+        stream: str,
+        after: int | None,
+        limit: int,
+        now: datetime,
+        *,
+        advance: bool = True,
     ) -> StreamPage:
         """Up to ``limit`` unexpired envelopes with seq > ``after`` (None: the stored
         cursor) and seq <= head, ascending, skipping expired ones (TTL deletion is lazy),
@@ -591,7 +599,10 @@ class Store(Protocol):
         envelopes the scan found right after it: they can never be delivered. It never moves
         past an unexpired envelope. The returned cursor is the stored one after that move.
         That move is a cursor advance like :meth:`set_cursor`'s and stamps deliveries the
-        same way, in the same transaction (M2-SPEC §3.2)."""
+        same way, in the same transaction (M2-SPEC §3.2).
+
+        With ``advance=False`` (a peek: M7-SPEC §1, the inbox summary) nothing is written:
+        the cursor never moves and nothing is stamped."""
         ...
 
     async def set_cursor(

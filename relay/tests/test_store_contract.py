@@ -496,6 +496,20 @@ async def test_the_cursor_skips_only_the_contiguous_expired_run(store: Store, te
     assert [e.seq for e in page.messages] == [7] and page.cursor == 6
 
 
+async def test_a_peek_never_moves_the_cursor_or_stamps(store: Store, team: str):
+    """M7-SPEC §1: ``advance=False`` reads what a read from the cursor would, writing nothing."""
+    await _append(store, team, [EXPIRED] * 3 + [LIVE] + [EXPIRED] + [LIVE])
+    for _ in range(2):
+        page = await store.read_stream(team, "bob", "inbox", None, 50, AFTER_EXPIRY, advance=False)
+        assert [e.seq for e in page.messages] == [4, 6]
+        assert page.cursor == 0 and page.head == 6
+    page = await store.read_stream(team, "bob", "inbox", None, 1, AFTER_EXPIRY, advance=False)
+    assert [e.seq for e in page.messages] == [4] and page.cursor == 0
+    # A read that may advance still does, from where the peeks left it.
+    page = await store.read_stream(team, "bob", "inbox", None, 50, AFTER_EXPIRY)
+    assert page.cursor == 3
+
+
 async def test_the_cursor_moves_only_for_reads_that_start_at_it(store: Store, team: str):
     await _append(store, team, [EXPIRED] * 4 + [LIVE])
     # An explicit `after` below the stored cursor: the gap (0, after] was never scanned.

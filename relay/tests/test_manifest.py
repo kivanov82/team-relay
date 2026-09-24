@@ -170,6 +170,7 @@ async def test_put_manifest_publishes_and_directory_shows_it(client, clock):
         "published_at": None,
         "sessions": {"working": {"last_seen": None}, "answering": {"last_seen": None}},
         "stats": {"asked": 0, "answered": 0, "open": 0, "median_answer_seconds": None},
+        "inbox_waiting": 0,
     }
 
 
