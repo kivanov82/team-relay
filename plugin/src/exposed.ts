@@ -5,7 +5,7 @@
 import { statSync, accessSync, constants } from 'node:fs';
 import { isAbsolute } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import type { Capability, Manifest } from './manifest.js';
+import { MAX_SHARES, SHARE_NAME_RE, type Capability, type Manifest, type Share } from './manifest.js';
 
 export type ExposedCapability = { capability: Capability; runner: string };
 export type SkippedCapability = { name: string; reason: string };
@@ -72,7 +72,34 @@ export function exposedCapabilities(
   return { exposed, skipped };
 }
 
-/** The discovery payload: the manifest restricted to the exposed capabilities. */
-export function discoveryPayload(exposed: ExposedCapability[]): Manifest {
-  return { version: 1, capabilities: exposed.map((e) => e.capability) };
+/**
+ * The folders this member shares (M4-SPEC §3), from ANSWERER_SHARES: the JSON list of
+ * basenames bin/answerer derives from ANSWERER_READ_DIRS (never a path). Unset or empty is
+ * no share. Throws on anything else, so a malformed value never reaches the team.
+ */
+export function sharesFromEnv(value: string | undefined): Share[] {
+  if (value === undefined || value === '') return [];
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(value);
+  } catch {
+    throw new Error('ANSWERER_SHARES is not JSON');
+  }
+  if (!Array.isArray(parsed)) throw new Error('ANSWERER_SHARES must be a list of folder names');
+  if (parsed.length > MAX_SHARES) throw new Error(`ANSWERER_SHARES names more than ${MAX_SHARES} folders`);
+  const names: string[] = [];
+  for (const n of parsed) {
+    if (typeof n !== 'string' || !SHARE_NAME_RE.test(n)) throw new Error('ANSWERER_SHARES holds a name that is not a folder name');
+    if (names.includes(n)) throw new Error('ANSWERER_SHARES repeats a name');
+    names.push(n);
+  }
+  return names.map((name) => ({ name }));
+}
+
+/**
+ * The discovery payload: the manifest restricted to the exposed capabilities, and the
+ * folders shared for reading (M4-SPEC §3; an empty list says "shares nothing").
+ */
+export function discoveryPayload(exposed: ExposedCapability[], shares: Share[] = []): Manifest {
+  return { version: 1, capabilities: exposed.map((e) => e.capability), shares };
 }

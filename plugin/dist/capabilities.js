@@ -31398,9 +31398,24 @@ var manifest_schema_default = {
       type: "array",
       maxItems: 32,
       items: { $ref: "#/$defs/capability" }
+    },
+    shares: {
+      description: "The folders the member's answering session may read for teammates, by basename only, never a full path (M4-SPEC \xA73). Optional; absent means the member shares nothing.",
+      type: "array",
+      maxItems: 16,
+      uniqueItems: true,
+      items: { $ref: "#/$defs/share" }
     }
   },
   $defs: {
+    share: {
+      type: "object",
+      additionalProperties: false,
+      required: ["name"],
+      properties: {
+        name: { type: "string", pattern: "^[A-Za-z0-9._-]{1,64}$" }
+      }
+    },
     identifier: {
       type: "string",
       pattern: "^[a-z][a-z0-9_]{1,62}$"

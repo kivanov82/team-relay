@@ -24,7 +24,7 @@ import {
 } from './relay-client.js';
 import { envelopeToNotification, neutraliseDeep, RecentIds } from './notify.js';
 import { findCapability, loadManifest, validateManifest, validateParams, codePointLength, hasLoneSurrogate } from './manifest.js';
-import { defaultManifestPath, discoveryPayload, exposedCapabilities } from './exposed.js';
+import { defaultManifestPath, discoveryPayload, exposedCapabilities, sharesFromEnv } from './exposed.js';
 import { makeLogger } from './log.js';
 import { ActiveRequests, AnswerDeadlines, deadlineOf } from './active.js';
 import {
@@ -58,7 +58,7 @@ function instructionsFor(role: Role): string {
   if (role === 'asker') {
     return [
       'Team relay (asking side). You can reach teammates\' Claude sessions:',
-      'list_teammates shows who is on the team and which capabilities each one publishes;',
+      'list_teammates shows who is on the team, which capabilities each one publishes and which folders each shares;',
       'ask_question sends a question to named teammates or to everyone ("*");',
       'invoke_capability asks one teammate to run one of their published capabilities with exact params;',
       'request_status shows who has acknowledged or answered a request and any progress.',
@@ -77,6 +77,10 @@ function instructionsFor(role: Role): string {
     'For each question: first call ack_question with its request_id, then answer from your own knowledge,',
     'your capability tools and, where it helps, local files you read with Read, Glob and Grep (you cannot run',
     'commands, write or edit files, or use the web), then call reply exactly once with that request_id.',
+    'Reading files: the folders this member shares are readable. For any other file or folder, try the read',
+    'only when the question needs it: the member is asked to allow or deny it and may take a while to answer.',
+    'Never try to read credentials, keys, tokens, .env files or other secrets. If access is denied, answer',
+    'without that file or say you could not read it; do not look for another way to reach it.',
     'For a capability_call: call ack_question, then call the capability tool it names with exactly the params',
     'given plus the request_id, then call reply with a short summary as text and the tool\'s JSON result as data.',
     'If you cannot or will not answer, call reply saying so.',
@@ -198,12 +202,17 @@ async function listTeammates(client: RelayClient): Promise<ToolResult> {
             required: c.required ?? [],
           }))
         : [];
-    return { member: m.member, last_seen: m.last_seen, published_at: m.published_at, capabilities: caps };
+    // M4-SPEC §3: the folders that teammate's answering session reads without asking, by name.
+    const shares =
+      isPlainObject(m.manifest) && Array.isArray(m.manifest.shares)
+        ? (m.manifest.shares as Array<{ name?: unknown }>).map((x) => x?.name).filter((n): n is string => typeof n === 'string')
+        : [];
+    return { member: m.member, last_seen: m.last_seen, published_at: m.published_at, capabilities: caps, shares };
   });
   // Titles, descriptions and enum values are whatever each teammate published: label them,
   // and keep them from opening or closing a <channel> tag.
   return toolJson({
-    teammate_authored_data: `${TEAMMATE_DATA_LABEL} Each capability's title, description and params come from that teammate's published manifest.`,
+    teammate_authored_data: `${TEAMMATE_DATA_LABEL} Each capability's title, description and params, and each shared folder name, come from that teammate's published manifest.`,
     teammates: neutraliseDeep(members),
   });
 }
@@ -465,8 +474,12 @@ async function main(): Promise<void> {
       const manifest = loadManifest(env.MANIFEST_PATH || defaultManifestPath());
       const { exposed, skipped } = exposedCapabilities(manifest, env);
       for (const s of skipped) log(`capability ${s.name} not offered: ${s.reason}`);
-      const res = await client.publishManifest(me.member, discoveryPayload(exposed));
+      // M4-SPEC §3: the shared folders' names (bin/answerer passes basenames, never paths),
+      // checked against the same schema the relay validates the payload with.
+      const payload = validateManifest(discoveryPayload(exposed, sharesFromEnv(env.ANSWERER_SHARES)));
+      const res = await client.publishManifest(me.member, payload);
       log(`published capabilities: ${res.capabilities.join(', ') || '(none)'}`);
+      log(`published shared folders: ${(payload.shares ?? []).map((x) => x.name).join(', ') || '(none)'}`);
     } catch (err) {
       fail(`cannot start: publishing the capability manifest failed (${describeError(err)})`);
     }

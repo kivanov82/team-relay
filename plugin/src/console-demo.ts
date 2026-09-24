@@ -6,7 +6,8 @@
 // by effective status, `answered` by `answered_at` in the window, the median to 3 decimals,
 // and answer previews masked as the relay masks them. The viewer is alice.
 //
-// Every cycle (60 s) starts seven requests: a directed question, a capability call with
+// Every cycle (60 s) starts seven requests: a directed question (whose answerer waits a
+// moment for bob to allow a file read, M4-SPEC §2), a capability call with
 // progress and a tool event, a broadcast that one teammate never acknowledges (no_response),
 // a question between two teammates (alice is not a participant, so its text is masked), an
 // acknowledged question that is never answered (timed_out), a capability call between two
@@ -44,7 +45,7 @@ const ACTIVITY_MAX_GROUP = 500;
 type Member = (typeof DEMO_MEMBERS)[number];
 type Status = 'pending' | 'acked' | 'answered' | 'no_response' | 'timed_out';
 
-export type ToolUse = { tool: string; status: 'ok' | 'error'; at: string; duration_ms: number | null };
+export type ToolUse = { tool: string; status: 'ok' | 'error' | 'waiting'; at: string; duration_ms: number | null };
 export type RecipientView = {
   status: Status;
   delivered_at: string | null;
@@ -73,7 +74,7 @@ export type ActivityRequest = {
 };
 type ProgressItem =
   | { seq: number; member: string; kind: 'progress'; text: string; pct: number | null; time: string }
-  | { seq: number; member: string; kind: 'tool'; tool: string; status: 'ok' | 'error'; duration_ms: number | null; time: string };
+  | { seq: number; member: string; kind: 'tool'; tool: string; status: 'ok' | 'error' | 'waiting'; duration_ms: number | null; time: string };
 
 // ---------------------------------------------------------------------------------------
 // Scripts: offsets in ms from the request's creation.
@@ -82,6 +83,8 @@ type Step =
   | { at: number; to: Member; do: 'deliver' | 'ack' | 'answer_delivered' }
   | { at: number; to: Member; do: 'answer'; text: string }
   | { at: number; to: Member; do: 'tool'; tool: string; status: 'ok' | 'error'; duration_ms: number }
+  // M4-SPEC §2: a permission request in the answering session (no duration).
+  | { at: number; to: Member; do: 'waiting'; tool: string }
   | { at: number; to: Member; do: 'progress'; text: string; pct: number };
 
 type Script = {
@@ -129,9 +132,11 @@ function scripts(cycle: number): Script[] {
         { at: 800, to: 'bob', do: 'deliver' },
         { at: 2500, to: 'bob', do: 'ack' },
         { at: 4000, to: 'bob', do: 'tool', tool: 'Grep', status: 'ok', duration_ms: 31 + v * 7 },
-        { at: 5200, to: 'bob', do: 'tool', tool: 'Read', status: 'ok', duration_ms: 12 + v * 3 },
-        { at: 9000, to: 'bob', do: 'answer', text: ANSWERS_FROM_BOB[v]! },
-        { at: 10_100, to: 'bob', do: 'answer_delivered' },
+        // A file outside bob's shared folders: his session waits for him to allow it.
+        { at: 5200, to: 'bob', do: 'waiting', tool: 'Read' },
+        { at: 16_000, to: 'bob', do: 'tool', tool: 'Read', status: 'ok', duration_ms: 12 + v * 3 },
+        { at: 20_000, to: 'bob', do: 'answer', text: ANSWERS_FROM_BOB[v]! },
+        { at: 21_100, to: 'bob', do: 'answer_delivered' },
       ],
     },
     {
@@ -306,6 +311,10 @@ function materialise(s: Script, created: number, id: string, now: number, enviro
           r.tools.push({ tool: step.tool, status: step.status, at: t, duration_ms: step.duration_ms });
           progress.push({ seq: progress.length + 1, member: step.to, kind: 'tool', tool: step.tool, status: step.status, duration_ms: step.duration_ms, time: t });
           break;
+        case 'waiting':
+          r.tools.push({ tool: step.tool, status: 'waiting', at: t, duration_ms: null });
+          progress.push({ seq: progress.length + 1, member: step.to, kind: 'tool', tool: step.tool, status: 'waiting', duration_ms: null, time: t });
+          break;
         case 'progress':
           r.progress_count++;
           r.last_progress_pct = step.pct;
@@ -444,10 +453,11 @@ export class DemoTeam {
       capabilities: manifest.capabilities.filter((c: Capability) => names.includes(c.name)),
     });
     for (const c of manifest.capabilities) this.environments.set(c.name, c.environment);
+    // M4-SPEC §3: bob shares two folders by name; carol shares none.
     this.manifests = {
       alice: null,
-      bob: pick(['staging_db_query']),
-      carol: pick(['service_health', 'production_db_count']),
+      bob: { ...pick(['staging_db_query']), shares: [{ name: 'orders-service' }, { name: 'runbooks' }] },
+      carol: { ...pick(['service_health', 'production_db_count']), shares: [] },
     };
     this.publishedAt = iso(this.epoch - 3_600_000);
   }

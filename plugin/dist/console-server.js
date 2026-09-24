@@ -14804,9 +14804,6 @@ import { createHash } from "node:crypto";
 
 // src/exposed.ts
 import { fileURLToPath } from "node:url";
-function defaultManifestPath() {
-  return fileURLToPath(new URL("../manifest.yaml", import.meta.url));
-}
 
 // src/manifest.ts
 var import_yaml = __toESM(require_dist(), 1);
@@ -21123,9 +21120,24 @@ var manifest_schema_default = {
       type: "array",
       maxItems: 32,
       items: { $ref: "#/$defs/capability" }
+    },
+    shares: {
+      description: "The folders the member's answering session may read for teammates, by basename only, never a full path (M4-SPEC \xA73). Optional; absent means the member shares nothing.",
+      type: "array",
+      maxItems: 16,
+      uniqueItems: true,
+      items: { $ref: "#/$defs/share" }
     }
   },
   $defs: {
+    share: {
+      type: "object",
+      additionalProperties: false,
+      required: ["name"],
+      properties: {
+        name: { type: "string", pattern: "^[A-Za-z0-9._-]{1,64}$" }
+      }
+    },
     identifier: {
       type: "string",
       pattern: "^[a-z][a-z0-9_]{1,62}$"
@@ -21430,6 +21442,11 @@ function validateOne(name, p, v) {
   }
 }
 
+// src/exposed.ts
+function defaultManifestPath() {
+  return fileURLToPath(new URL("../manifest.yaml", import.meta.url));
+}
+
 // src/console-demo.ts
 var DEMO_TEAM = "demo";
 var DEMO_ME = "alice";
@@ -21473,9 +21490,11 @@ function scripts(cycle) {
         { at: 800, to: "bob", do: "deliver" },
         { at: 2500, to: "bob", do: "ack" },
         { at: 4e3, to: "bob", do: "tool", tool: "Grep", status: "ok", duration_ms: 31 + v * 7 },
-        { at: 5200, to: "bob", do: "tool", tool: "Read", status: "ok", duration_ms: 12 + v * 3 },
-        { at: 9e3, to: "bob", do: "answer", text: ANSWERS_FROM_BOB[v] },
-        { at: 10100, to: "bob", do: "answer_delivered" }
+        // A file outside bob's shared folders: his session waits for him to allow it.
+        { at: 5200, to: "bob", do: "waiting", tool: "Read" },
+        { at: 16e3, to: "bob", do: "tool", tool: "Read", status: "ok", duration_ms: 12 + v * 3 },
+        { at: 2e4, to: "bob", do: "answer", text: ANSWERS_FROM_BOB[v] },
+        { at: 21100, to: "bob", do: "answer_delivered" }
       ]
     },
     {
@@ -21637,6 +21656,10 @@ function materialise(s, created, id, now, environments) {
           r.tools.push({ tool: step.tool, status: step.status, at: t, duration_ms: step.duration_ms });
           progress.push({ seq: progress.length + 1, member: step.to, kind: "tool", tool: step.tool, status: step.status, duration_ms: step.duration_ms, time: t });
           break;
+        case "waiting":
+          r.tools.push({ tool: step.tool, status: "waiting", at: t, duration_ms: null });
+          progress.push({ seq: progress.length + 1, member: step.to, kind: "tool", tool: step.tool, status: "waiting", duration_ms: null, time: t });
+          break;
         case "progress":
           r.progress_count++;
           r.last_progress_pct = step.pct;
@@ -21753,8 +21776,8 @@ var DemoTeam = class {
     for (const c of manifest.capabilities) this.environments.set(c.name, c.environment);
     this.manifests = {
       alice: null,
-      bob: pick(["staging_db_query"]),
-      carol: pick(["service_health", "production_db_count"])
+      bob: { ...pick(["staging_db_query"]), shares: [{ name: "orders-service" }, { name: "runbooks" }] },
+      carol: { ...pick(["service_health", "production_db_count"]), shares: [] }
     };
     this.publishedAt = iso(this.epoch - 36e5);
   }

@@ -377,3 +377,32 @@ describe('param rules, one reading on both sides (§11.2, §11.3)', () => {
     expect(hasLoneSurrogate('\ude00x')).toBe(true);
   });
 });
+
+describe('shares (M4-SPEC §3)', () => {
+  const withShares = (shares: unknown) => ({ version: 1, capabilities: [], shares });
+
+  it('accepts folder names, none, or no list at all', () => {
+    expect(validateManifest(withShares([{ name: 'orders-service' }, { name: 'My_Notes' }, { name: 'v1.2' }])).shares).toHaveLength(3);
+    expect(validateManifest(withShares([])).shares).toEqual([]);
+    expect(validateManifest({ version: 1, capabilities: [] }).shares).toBeUndefined();
+    expect(() => validateManifest(withShares(Array.from({ length: 16 }, (_, i) => ({ name: `d${i}` }))))).not.toThrow();
+  });
+
+  it('refuses a path, a bad name, a repeated name, more than 16, and anything but {name}', () => {
+    for (const shares of [
+      [{ name: '/Users/bob/src' }],
+      [{ name: 'a/b' }],
+      [{ name: 'My Notes' }],
+      [{ name: '' }],
+      [{ name: 'a'.repeat(65) }],
+      [{ name: 'notes\n' }],
+      [{ name: 'a' }, { name: 'a' }],
+      Array.from({ length: 17 }, (_, i) => ({ name: `d${i}` })),
+      [{ name: 'a', path: '/x' }],
+      ['a'],
+      { name: 'a' },
+    ]) {
+      expect(() => validateManifest(withShares(shares)), JSON.stringify(shares)).toThrow(ManifestError);
+    }
+  });
+});

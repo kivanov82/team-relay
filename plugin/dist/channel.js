@@ -31909,9 +31909,24 @@ var manifest_schema_default = {
       type: "array",
       maxItems: 32,
       items: { $ref: "#/$defs/capability" }
+    },
+    shares: {
+      description: "The folders the member's answering session may read for teammates, by basename only, never a full path (M4-SPEC \xA73). Optional; absent means the member shares nothing.",
+      type: "array",
+      maxItems: 16,
+      uniqueItems: true,
+      items: { $ref: "#/$defs/share" }
     }
   },
   $defs: {
+    share: {
+      type: "object",
+      additionalProperties: false,
+      required: ["name"],
+      properties: {
+        name: { type: "string", pattern: "^[A-Za-z0-9._-]{1,64}$" }
+      }
+    },
     identifier: {
       type: "string",
       pattern: "^[a-z][a-z0-9_]{1,62}$"
@@ -32021,6 +32036,8 @@ var manifest_schema_default = {
 };
 
 // src/manifest.ts
+var SHARE_NAME_RE = /^[A-Za-z0-9._-]{1,64}$/;
+var MAX_SHARES = 16;
 var ManifestError = class extends Error {
   problems;
   constructor(problems) {
@@ -32299,8 +32316,26 @@ function exposedCapabilities(manifest, env) {
   }
   return { exposed, skipped };
 }
-function discoveryPayload(exposed) {
-  return { version: 1, capabilities: exposed.map((e) => e.capability) };
+function sharesFromEnv(value) {
+  if (value === void 0 || value === "") return [];
+  let parsed;
+  try {
+    parsed = JSON.parse(value);
+  } catch {
+    throw new Error("ANSWERER_SHARES is not JSON");
+  }
+  if (!Array.isArray(parsed)) throw new Error("ANSWERER_SHARES must be a list of folder names");
+  if (parsed.length > MAX_SHARES) throw new Error(`ANSWERER_SHARES names more than ${MAX_SHARES} folders`);
+  const names = [];
+  for (const n of parsed) {
+    if (typeof n !== "string" || !SHARE_NAME_RE.test(n)) throw new Error("ANSWERER_SHARES holds a name that is not a folder name");
+    if (names.includes(n)) throw new Error("ANSWERER_SHARES repeats a name");
+    names.push(n);
+  }
+  return names.map((name) => ({ name }));
+}
+function discoveryPayload(exposed, shares = []) {
+  return { version: 1, capabilities: exposed.map((e) => e.capability), shares };
 }
 
 // src/log.ts
@@ -32461,7 +32496,7 @@ function instructionsFor(role) {
   if (role === "asker") {
     return [
       "Team relay (asking side). You can reach teammates' Claude sessions:",
-      "list_teammates shows who is on the team and which capabilities each one publishes;",
+      "list_teammates shows who is on the team, which capabilities each one publishes and which folders each shares;",
       'ask_question sends a question to named teammates or to everyone ("*");',
       "invoke_capability asks one teammate to run one of their published capabilities with exact params;",
       "request_status shows who has acknowledged or answered a request and any progress.",
@@ -32480,6 +32515,10 @@ function instructionsFor(role) {
     "For each question: first call ack_question with its request_id, then answer from your own knowledge,",
     "your capability tools and, where it helps, local files you read with Read, Glob and Grep (you cannot run",
     "commands, write or edit files, or use the web), then call reply exactly once with that request_id.",
+    "Reading files: the folders this member shares are readable. For any other file or folder, try the read",
+    "only when the question needs it: the member is asked to allow or deny it and may take a while to answer.",
+    "Never try to read credentials, keys, tokens, .env files or other secrets. If access is denied, answer",
+    "without that file or say you could not read it; do not look for another way to reach it.",
     "For a capability_call: call ack_question, then call the capability tool it names with exactly the params",
     "given plus the request_id, then call reply with a short summary as text and the tool's JSON result as data.",
     "If you cannot or will not answer, call reply saying so.",
@@ -32585,10 +32624,11 @@ async function listTeammates(client) {
       params: c.params,
       required: c.required ?? []
     })) : [];
-    return { member: m.member, last_seen: m.last_seen, published_at: m.published_at, capabilities: caps };
+    const shares = isPlainObject4(m.manifest) && Array.isArray(m.manifest.shares) ? m.manifest.shares.map((x) => x?.name).filter((n) => typeof n === "string") : [];
+    return { member: m.member, last_seen: m.last_seen, published_at: m.published_at, capabilities: caps, shares };
   });
   return toolJson({
-    teammate_authored_data: `${TEAMMATE_DATA_LABEL} Each capability's title, description and params come from that teammate's published manifest.`,
+    teammate_authored_data: `${TEAMMATE_DATA_LABEL} Each capability's title, description and params, and each shared folder name, come from that teammate's published manifest.`,
     teammates: neutraliseDeep(members2)
   });
 }
@@ -32798,8 +32838,10 @@ async function main() {
       const manifest = loadManifest(env.MANIFEST_PATH || defaultManifestPath());
       const { exposed, skipped } = exposedCapabilities(manifest, env);
       for (const s of skipped) log(`capability ${s.name} not offered: ${s.reason}`);
-      const res = await client.publishManifest(me.member, discoveryPayload(exposed));
+      const payload = validateManifest(discoveryPayload(exposed, sharesFromEnv(env.ANSWERER_SHARES)));
+      const res = await client.publishManifest(me.member, payload);
       log(`published capabilities: ${res.capabilities.join(", ") || "(none)"}`);
+      log(`published shared folders: ${(payload.shares ?? []).map((x) => x.name).join(", ") || "(none)"}`);
     } catch (err) {
       fail(`cannot start: publishing the capability manifest failed (${describeError(err)})`);
     }

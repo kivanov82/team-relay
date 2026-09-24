@@ -38,7 +38,14 @@ export type Capability = {
   required?: string[];
 };
 
-export type Manifest = { version: 1; capabilities: Capability[] };
+/** A folder the member's answering session may read for teammates, by name only (M4-SPEC §3). */
+export type Share = { name: string };
+export type Manifest = { version: 1; capabilities: Capability[]; shares?: Share[] };
+
+/** A share name: a folder's basename in a safe alphabet (schema `$defs/share`). */
+export const SHARE_NAME_RE = /^[A-Za-z0-9._-]{1,64}$/;
+/** At most this many shares (schema `properties.shares.maxItems`). */
+export const MAX_SHARES = 16;
 
 export class ManifestError extends Error {
   readonly problems: string[];

@@ -12,6 +12,7 @@ import _Ajv from 'ajv';
 import { CONTENT_SECURITY_POLICY, createConsoleServer, demoBackend, keyMatches, relayBackend, type ConsoleServer } from '../src/console-app.js';
 import { DEMO_CYCLE_MS, DemoTeam, SWEEP_LAG_MS, median3, stillOpen } from '../src/console-demo.js';
 import { REDIRECT_TTL_MS, openInBrowser, redirectHtml, type Run } from '../src/console-open.js';
+import { validateManifest } from '../src/manifest.js';
 import { RelayClient } from '../src/relay-client.js';
 import { FakeRelay, TOKEN_OF } from './helpers/fake-relay.js';
 import { DIST } from './helpers/mcp.js';
@@ -64,7 +65,8 @@ const RECIPIENT = {
         required: ['tool', 'status', 'at', 'duration_ms'],
         properties: {
           tool: { type: 'string', pattern: '^[A-Za-z0-9_.:-]{1,64}$' },
-          status: { enum: ['ok', 'error'] },
+          // M4-SPEC §2: `waiting` while the member is asked to allow the tool.
+          status: { enum: ['ok', 'error', 'waiting'] },
           at: TIME,
           duration_ms: { anyOf: [{ type: 'integer', minimum: 0, maximum: 3600000 }, { type: 'null' }] },
         },
@@ -421,6 +423,36 @@ describe('console --demo backend', () => {
     expect(Date.parse(bob.acked_at!)).toBeLessThan(Date.parse(bob.answered_at!));
     expect(Date.parse(bob.answered_at!)).toBeLessThan(Date.parse(bob.answer_delivered_at!));
     expect(requests.some((r) => Object.values(r.recipients).some((x) => x.tools.some((t) => t.status === 'error')))).toBe(true);
+  });
+
+  it('shows a waiting grant (M4-SPEC §2) that the next event for that tool clears, and shares by name (§3)', () => {
+    const start = Date.parse('2026-09-23T10:00:30.000Z');
+    let now = start;
+    const team = new DemoTeam(() => now);
+    const cycleStart = Math.floor(start / DEMO_CYCLE_MS) * DEMO_CYCLE_MS + DEMO_CYCLE_MS;
+    const directedToBob = () =>
+      team
+        .activity({ since: new Date(cycleStart - 1).toISOString(), limit: 200 })
+        .requests.find((r) => r.kind === 'question' && r.asker === 'alice' && Object.keys(r.recipients).join() === 'bob');
+    now = cycleStart + 8000;
+    const waiting = directedToBob()!;
+    const bob = waiting.recipients.bob!;
+    expect(bob.status).toBe('acked');
+    expect(bob.tools.at(-1)).toEqual({ tool: 'Read', status: 'waiting', at: new Date(cycleStart + 5200).toISOString(), duration_ms: null });
+    // The side surface lists it as a tool event with no duration, and never a path.
+    const detail = team.request(waiting.request_id);
+    expect(detail.progress.at(-1)).toMatchObject({ kind: 'tool', tool: 'Read', status: 'waiting', duration_ms: null });
+    now = cycleStart + 17_000;
+    const cleared = directedToBob()!.recipients.bob!;
+    expect(cleared.tools.map((t) => [t.tool, t.status])).toEqual([
+      ['Grep', 'ok'],
+      ['Read', 'waiting'],
+      ['Read', 'ok'],
+    ]);
+    const members = team.directory().members;
+    for (const m of members) expect(() => validateManifest(m.manifest)).not.toThrow();
+    expect(members.find((m) => m.member === 'bob')!.manifest!.shares).toEqual([{ name: 'orders-service' }, { name: 'runbooks' }]);
+    expect(members.find((m) => m.member === 'carol')!.manifest!.shares).toEqual([]);
   });
 
   it('masks text and params for requests alice is not part of, and keeps name and environment', () => {
