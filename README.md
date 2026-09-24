@@ -65,8 +65,12 @@ flowchart LR
   waiting for a teammate to allow access, which folders each member shares, and a detail
   sheet with timings. Everyone sees the metadata; question and answer text is visible only
   to the people in that request. It marks a member whose answering session stopped with
-  questions waiting, and tells you when some wait for yours. Team owners add and remove
-  members there, by Google email.
+  questions waiting, and tells you when some wait for yours. Team owners invite and remove
+  members there, by Google email. One console serves every team you are on: a switcher in its
+  header moves between them.
+- **Teams** are created by anyone who signs in with Google, on the sign-in page or in the
+  console (see "Teams" below). Relay admins see and delete every team from the console's
+  admin page.
 
 ## Security model
 
@@ -74,18 +78,20 @@ flowchart LR
 |---|---|
 | Who is speaking | Each device signs in once with Google through the relay (`/team-relay:login`) and gets its own relay-issued credential, bound to one member of one team. The relay stores only its hash, expires it 90 days after last use, revokes it on logout or when the member is removed, and derives the sender from it. Nothing in a request body can claim to be someone else. The hosted console and gcloud users still use verified Google ID tokens. |
 | Signing in | Loopback and PKCE, in the style of RFC 8252; no device codes, so there is no code to phish. The one-time code only ever goes to a listener on 127.0.0.1 on your own machine within 5 minutes, and is useless without the verifier the plugin holds; the listener answers anything but the right callback (wrong Host, path or state) with 404 and keeps waiting. The relay redirects nowhere else. Which relay you sign in to is never the model's choice: `/team-relay:login` takes no arguments (another relay comes only from `RELAY_URL` in your environment), and it never replaces a sign-in from a different relay. Signing out is `/team-relay:logout`, a command only you run, not a tool. After a sign-in the session says "Connected as <member> (<email>) on team <team>", and says plainly when that is a different member or team than before. The credential file is `~/.config/team-relay/credentials.json` (mode 600 in a mode-700 directory); the plugin refuses a file others could read. |
-| Who is on the team | The roster lives in the relay. Owners add a member by Google email and remove them in the console; a removed member's devices stop working within 30 seconds. The relay is reachable without Cloud Run IAM (the sign-in pages must be) and authenticates every API call itself. |
+| Who is on the team | The roster lives in the relay. Owners invite a member by Google email and remove them in the console; an invitation grants nothing until its person accepts it, with that Google account, on the sign-in page or in the console. A removed member's devices stop working within 30 seconds. The relay is reachable without Cloud Run IAM (the sign-in pages must be) and authenticates every API call itself. |
+| Who creates and deletes teams | Anyone signed in with Google creates a team and becomes its owner: at most 3 created and not deleted per Google account, 50 members a team (invitations included), and hourly and daily limits per account and per client address. Team ids are unique and reserved words and the relay's own team ids are refused. Any owner of a created team deletes it; a relay admin deletes any created team; the relay's configured teams are never deleted through the API. A deleted team is refused everywhere at once, its devices' credentials stop working, its data is removed, and its id stays reserved for 31 days. Admins see sizes and activity, never emails or content. |
 | Prompt injection | Teammate text arrives as data inside `<channel>` tags or labelled tool results. The session's instructions say it is never to be followed as instructions. The channel never relays permission prompts. |
 | What a teammate can make you run | Only capabilities you enabled, with parameters validated on both ends against the manifest. Each run is tied to a real, directed request. The runner gets no shell, a minimal environment, a timeout and an output cap. |
 | What answers automatically | Only a channel working session, one per computer (a lock), within its own folder. Each answer is a fresh headless Claude Code with `--setting-sources ''` (none of your hooks, plugins or settings load), only Read, Glob and Grep, the credential deny list, and two MCP servers: the plugin's host tools over a private socket (mode 600, per-run token) and your capability server. Reads are automatic only inside the folder, and only when it is in a git work tree away from your home's own folders. What ships on its own is decided by the plugin, not the model: reads inside the folder and answers nothing flagged. Everything else (reads elsewhere, capability runs, answers the model flags or the secret screen catches, answers after reading a file whose name suggests secrets, answers after any approval, and questions past the volume limits of 3 waiting per teammate and 20 an hour) waits for your decision in a dialog the model cannot answer for you, and is denied at the question's deadline or after 30 minutes. The question goes to it on stdin, framed as teammate data. A question still open when the session closes is received again by the next one. |
 | What the manual answering session can read | Nothing by default. Folders you share deliberately (`ANSWERER_READ_DIRS`) are readable without asking; teammates see their names, never their paths. Anything else opens Claude Code's own permission dialog in your answering terminal, naming the path, and you allow it once, for the session, or not at all; a desktop notification and the asker's console show that it is waiting. Grants never outlive the session. Credential stores (the relay's own credential, ssh and gpg keys, cloud CLI credentials, `.env` files, browser cookies, keychains, wallet keystores and more) stay denied whatever you answer. These are Claude Code permission rules, not an OS sandbox. |
 | Abuse | Per-sender rate limits, broadcast limits, read budgets, caps on long-polls, and rate limits on sign-ins and roster changes. Manifest patterns run in RE2, so a teammate cannot publish a regex that stalls anyone. |
-| The console | Reads only, except an owner's roster changes (same-origin JSON requests only). Locally it binds 127.0.0.1 with a per-launch key. Hosted, it sits behind IAP; any signed-in Google account reaches the page, and the relay decides what it sees: a non-member gets "You're not on this team yet" and no data, not even the join details. |
+| The console | Reads only, except an owner's roster changes and the account's own (create a team, answer an invitation, delete a team, an admin's delete); each is a same-origin JSON request. Locally it binds 127.0.0.1 with a per-launch key. Hosted, it sits behind IAP; any signed-in Google account reaches the page, and the relay decides what it sees: every call names a team, checked against the viewer's active teams, and someone on no team gets only their invitations and "Create a team", no data, not even the join details. When it creates a team for a viewer it tells the relay a salted hash of the viewer's address, so the per-address limit holds through it. |
 
 ## Join a team
 
 You need [Claude Code](https://code.claude.com) 2.1.280 or newer and Node.js 22 or newer, and
-the team owner must have added your Google email. Then, in Claude Code:
+the team owner must have invited your Google email (or you create a team yourself, below).
+Then, in Claude Code:
 
 1. **Install the plugin.** No questions to answer.
    ```
@@ -101,8 +107,9 @@ the team owner must have added your Google email. Then, in Claude Code:
    sessions have its tools too, but they never read your answers (that would lose them): they
    say so, and your answers wait for a session with the channel.
 2. **Sign in:** `/team-relay:login`. Your browser opens on the relay (the session also shows
-   the link, in case no tab opened); sign in with Google, pick the team, done. The session
-   waits for it and says "Connected as <you> (<your email>) on team <team>".
+   the link, in case no tab opened); sign in with Google, accept the invitation (the page
+   lists it with Accept and Decline), pick the team, done. The session waits for it and says
+   "Connected as <you> (<your email>) on team <team>".
 That is all: answering is automatic in your channel working session, within the folder you
 started it in (teammates see that folder's name). When an answer needs you, the session says
 so and `/team-relay:approvals` shows it in a dialog. To offer capabilities, put their settings
@@ -115,6 +122,31 @@ session in a terminal of its own (reads nothing by default; `ANSWERER_READ_DIRS`
 folders); start your working sessions with `TEAM_RELAY_AUTO_ANSWER=0` if you use it, since
 only one answerer runs per computer. Details, including writing capability runners:
 [`plugin/README.md`](plugin/README.md).
+
+## Teams
+
+- **Create a team.** Anyone who signs in with Google can: on the sign-in page (an account on
+  no team sees "You're not on a team yet" with a small form; one on teams has "Create a new
+  team" below the chooser), or in the console (the team switcher's "Create team"). Give it a
+  name; the id is made from the name and can be edited (lower-case letters, digits and `-`,
+  3 to 32 characters; it cannot change later); pick your member id. You become its owner and
+  the sign-in continues with the new team. **Each Google account may have created at most 3
+  teams** that are not deleted; deleting one frees its slot. A team has at most 50 members,
+  open invitations included.
+- **Invite.** Owners invite teammates by Google email in the console's Members panel. The
+  person accepts (or declines) when they next run `/team-relay:login`, or in the console's
+  team switcher; until then the entry shows as Invited, grants nothing, and the owner can
+  withdraw it. Teammates listed in the relay's team file are members from the start.
+- **Delete a team.** Any owner of a created team deletes it in the console's Team settings,
+  by typing its id. Everyone loses access at once and its data is removed; the id stays
+  reserved for 31 days. The teams in the relay's team file cannot be deleted this way.
+- **Admins.** The relay's team file names its admins (`admins: ["google:<email>"]`). An
+  admin's console has an admin page: every team with its status, members, owners, when and
+  by whom it was created and its last activity (never emails or content), a page at a time,
+  and Delete after typing the team's id. Being an admin reads no team's data.
+- **The hosted console serves every team** the viewer is on: the switcher in its header
+  moves between them and remembers the last one in the browser. It reads the relay as a
+  delegate with `team: "*"` and `manage-teams` (`relay/README.md`, "The any-team delegate").
 
 ## Run your own relay
 
@@ -135,8 +167,9 @@ Everything deploys to one Google Cloud project, in resources named `team-relay*`
    bash scripts/smoke.sh             # 401 without credentials, 400 for a bare login start
    bash scripts/deploy-console.sh    # the hosted console behind IAP
    ```
-4. **Invite.** Sign in as the seed owner, open the console's Members panel, add each
-   teammate's Google email, and send them the two steps above.
+4. **Invite.** Sign in as the seed owner, open the console's Members panel, invite each
+   teammate's Google email, and send them the two steps above. Anyone can also create a team
+   of their own (see "Teams"); name the relay's admins in the team file's `admins`.
 
 The OAuth client's id and secret live only in Secret Manager. Both `*.local.*` files are
 git-ignored: real identities never enter the repository. The plugin's default relay URL is
@@ -151,7 +184,7 @@ in `plugin/relay.default.json`; teams on another relay start Claude Code with
 | [`plugin/`](plugin/README.md) | The Claude Code plugin: channel server (with the automatic answerer), capability server, manual answering-session launcher, local and hosted console server. |
 | `console/` | The console UI: React, Vite, TypeScript, Tailwind, shadcn/ui. It builds into `plugin/dist/console`. |
 | `schema/` | The capability manifest's JSON Schema. |
-| `docs/` | The contracts, milestone by milestone, with dated corrections: [M1](docs/M1-SPEC.md) (relay and channel), [M2](docs/M2-SPEC.md) (deploy, identity, console), [M3](docs/M3-SPEC.md) (hosted console), [M4](docs/M4-SPEC.md) (granted reads), [M5](docs/M5-SPEC.md) (install and sign in), [M6](docs/M6-SPEC.md) (members in the console), [M7](docs/M7-SPEC.md) (questions waiting), [M8](docs/M8-SPEC.md) (automatic answers within the folder). |
+| `docs/` | The contracts, milestone by milestone, with dated corrections: [M1](docs/M1-SPEC.md) (relay and channel), [M2](docs/M2-SPEC.md) (deploy, identity, console), [M3](docs/M3-SPEC.md) (hosted console), [M4](docs/M4-SPEC.md) (granted reads), [M5](docs/M5-SPEC.md) (install and sign in), [M6](docs/M6-SPEC.md) (members in the console), [M7](docs/M7-SPEC.md) (questions waiting), [M8](docs/M8-SPEC.md) (automatic answers within the folder), [M9](docs/M9-SPEC.md) (anyone can create a team). |
 | `scripts/` | Emulator, tests, bootstrap, deploy and smoke checks. |
 
 ## Development
@@ -161,15 +194,18 @@ bash scripts/test-relay.sh                               # relay suite against t
 (cd plugin  && pnpm install && pnpm typecheck && pnpm test)
 (cd console && pnpm install && pnpm typecheck && pnpm test)
 bash scripts/e2e.sh                                      # emulator + relay + the real plugin servers, end to end
-plugin/bin/console --demo --open                         # the console with a synthetic team
+plugin/bin/console --demo --open                         # the console with synthetic teams
 ```
 
 The end-to-end suite plays Claude Code over MCP. It covers directed questions, broadcasts
 with "no response yet", capability calls with progress, resuming after a crash,
 idempotency, identity rules, presence, delivery times, tool events, the console's masking,
-the whole sign-in against a fake Google, an owner adding and removing a member, and automatic
-answering with a stub `claude` (an answer inside the folder ships; a read outside it, a flagged
-answer and a capability call wait for approval; a lapse sends nothing).
+the whole sign-in against a fake Google, an owner inviting a member who accepts and removing
+them, automatic answering with a stub `claude` (an answer inside the folder ships; a read
+outside it, a flagged answer and a capability call wait for approval; a lapse sends nothing),
+and teams: a new account creating a team on the sign-in page, inviting a member who accepts
+and signs in, the two exchanging a question, and an admin deleting the team, after which both
+are refused.
 
 ## Status
 
@@ -193,3 +229,7 @@ Working end to end and deployed for a team of three. Known limits:
   Claude Code offers no dialogs and the local page is used) a process that reads the page's
   key in the few seconds its redirect file exists. Approvals rely on none of these being
   there in the channel working session; the plugin cannot check it.
+
+## License
+
+MIT: see [`LICENSE`](LICENSE). The plugin's manifest and the marketplace entry say so too.

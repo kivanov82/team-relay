@@ -8,8 +8,11 @@ answer is pushed into the asker's session over a Claude Code channel. The contra
 answering session may read, and how a member grants more), `../docs/M5-SPEC.md` (install
 with no questions, sign in with `/team-relay:login`, and its §9 corrections after the security
 review), `../docs/M6-SPEC.md` (owners manage members in the console),
-`../docs/M7-SPEC.md` §2 (say when questions are waiting) and `../docs/M8-SPEC.md` (answers
-ship on their own, within the folder you are working in).
+`../docs/M7-SPEC.md` §2 (say when questions are waiting), `../docs/M8-SPEC.md` (answers
+ship on their own, within the folder you are working in) and `../docs/M9-SPEC.md` §5 and §7
+(the console serves every team you are on: creating, joining by invitation and deleting teams,
+and the relay admin's page). Licensed MIT (`../LICENSE`; `plugin.json` and the marketplace
+entry say so, written by `pnpm generate`).
 
 - **Working session** (your normal `claude`, started with the channel): the plugin's `relay`
   channel in *asker* role. Tools `list_teammates`, `ask_question`, `invoke_capability`,
@@ -41,7 +44,7 @@ Commands (`commands/*.md`, namespaced by the plugin name):
 
 | Command | What it does |
 |---|---|
-| `/team-relay:login` | Calls the `login` tool, which takes no arguments: signs this computer in to the configured relay (below). |
+| `/team-relay:login` | Calls the `login` tool, which takes no arguments: signs this computer in to the configured relay (below). The relay's page lists your open team invitations (Accept, Decline) and lets you create a team (at most 3 per Google account). |
 | `/team-relay:logout` | Runs `node "${CLAUDE_PLUGIN_ROOT}/dist/logout.js"` itself (the `` !`…` `` form, when the command expands): revokes this computer's credential at its relay, then deletes it. |
 | `/team-relay:approvals` | Calls the `review_approvals` tool (no arguments): each answer or step waiting for your approval opens as a dialog (MCP elicitation), and you decide there (M8, below). |
 | `/team-relay:answering` | Optional: prints the one command that starts a manual answering session (`"${CLAUDE_PLUGIN_ROOT}/bin/answerer"`), and the settings that share folders and offer capabilities (generated from `manifest.yaml`). |
@@ -81,6 +84,13 @@ read it; it never reads your inbox stream):
   `inbox_notice` (the same sentence).
 - **The SessionStart line** adds the sentence (the summary is read beside `/me`, with 3 s of
   its own; nothing on failure), and **`login_wait`**'s success message appends it.
+- **Open team invitations** (M9-SPEC §7.2): when the session signs in with a Google identity
+  (`RELAY_AUTH=google`), `whoami` adds `invitations` (the team ids) and `invitations_notice`,
+  and the SessionStart line the same sentence ("You have an invitation to team ops from olga:
+  accept it on the sign-in page (/team-relay:login lists it) or in the team console."). Only
+  ids reach the session, never a team's name. A stored device credential (the usual sign-in)
+  or a static token cannot read them (the relay's `/v1/me/teams` takes a Google identity), and
+  then nothing is said: `/team-relay:login` lists them anyway.
 
 ### Sessions without the channel
 
@@ -548,6 +558,7 @@ is no longer open, so tool calls after it are not reported.
 | `JOIN_REPO_URL` | console server | Optional: the `https://` URL of this repository; a GitHub URL becomes the marketplace source when `JOIN_MARKETPLACE` is unset. |
 | `CONSOLE_MODE` | console server | `local` (default) or `hosted` (the container only). |
 | `PORT`, `CONSOLE_PUBLIC_HOST`, `IAP_AUDIENCE` | hosted console | Listening port (default 8080), the exact public host, the IAP audience. |
+| `CONSOLE_IP_HASH_SALT` | hosted console | Required, at least 32 characters (a secret): salts the viewer's address before it is hashed for the relay's per-address team creation limit (M9-SPEC §7.6). |
 | `ANSWERER_WORKDIR` | `bin/answerer` | The session's working directory: absolute, outside `$HOME`, empty. Default `${TMPDIR:-/tmp}/team-relay-answerer-<uid>/work`. |
 
 A capability is offered only when it is enabled, its runner is an executable regular file,
@@ -576,7 +587,7 @@ synthetic example.
 ## The console (M2-SPEC §4.4)
 
 ```
-bin/console --demo --open     # a synthetic team (demo: alice, bob, carol), no relay needed
+bin/console --demo --open     # synthetic teams (demo: alice, bob, carol; more below), no relay needed
 bin/console --open            # your team, with your stored sign-in (or the RELAY_* settings above)
 ```
 
@@ -600,11 +611,32 @@ it back as `X-Console-Key` on every API call. The server:
   4 KiB that is checked here (known fields only, a member id, lower-cased emails) before it is
   sent on once, never retried. The relay decides whether you are an owner. Every other
   method and path is refused: nothing can be sent, acked or replied from the console;
+- serves several teams (M9-SPEC §5): every team-scoped route above (and `/api/join`) takes the
+  team from a `team` query parameter or an `X-Relay-Team` header (the same value when both
+  are sent; not a team id, twice, or different: 400), checked against the viewer's **active**
+  teams from the relay's `GET /v1/me/teams`, kept 15 s per viewer and read again after any
+  change to them. Without either, `RELAY_TEAM` is the team, and only when the viewer is on it.
+  Any other team answers `403 {"error": "not_on_team", "email"?, "team"}` and the relay is not
+  asked. A sign-in bound to one team (a stored device credential, or a static token) reaches
+  that team only, with no `/v1/me/teams` call;
+- the account routes, each a change with the roster changes' rules (JSON, same origin, at most
+  4 KiB, checked here, no query, sent once): `GET /api/teams` (the viewer's teams and
+  invitations, `admin`, `teams_created` of `max_teams_created`, `suggested_member`,
+  `can_manage_teams`, `default_team`, and hosted the viewer's email; for a bound sign-in its
+  one team from `/me`), `POST /api/teams` `{name, id?, owner_member_id}` (create; the name is
+  trimmed, 1 to 60 characters with no control or invisible characters; the id
+  `^[a-z][a-z0-9-]{2,31}$`), `POST /api/invitations/{team}` `{"accept": true|false}`,
+  `DELETE /api/teams/{team}` `{"confirm": "<team id>"}` (a team the viewer is on; the relay
+  checks they own it), `GET /api/admin/teams?after=&limit=` (1..1000) and `DELETE
+  /api/admin/teams/{team}` `{"confirm": "<team id>"}` (the relay decides who is an admin). A
+  confirmation that is not the team id is refused here (400);
 - passes a relay refusal on as `502 {"error": "relay_refused", "relay_status",
-  "relay_error", "detail"}`, so the Members panel can say why a change was refused;
+  "relay_error", "detail"}`, so the panel or dialog can say why a change was refused
+  (`team_id_unavailable`, `team_name_unavailable`, `team_limit`, `rate_limited`, `seed_team`,
+  and so on);
 - answers `GET /api/join` itself, never proxying it, behind the same key (IAP when hosted,
   and then only to a member of the team, below): `{"relay_url", "team", "repo_url", "marketplace_source", "marketplace":
-  "team-relay-dev", "plugin": "team-relay", "default_relay"}` from the relay and team in use,
+  "team-relay-dev", "plugin": "team-relay", "default_relay"}` from the relay and the team asked about,
   `JOIN_MARKETPLACE` and `JOIN_REPO_URL` (`null` when unset; demo values with `--demo`);
   `default_relay` says whether the plugin's default relay is this one (else the panel's
   working-session command starts with `RELAY_URL=<relay>`; `/team-relay:login` takes no
@@ -620,7 +652,21 @@ it back as `X-Console-Key` on every API call. The server:
   CSP (`default-src 'self'`, no inline script or style, no external requests), and a
   placeholder page when that directory is missing.
 
-`--demo` serves a scripted, looping stream in the relay's own shapes: every minute a
+The console's header has a team switcher (your teams, your open invitations with Accept and
+Decline, *Create team*, and *Admin* for relay admins); it remembers the last team in the
+browser (`localStorage`, when the browser allows it). An owner's Members panel shows people
+they invited as *Invited* with *Withdraw*, and *Team settings* has *Delete team* (type the id to
+confirm; the relay refuses its configured teams). Someone on no team sees their invitations
+and *Create a team*. The admin page (`/admin`) lists every team a page at a time (id, name,
+status, members, owners, created, last activity; no emails, no content) with *Delete* after the
+id is typed. Screenshots: `../console/screenshots/`.
+
+`--demo` serves several synthetic teams: alice owns `demo` (the scripted one below, from the
+team file, so it cannot be deleted; dana is invited) and `research`, a quiet team she created;
+she is invited to `ops` and is a relay admin, so the admin page lists other people's teams
+too. Creating (at most 3), accepting, declining and deleting follow the relay's rules and
+refusals, in memory. The `demo` team is a scripted, looping stream in the relay's own shapes:
+every minute a
 directed question, a capability call with progress and a tool event, a broadcast one
 teammate never acknowledges (`no_response`), a question between two teammates (you see its
 metadata, not its text), an acknowledged question that is never answered (`timed_out`), a
@@ -648,14 +694,26 @@ The same server runs in a container on Cloud Run behind IAP (`Dockerfile.console
   required in hosted mode) and `X-Relay-On-Behalf-Of: <viewer email, lower-cased>`; the
   relay acts as that member (M3-SPEC §2; roster changes need the delegate's `manage-roster`
   scope and an owner, M6-SPEC §3);
-- answers `403 {"error": "not_on_team", "email"}` when the relay says the signed-in account is
-  on no roster of the team (its `403 not_a_member`; IAP admits any Google account, M6-SPEC
-  §5), and the console shows "You're not on this team yet. Ask the owner to add <email>."
-  with no data. A plain `401` from the relay is the console's own sign-in failing (a setup
-  problem) and is shown as such;
-- answers `GET /api/join` only to a member of the team (M6-SPEC §7 item 6): it asks the relay
-  who the viewer is (`/me`, on the viewer's behalf) first, and a signed-in account on no
-  roster gets the same `not_on_team` response and nothing about joining;
+- serves every team the viewer is an active member of (M9-SPEC §5): the relay's delegate
+  entry for the console is `team: "*"` with `scope: [read, manage-roster, manage-teams]`
+  (`../relay/README.md`, "The any-team delegate"); `RELAY_TEAM` is the default team only;
+- answers `403 {"error": "not_on_team", "email", "team"}` for a team the viewer is not an
+  active member of (IAP admits any Google account, M6-SPEC §5; an invitation is not
+  membership, M9-SPEC §7.2), before anything is asked of the team; the relay's own refusal
+  of a non-member (the any-team delegate's `404`, a per-team delegate's `403 not_a_member`)
+  answers the same and drops the viewer's cached teams. Someone on no team gets their
+  invitations and "Create a team", and no data. A plain `401` from the relay is the console's
+  own sign-in failing (a setup problem) and is shown as such;
+- answers `GET /api/join` only to an active member of the team asked about (M6-SPEC §7 item 6);
+- creates a team for the viewer with `X-Relay-Client-IP-Hash`: the SHA-256 (64 lower-case hex)
+  of `CONSOLE_IP_HASH_SALT` followed by the viewer's address, so the relay's per-address limit
+  holds through the console without it ever seeing the address (M9-SPEC §7.6). The address is
+  the **right-most** `X-Forwarded-For` entry: Cloud Run's front end, where IAP runs (the
+  service has no load balancer in front), appends the address the connection came from, so
+  that entry is the only one a client cannot write; anything left of it is the client's own
+  claim. IPv6 counts per /64 and an IPv4-mapped address as IPv4, as the relay counts them.
+  Should a load balancer ever be put in front, it appends its own address after the client's,
+  and every viewer would share one bucket: creations limited too much, never too little;
 
 `IAP_AUDIENCE` for a Cloud Run service is, in Google's "signed headers" documentation,
 `/projects/PROJECT_NUMBER/locations/REGION/services/SERVICE_NAME` (the project *number*).
@@ -722,14 +780,21 @@ pnpm test             # builds dist/ first; the stdio suites drive node dist/*.j
 pnpm build            # esbuild → dist/{channel,capabilities,session-start,tool-event,notify-desktop,console-server,credential-info,logout,answer-tools,answering-lock-info,answer-dry-run}.js (committed); never touches dist/console/
 pnpm generate         # manifest.yaml → commands/answering.md, and plugin.json (no userConfig) and .mcp.json
 pnpm generate --check # fails when those files are out of date
-../scripts/e2e.sh     # the M1 gate, the M2 scenarios, the M5/M6 sign-in and roster scenarios when the relay serves them, M7 and M8
+../scripts/e2e.sh     # the M1 gate, the M2 scenarios, the M5/M6 sign-in and roster scenarios when the relay serves them, M7, M8 and M9
 ```
 
 `pnpm test` never runs `test/e2e/`. `../scripts/e2e.sh` (Docker and `../relay/.venv` needed)
 starts a Firestore emulator on 127.0.0.1:8682 and the relay with throwaway static tokens and a
 fake Google sign-in (`relay/tests/fake_oauth_app.py`), builds `dist/`, runs `pnpm test:e2e`
-with `E2E=1`, and tears everything down on exit. The sign-in scenarios drive the real login
-tool with a headless stub browser (`test/fixtures/fake-browser.mjs`). The automatic answerer's
+with `E2E=1`, and tears everything down on exit; the files run in name order. The sign-in
+scenarios drive the real login tool with a headless stub browser
+(`test/fixtures/fake-browser.mjs`), which presses one button of each page as a browser would:
+Accept for an invitation it is told to accept (`FAKE_BROWSER_ACCEPT`), Create team on the
+create page with the values it is given (`FAKE_BROWSER_CREATE`), else Continue. The M9
+scenario (`test/e2e/m9.test.ts`) runs the hosted console server in the test process (IAP
+stood in for, the delegate's ID token from the fake Google): a new account creates a team on
+the sign-in page, invites a member who accepts and signs in, they exchange a question, the
+owner creates and deletes a second team, and an admin deletes the first; both are refused. The automatic answerer's
 tests (`test/answer-host.test.ts`, `test/e2e/m8.test.ts`) run the host with a stub `claude`
 (`test/fixtures/stub-claude.mjs`, through `TEAM_RELAY_CLAUDE_BIN`) that reads the prompt, starts
 the run's MCP servers and calls the host's tools as the question scripts it; no model is called.
