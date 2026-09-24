@@ -316,5 +316,28 @@ else
   echo "   secret ${OAUTH_SECRET}: skipped (set OAUTH_CLIENT_FILE=<client JSON> to create it)"
 fi
 
+# ------------------------------------------------------- 9. console IP-hash salt (M9)
+# The hosted console hashes each viewer's address with this salt before telling the relay
+# (M9-SPEC §7.6); a random value created once, never printed, readable only by the console.
+SALT_SECRET="team-relay-console-ip-salt"
+echo "9. console IP-hash salt"
+if gcloud secrets describe "$SALT_SECRET" --project="$PROJECT" >/dev/null 2>&1; then
+  echo "   secret ${SALT_SECRET}: exists"
+else
+  openssl rand -hex 32 | tr -d '\n' | gcloud secrets create "$SALT_SECRET" --project="$PROJECT" \
+    --replication-policy=user-managed --locations="$REGION" --data-file=- --quiet >/dev/null
+  echo "   secret ${SALT_SECRET}: created (value not shown)"
+fi
+if gcloud secrets get-iam-policy "$SALT_SECRET" --project="$PROJECT" --flatten='bindings[].members' \
+    --format='csv[no-heading](bindings.role,bindings.members)' \
+    | has_binding roles/secretmanager.secretAccessor "serviceAccount:${CONSOLE_EMAIL}"; then
+  echo "   accessor on ${SALT_SECRET}: exists"
+else
+  gcloud secrets add-iam-policy-binding "$SALT_SECRET" --project="$PROJECT" \
+    --member="serviceAccount:${CONSOLE_EMAIL}" --role=roles/secretmanager.secretAccessor \
+    --quiet >/dev/null
+  echo "   accessor on ${SALT_SECRET}: created"
+fi
+
 echo
 echo "Bootstrap complete. Deploy with: bash scripts/deploy.sh, then bash scripts/deploy-console.sh"

@@ -64,6 +64,14 @@ if [[ -n "${JOIN_REPO_URL:-}" ]]; then
   CONSOLE_ENV="${CONSOLE_ENV};JOIN_REPO_URL=${JOIN_REPO_URL}"
 fi
 
+SALT_SECRET="team-relay-console-ip-salt"
+SALT_VERSION="$(gcloud secrets versions list "$SALT_SECRET" --project="$PROJECT" \
+  --filter='state:ENABLED' --sort-by='~createTime' --limit=1 --format='value(name.basename())')"
+if [[ -z "$SALT_VERSION" ]]; then
+  echo "error: no enabled version of ${SALT_SECRET}; run scripts/gcp-bootstrap.sh" >&2
+  exit 1
+fi
+
 echo "Deploying ${SERVICE}"
 gcloud beta run deploy "$SERVICE" \
   --project="$PROJECT" \
@@ -74,6 +82,7 @@ gcloud beta run deploy "$SERVICE" \
   --iap \
   --min-instances=0 --max-instances=2 --cpu=1 --memory=256Mi --timeout=60 \
   --update-env-vars="$CONSOLE_ENV" \
+  --set-secrets="CONSOLE_IP_HASH_SALT=${SALT_SECRET}:${SALT_VERSION}" \
   --quiet
 
 # IAP invokes the service as its service agent; nothing else may.
