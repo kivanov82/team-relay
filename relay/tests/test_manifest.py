@@ -690,6 +690,7 @@ async def test_shares_round_trip_through_publish_and_directory(api):
 )
 async def test_a_manifest_with_bad_shares_is_422_and_not_stored(api, shares):
     await api.publish("bob")
+    api.clock.advance(1)  # the audit lists by time
     r = await api.client.put(
         api.url("/members/bob/manifest"), headers=auth("bob"), json=_with_shares(shares)
     )
