@@ -1,0 +1,580 @@
+"""Sign in from Claude Code (M5-SPEC §2): loopback + PKCE, RFC 8252 style.
+
+    plugin ──GET /v1/login/start──▶ relay ──302──▶ Google ──302──▶ /v1/login/callback
+           chooser page ──POST /v1/login/choose──▶ 303 http://127.0.0.1:<port>/callback?code&state
+    plugin ──POST /v1/login/token {code, code_verifier}──▶ {"credential": "trc_…", …}
+
+- The login document (``logins/{sha256(login id)}``) moves ``google`` → ``exchanging`` →
+  ``choose`` → ``done``, or to ``closed``; every move is one store transaction that checks
+  the step it expects and the expiry, so a replayed callback or a second POST finds the
+  wrong step and stops.
+- The browser that started the login holds the login id in the ``trl`` cookie
+  (``HttpOnly; Secure; SameSite=Lax; Path=/v1/login; Max-Age=600``); the callback's
+  ``state`` must equal it and the chooser's POST must carry it and the login's CSRF token.
+- The one-time code travels only to ``http://127.0.0.1:<port>/callback`` (the port the
+  plugin's listener chose); nothing else is ever a redirect target. It is stored hashed,
+  lives 2 minutes, and is useless without the plugin's PKCE verifier. A code presented twice
+  revokes the credential it minted.
+- Every endpoint is rate limited per client IP, counted in the store (:func:`client_ip`).
+"""
+
+from __future__ import annotations
+
+import hashlib
+import hmac
+import ipaddress
+import re
+import secrets
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
+from typing import Any
+from urllib.parse import parse_qsl, urlencode
+
+from fastapi import Request
+from fastapi.responses import JSONResponse, RedirectResponse, Response
+
+from .clock import format_time
+from .config import Limits, Settings, TeamConfig, normalise_email
+from .credentials import (
+    CREDENTIAL_LIFETIME,
+    Credentials,
+    b64url,
+    credential_key,
+    new_credential,
+    public_id,
+)
+from .jsonutil import sha256_hex
+from .log import log_event
+from .oauth import OAuthError, OAuthProvider, pkce_challenge
+from .pages import (
+    SECURITY_HEADERS,
+    chooser_page,
+    html_response,
+    message_page,
+)
+from .roster import Roster
+from .store import (
+    AuditEntry,
+    CredentialRecord,
+    LoginChange,
+    LoginChoice,
+    LoginCode,
+    LoginDoc,
+    Quota,
+    Redemption,
+    Store,
+)
+
+COOKIE = "trl"
+COOKIE_PATH = "/v1/login"
+LOGIN_LIFETIME = timedelta(minutes=10)
+CODE_LIFETIME = timedelta(minutes=2)
+LOGIN_WINDOW_SECONDS = 60
+MAX_FORM_BYTES = 4096
+
+PORT_RE = re.compile(r"^[1-9][0-9]{3,4}$")
+# The plugin's state: 32 random bytes, base64url (43) or hex (64); a little room either way.
+STATE_RE = re.compile(r"^[A-Za-z0-9_-]{32,128}$")
+CHALLENGE_RE = re.compile(r"^[A-Za-z0-9_-]{43}$")
+VERIFIER_RE = re.compile(r"^[A-Za-z0-9._~-]{43,128}$")  # RFC 7636 §4.1
+DEVICE_RE = re.compile(r"^[A-Za-z0-9 ._()-]{1,64}$")
+TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{43}$")  # login ids, CSRF tokens, one-time codes
+GOOGLE_CODE_RE = re.compile(r"^[\x21-\x7e]{1,1024}$")
+
+STEP_GOOGLE = "google"
+STEP_EXCHANGING = "exchanging"
+STEP_CHOOSE = "choose"
+STEP_DONE = "done"
+STEP_CLOSED = "closed"
+
+AGAIN = "Run /team-relay:login in Claude Code to start again."
+
+
+def client_ip(request: Request, on_cloud_run: bool) -> str:
+    """The address a login rate limit is counted against.
+
+    Behind Cloud Run the socket peer is Google's front end, which appends the address it
+    received the connection from to ``X-Forwarded-For``. Anything to the left of that last
+    entry came from the client and can be forged, so the **right-most** entry is taken: the
+    only one Google wrote. Off Cloud Run (local development, the tests) the header is
+    ignored and the socket peer is used. IPv6 addresses count per /64, since one host
+    commonly holds a whole /64. Unparseable values share one bucket, ``unknown``."""
+    raw: str | None
+    if on_cloud_run:
+        values = request.headers.getlist("x-forwarded-for")
+        raw = values[-1].split(",")[-1].strip() if values else None
+    else:
+        raw = request.client.host if request.client else None
+    try:
+        address = ipaddress.ip_address(raw or "")
+    except ValueError:
+        return "unknown"
+    if address.version == 6:
+        return str(ipaddress.ip_network(f"{address}/64", strict=False))
+    return str(address)
+
+
+def _key(secret: str) -> str:
+    return hashlib.sha256(secret.encode("ascii")).hexdigest()
+
+
+def _same(a: str, b: str) -> bool:
+    return hmac.compare_digest(a.encode("utf-8"), b.encode("utf-8"))
+
+
+def _single(params: Any, name: str) -> str | None:
+    """The one value of ``name``; None when it is absent or given more than once."""
+    values = params.getlist(name)
+    return values[0] if len(values) == 1 else None
+
+
+@dataclass(frozen=True)
+class _Form:
+    fields: dict[str, str]
+
+
+class LoginService:
+    def __init__(
+        self,
+        settings: Settings,
+        store: Store,
+        roster: Roster,
+        credentials: Credentials,
+        oauth: OAuthProvider,
+        now: Callable[[], datetime],
+        on_cloud_run: bool,
+    ) -> None:
+        assert settings.public_url is not None
+        self._config: TeamConfig = settings.team_config
+        self._limits: Limits = settings.team_config.limits
+        self._store = store
+        self._roster = roster
+        self._credentials = credentials
+        self._oauth = oauth
+        self._now = now
+        self._on_cloud_run = on_cloud_run
+        self.public_url = settings.public_url
+        self.redirect_uri = f"{settings.public_url}/v1/login/callback"
+        self._retention = timedelta(days=settings.team_config.audit_retention_days)
+
+    # Helpers --------------------------------------------------------------------------------
+    async def _allow(self, request: Request, kind: str, limit: int) -> bool:
+        now = self._now()
+        start = int(now.timestamp()) // LOGIN_WINDOW_SECONDS * LOGIN_WINDOW_SECONDS
+        # The address itself is never stored: only a hash of it, in the counter's key.
+        ip_hash = sha256_hex(client_ip(request, self._on_cloud_run))[:32]
+        quota = Quota(
+            key=f"{kind}.{ip_hash}.{start}",
+            limit=limit,
+            expire_at=datetime.fromtimestamp(start + 2 * LOGIN_WINDOW_SECONDS, UTC),
+        )
+        if await self._store.count_login_quota(quota):
+            return True
+        log_event("login_rate_limited", severity="WARNING", endpoint=kind)
+        return False
+
+    @staticmethod
+    def _refused(reason: str, **fields: Any) -> None:
+        log_event("login_refused", severity="WARNING", reason=reason, **fields)
+
+    def _page(self, status: int, title: str, *lines: str, clear: bool = False) -> Response:
+        response = html_response(message_page(title, lines, error=status >= 400), status)
+        if clear:
+            self._clear_cookie(response)
+        return response
+
+    def _clear_cookie(self, response: Response) -> None:
+        response.delete_cookie(COOKIE, path=COOKIE_PATH, secure=True, httponly=True, samesite="lax")
+
+    def _busy(self) -> Response:
+        return self._page(429, "Too many attempts", "Wait a minute, then try again.")
+
+    async def _close(self, key: str) -> None:
+        def fn(doc: LoginDoc | None) -> LoginChange[None]:
+            if doc is None or doc.step in (STEP_DONE, STEP_CLOSED):
+                return LoginChange(result=None)
+            doc.step = STEP_CLOSED
+            return LoginChange(result=None, login=doc)
+
+        await self._store.mutate_login(key, fn)
+
+    def _cookie_login(self, request: Request) -> str | None:
+        value = request.cookies.get(COOKIE)
+        return value if value is not None and TOKEN_RE.fullmatch(value) else None
+
+    # GET /v1/login/start ----------------------------------------------------------------------
+    async def start(self, request: Request) -> Response:
+        if not await self._allow(request, "start", self._limits.login_starts_per_minute):
+            return self._busy()
+        q = request.query_params
+        port, state = _single(q, "port"), _single(q, "state")
+        challenge, method = _single(q, "code_challenge"), _single(q, "code_challenge_method")
+        device = _single(q, "device")
+        valid = (
+            port is not None
+            and PORT_RE.fullmatch(port) is not None
+            and 1024 <= int(port) <= 65535
+            and state is not None
+            and STATE_RE.fullmatch(state) is not None
+            and challenge is not None
+            and CHALLENGE_RE.fullmatch(challenge) is not None
+            and method == "S256"
+            and device is not None
+            and DEVICE_RE.fullmatch(device) is not None
+        )
+        if not valid:
+            self._refused("bad_start")
+            return self._page(400, "This sign-in link is not valid", AGAIN)
+        assert port and state and challenge and device
+        now = self._now()
+        login_id = b64url(secrets.token_bytes(32))
+        google_verifier = b64url(secrets.token_bytes(32))
+        login = LoginDoc(
+            key=_key(login_id),
+            port=int(port),
+            state=state,
+            challenge=challenge,
+            device=device,
+            step=STEP_GOOGLE,
+            nonce=b64url(secrets.token_bytes(32)),
+            google_verifier=google_verifier,
+            created_at=now,
+            expire_at=now + LOGIN_LIFETIME,
+        )
+        await self._store.create_login(login)
+        url = self._oauth.authorization_url(
+            redirect_uri=self.redirect_uri,
+            state=login_id,
+            nonce=login.nonce,
+            code_challenge=pkce_challenge(google_verifier),
+        )
+        response = RedirectResponse(url, status_code=302, headers=dict(SECURITY_HEADERS))
+        response.set_cookie(
+            COOKIE,
+            login_id,
+            max_age=int(LOGIN_LIFETIME.total_seconds()),
+            path=COOKIE_PATH,
+            secure=True,
+            httponly=True,
+            samesite="lax",
+        )
+        log_event("login_started", login=login.key[:12])
+        return response
+
+    # GET /v1/login/callback -------------------------------------------------------------------
+    async def callback(self, request: Request) -> Response:
+        if not await self._allow(request, "page", self._limits.login_pages_per_minute):
+            return self._busy()
+        q = request.query_params
+        cookie = self._cookie_login(request)
+        state = _single(q, "state")
+        if cookie is None or state is None or not _same(cookie, state):
+            self._refused("state_mismatch")
+            return self._page(
+                400, "This sign-in did not start in this browser", AGAIN, clear=cookie is not None
+            )
+        key = _key(cookie)
+        now = self._now()
+
+        def begin(doc: LoginDoc | None) -> LoginChange[LoginDoc | None]:
+            if doc is None or doc.step != STEP_GOOGLE or now >= doc.expire_at:
+                return LoginChange(result=None)
+            doc.step = STEP_EXCHANGING
+            return LoginChange(result=doc, login=doc)
+
+        login = await self._store.mutate_login(key, begin)
+        if login is None:
+            self._refused("login_not_waiting_for_google", login=key[:12])
+            return self._page(
+                400, "This sign-in has expired or was already used", AGAIN, clear=True
+            )
+
+        async def fail(status: int, reason: str, title: str, *lines: str) -> Response:
+            await self._close(key)
+            self._refused(reason, login=key[:12])
+            return self._page(status, title, *lines, clear=True)
+
+        if q.getlist("error"):
+            return await fail(400, "google_error", "Sign-in was cancelled", AGAIN)
+        code = _single(q, "code")
+        if code is None or GOOGLE_CODE_RE.fullmatch(code) is None:
+            return await fail(400, "bad_google_code", "Sign-in did not complete", AGAIN)
+        try:
+            id_token = await self._oauth.exchange(
+                code=code, redirect_uri=self.redirect_uri, code_verifier=login.google_verifier
+            )
+            claims = await self._oauth.verify_id_token(id_token)
+        except OAuthError as exc:
+            return await fail(
+                400, f"google_{exc.reason}", "Sign-in with Google did not complete", AGAIN
+            )
+        nonce = claims.get("nonce")
+        if not isinstance(nonce, str) or not _same(nonce, login.nonce):
+            return await fail(400, "bad_nonce", "Sign-in with Google did not complete", AGAIN)
+        if claims.get("email_verified") is not True:
+            return await fail(
+                403,
+                "email_not_verified",
+                "This Google account's email is not verified",
+                "Verify it with Google, then run /team-relay:login again.",
+            )
+        email = normalise_email(claims.get("email"))
+        if email is None:
+            return await fail(400, "no_email", "Sign-in with Google did not complete", AGAIN)
+        memberships = await self._roster.teams_for_email(email, fresh=True)
+        if not memberships:
+            return await fail(
+                403,
+                "not_on_any_team",
+                "This Google account is not on any team",
+                f"Ask the team owner to add {email}.",
+            )
+        csrf = b64url(secrets.token_bytes(32))
+        choices = [LoginChoice(team=t, member=m) for t, m in memberships]
+        now = self._now()
+
+        def offer(doc: LoginDoc | None) -> LoginChange[LoginDoc | None]:
+            if doc is None or doc.step != STEP_EXCHANGING or now >= doc.expire_at:
+                return LoginChange(result=None)
+            doc.step = STEP_CHOOSE
+            doc.email = email
+            doc.choices = choices
+            doc.csrf_sha256 = _key(csrf)
+            return LoginChange(result=doc, login=doc)
+
+        chosen = await self._store.mutate_login(key, offer)
+        if chosen is None:
+            return await fail(400, "login_expired", "This sign-in has expired", AGAIN)
+        page = chooser_page(
+            email=email,
+            device=chosen.device,
+            choices=choices,
+            csrf=csrf,
+            action="/v1/login/choose",
+        )
+        return html_response(page)
+
+    # POST /v1/login/choose --------------------------------------------------------------------
+    async def _read_form(self, request: Request) -> _Form | None:
+        media = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+        if media != "application/x-www-form-urlencoded":
+            return None
+        declared = request.headers.get("content-length")
+        if declared is not None and (
+            not (declared.isascii() and declared.isdigit()) or int(declared) > MAX_FORM_BYTES
+        ):
+            return None
+        data = bytearray()
+        async for chunk in request.stream():
+            data.extend(chunk)
+            if len(data) > MAX_FORM_BYTES:
+                return None
+        try:
+            pairs = parse_qsl(
+                data.decode("ascii"), keep_blank_values=True, strict_parsing=bool(data)
+            )
+        except (UnicodeDecodeError, ValueError):
+            return None
+        fields: dict[str, str] = {}
+        for name, value in pairs:
+            if name not in ("csrf", "team", "action") or name in fields:
+                return None
+            fields[name] = value
+        return _Form(fields=fields)
+
+    async def choose(self, request: Request) -> Response:
+        if not await self._allow(request, "page", self._limits.login_pages_per_minute):
+            return self._busy()
+        origin = request.headers.get("origin")
+        if origin is not None and origin != self.public_url:
+            self._refused("cross_origin_choose")
+            return self._page(403, "This request did not come from the sign-in page", AGAIN)
+        cookie = self._cookie_login(request)
+        if cookie is None:
+            self._refused("no_login_cookie")
+            return self._page(400, "This sign-in did not start in this browser", AGAIN)
+        form = await self._read_form(request)
+        if form is None:
+            self._refused("bad_form")
+            return self._page(400, "This form could not be read", AGAIN)
+        key = _key(cookie)
+        csrf = form.fields.get("csrf", "")
+        action = form.fields.get("action", "continue")
+        team = form.fields.get("team")
+        if action not in ("continue", "cancel"):
+            self._refused("bad_action")
+            return self._page(400, "This form could not be read", AGAIN)
+        now = self._now()
+
+        # Read first (a transaction that writes nothing), so a membership that ended since
+        # the chooser was shown is checked before a code is minted.
+        current = await self._store.mutate_login(key, lambda doc: LoginChange(result=doc))
+        if current is None or current.step != STEP_CHOOSE or now >= current.expire_at:
+            self._refused("login_not_choosing", login=key[:12])
+            return self._page(
+                400, "This sign-in has expired or was already used", AGAIN, clear=True
+            )
+        if (
+            current.csrf_sha256 is None
+            or TOKEN_RE.fullmatch(csrf) is None
+            or not _same(_key(csrf), current.csrf_sha256)
+        ):
+            self._refused("bad_csrf", login=key[:12])
+            return self._page(403, "This form has expired", AGAIN)
+        if action == "cancel":
+            await self._close(key)
+            log_event("login_cancelled", login=key[:12])
+            return self._loopback(current, {"error": "access_denied", "state": current.state})
+        choice = next((c for c in current.choices if team is not None and c.team == team), None)
+        if choice is None or current.email is None:
+            self._refused("team_not_offered", login=key[:12])
+            return self._page(400, "Choose one of your teams", AGAIN)
+        still = await self._roster.member_for_email(choice.team, current.email)
+        if still != choice.member:
+            await self._close(key)
+            self._refused("membership_changed", login=key[:12])
+            return self._page(
+                403, "You are no longer on this team", "Ask the team owner.", clear=True
+            )
+
+        code = b64url(secrets.token_bytes(32))
+        now = self._now()
+
+        def mint(doc: LoginDoc | None) -> LoginChange[LoginDoc | None]:
+            if (
+                doc is None
+                or doc.step != STEP_CHOOSE
+                or now >= doc.expire_at
+                or doc.csrf_sha256 != current.csrf_sha256
+            ):
+                return LoginChange(result=None)
+            doc.step = STEP_DONE
+            minted = LoginCode(
+                key=_key(code),
+                login_key=doc.key,
+                team=choice.team,
+                member=choice.member,
+                device=doc.device,
+                challenge=doc.challenge,
+                created_at=now,
+                expire_at=now + CODE_LIFETIME,
+            )
+            return LoginChange(result=doc, login=doc, code=minted)
+
+        done = await self._store.mutate_login(key, mint)
+        if done is None:
+            self._refused("login_not_choosing", login=key[:12])
+            return self._page(
+                400, "This sign-in has expired or was already used", AGAIN, clear=True
+            )
+        log_event("login_chosen", login=key[:12], team=choice.team, member=choice.member)
+        return self._loopback(done, {"code": code, "state": done.state})
+
+    def _loopback(self, login: LoginDoc, params: Mapping[str, str]) -> Response:
+        # The only redirect target there is: the plugin's own listener on this machine.
+        url = f"http://127.0.0.1:{int(login.port)}/callback?{urlencode(params)}"
+        response = RedirectResponse(url, status_code=303, headers=dict(SECURITY_HEADERS))
+        self._clear_cookie(response)
+        return response
+
+    # POST /v1/login/token ---------------------------------------------------------------------
+    async def token(self, request: Request, raw: Any) -> Response:
+        headers = {"Cache-Control": "no-store", "Pragma": "no-cache"}
+        if not await self._allow(request, "token", self._limits.login_tokens_per_minute):
+            return JSONResponse(
+                {"error": "rate_limited", "detail": "Too many attempts; wait a minute."},
+                429,
+                headers=headers,
+            )
+        code = raw.get("code") if isinstance(raw, dict) else None
+        verifier = raw.get("code_verifier") if isinstance(raw, dict) else None
+        if (
+            not isinstance(raw, dict)
+            or set(raw) != {"code", "code_verifier"}
+            or not isinstance(code, str)
+            or TOKEN_RE.fullmatch(code) is None
+            or not isinstance(verifier, str)
+            or VERIFIER_RE.fullmatch(verifier) is None
+        ):
+            self._refused("bad_token_request")
+            return JSONResponse(
+                {"error": "invalid_request", "detail": "Send {code, code_verifier}."},
+                400,
+                headers=headers,
+            )
+        now = self._now()
+        credential = new_credential()
+        ckey = credential_key(credential)
+        challenge = pkce_challenge(verifier)
+        retention = self._retention
+
+        def redeem(doc: LoginCode | None) -> Redemption[tuple[str, LoginCode | None]]:
+            if doc is None:
+                return Redemption(result=("unknown_code", None))
+            if doc.used:
+                # A code presented twice: whoever holds it, the credential it minted goes.
+                minted = (doc.team, doc.credential_key) if doc.credential_key else None
+                return Redemption(result=("reused_code", doc), revoke=minted)
+            if now >= doc.expire_at:
+                return Redemption(result=("expired_code", doc))
+            doc.used = True
+            if not _same(challenge, doc.challenge):
+                return Redemption(result=("wrong_verifier", doc), code=doc)  # burnt
+            doc.credential_key = ckey
+            record = CredentialRecord(
+                key=ckey,
+                team=doc.team,
+                member=doc.member,
+                device=doc.device,
+                created_at=now,
+                last_used_at=now,
+                expire_at=now + CREDENTIAL_LIFETIME,
+            )
+            audit = AuditEntry(
+                time=now,
+                team=doc.team,
+                actor=doc.member,
+                action="credential.create",
+                outcome="created",
+                expire_at=now + retention,
+                member=doc.member,
+                detail=f"credential {public_id(ckey)}",
+            )
+            return Redemption(result=("ok", doc), code=doc, credential=record, audit=[audit])
+
+        outcome = await self._store.redeem_code(_key(code), redeem, now)
+        reason, doc = outcome.result
+        if outcome.revoked:
+            self._credentials.forget([r.key for r in outcome.revoked])
+            why = "login code reused" if reason == "reused_code" else "device limit"
+            await self._store.append_audit(
+                [
+                    AuditEntry(
+                        time=now,
+                        team=r.team,
+                        actor="relay",
+                        action="credential.revoke",
+                        outcome="revoked",
+                        expire_at=now + retention,
+                        member=r.member,
+                        detail=f"credential {public_id(r.key)}; {why}",
+                    )
+                    for r in outcome.revoked
+                ]
+            )
+        if reason != "ok" or doc is None:
+            self._refused(reason, revoked=len(outcome.revoked))
+            return JSONResponse({"error": "invalid_grant"}, 400, headers=headers)
+        log_event("login_completed", team=doc.team, member=doc.member, credential=public_id(ckey))
+        return JSONResponse(
+            {
+                "credential": credential,
+                "team": doc.team,
+                "member": doc.member,
+                "relay_url": self.public_url,
+                "expires_at": format_time(now + CREDENTIAL_LIFETIME),
+            },
+            200,
+            headers=headers,
+        )

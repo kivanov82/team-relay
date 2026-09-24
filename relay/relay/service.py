@@ -21,12 +21,23 @@ from pydantic import BaseModel, ValidationError
 
 from .clock import Clock, format_time, truncate_ms, utc_now
 from .config import TeamConfig
+from .credentials import PUBLIC_ID_RE, Credentials, public_id
 from .errors import ApiError, not_found
 from .jsonutil import canonical_json, content_digest, sha256_hex
 from .log import log_event
 from .manifest import ManifestError, ManifestValidator, ParamsError, find_capability
 from .manifest import validate_params as check_params
 from .models import CreateRequestBody, CursorBody, ProgressBody, ReplyBody, ToolEventBody
+from .roster import (
+    OWNER,
+    Roster,
+    entry_json,
+    parse_add,
+    parse_update,
+    plan_add,
+    plan_remove,
+    plan_update,
+)
 from .store import (
     STREAMS,
     AuditEntry,
@@ -58,6 +69,9 @@ PRESENCE_INTERVAL = timedelta(seconds=15)
 MAX_WAIT_SECONDS = 25
 RELAY = "relay"
 QUOTA_WINDOW_SECONDS = 60
+ROSTER_QUOTA_WINDOW_SECONDS = 3600  # M6-SPEC §2: roster mutations per owner and hour
+# GET /credentials lists at most this many of the caller's devices, most recently used first.
+MAX_LISTED_CREDENTIALS = 100
 
 # M2-SPEC §3.5, the activity feed.
 ACTIVITY_WINDOW = timedelta(hours=24)  # an omitted `since`
@@ -80,6 +94,14 @@ STATS_READ_CAP = 500
 STATS_CACHE_TTL = timedelta(seconds=10)
 
 
+EMPTY_STATS: dict[str, Any] = {
+    "asked": 0,
+    "answered": 0,
+    "open": 0,
+    "median_answer_seconds": None,
+}
+
+
 def still_open(doc: RequestDoc, state: RecipientState, now: datetime) -> bool:
     """M2-SPEC §7.2: a recipient is open while its relevant deadline is in the future:
     ``pending`` until the ack deadline, ``acked`` until the answer deadline. The feed and
@@ -95,13 +117,15 @@ def still_open(doc: RequestDoc, state: RecipientState, now: datetime) -> bool:
 
 @dataclass(frozen=True)
 class Caller:
-    """The member every rule is applied to. ``delegate`` is the principal of the read-only
-    delegate reading on the member's behalf (M3-SPEC §2), for the logs only; it changes no
-    rule."""
+    """The member every rule is applied to. ``delegate`` is the principal of the delegate
+    acting on the member's behalf (M3-SPEC §2, M6-SPEC §3), for the logs and the audit
+    detail only; it changes no rule. ``credential`` is the key of the device credential the
+    call authenticated with (M5-SPEC §3), if it did."""
 
     team: str
     member: str
     delegate: str | None = None
+    credential: str | None = None
 
 
 @dataclass(frozen=True)
@@ -210,6 +234,10 @@ class RelayService:
         # In-process only (M2-SPEC §7.3): the directory's stats per team, for
         # STATS_CACHE_TTL. One entry per configured team, so it is bounded by the config.
         self._stats_cache: dict[str, _TeamStats] = {}
+        # M6-SPEC §1: membership comes from the roster in the store, cached per team.
+        self.roster = Roster(config, store, self.now)
+        # M5-SPEC §3: device credentials, cached for at most 60 s.
+        self.credentials = Credentials(store, config.team_ids(), self.now)
 
     # Helpers -------------------------------------------------------------------------------
     def now(self) -> datetime:
@@ -317,8 +345,11 @@ class RelayService:
 
         return await self.store.mutate_request(team, request_id, stamped)
 
-    def _teammates(self, caller: Caller) -> list[str]:
-        return [m for m in self.config.members_of(caller.team) if m != caller.member]
+    async def _members(self, team: str) -> tuple[str, ...]:
+        return (await self.roster.snapshot(team)).members()
+
+    async def _teammates(self, caller: Caller) -> list[str]:
+        return [m for m in await self._members(caller.team) if m != caller.member]
 
     @staticmethod
     def _recipient(doc: RequestDoc | None, caller: Caller) -> tuple[RequestDoc, RecipientState]:
@@ -328,8 +359,15 @@ class RelayService:
         return doc, doc.recipients[caller.member]
 
     # §3.2 ----------------------------------------------------------------------------------
-    def me(self, caller: Caller) -> dict[str, Any]:
-        return {"team": caller.team, "member": caller.member, "teammates": self._teammates(caller)}
+    async def me(self, caller: Caller) -> dict[str, Any]:
+        roster = await self.roster.snapshot(caller.team)
+        return {
+            "team": caller.team,
+            "member": caller.member,
+            "teammates": [m for m in roster.members() if m != caller.member],
+            # M6-SPEC §4: the console shows owners the Members panel.
+            "role": roster.role(caller.member),
+        }
 
     # §3.3 ----------------------------------------------------------------------------------
     async def publish_manifest(self, caller: Caller, member: str, raw: Any) -> dict[str, Any]:
@@ -383,7 +421,7 @@ class RelayService:
 
     async def directory(self, caller: Caller) -> dict[str, Any]:
         await self._count_read(caller, "directory")
-        teammates = self._teammates(caller)
+        teammates = await self._teammates(caller)
         docs = await self.store.get_members(caller.team, teammates)
         stats = await self._team_stats(caller.team)
         members = []
@@ -403,7 +441,8 @@ class RelayService:
                         "working": {"last_seen": format_time(replies)},
                         "answering": {"last_seen": format_time(inbox)},
                     },
-                    "stats": dict(stats.members[m]),
+                    # A member added since the cached stats were computed has none yet.
+                    "stats": dict(stats.members.get(m) or EMPTY_STATS),
                 }
             )
         # False when the 24-hour window held more requests than one stats read covers
@@ -420,7 +459,7 @@ class RelayService:
         cached = self._stats_cache.get(team)
         if cached is not None and timedelta(0) <= now - cached.at < STATS_CACHE_TTL:
             return cached
-        members, complete = await self._stats(team, list(self.config.members_of(team)), now)
+        members, complete = await self._stats(team, list(await self._members(team)), now)
         fresh = _TeamStats(at=now, members=members, complete=complete)
         self._stats_cache[team] = fresh
         return fresh
@@ -513,16 +552,16 @@ class RelayService:
             "expire_at": format_time(record.expire_at),
         }
 
-    def _resolve_recipients(
+    async def _resolve_recipients(
         self, caller: Caller, body: CreateRequestBody
     ) -> tuple[list[str], bool]:
-        members = set(self.config.members_of(caller.team))
+        members = set(await self._members(caller.team))
         if body.to == "*":
             if body.kind == "capability":
                 raise ApiError(
                     400, "broadcast_capability", "Capabilities can only be invoked on one member."
                 )
-            recipients = self._teammates(caller)
+            recipients = [m for m in sorted(members) if m != caller.member]
             if not recipients:
                 raise ApiError(400, "bad_recipients", "You have no teammates to broadcast to.")
             return recipients, True
@@ -573,7 +612,7 @@ class RelayService:
         if existing is not None:
             return await self._replay_audited(caller, existing, body_hash, now)
 
-        recipients, broadcast = self._resolve_recipients(caller, body)
+        recipients, broadcast = await self._resolve_recipients(caller, body)
         capability = None
         if body.kind == "capability":
             capability = await self._resolve_capability(caller, recipients[0], body)
@@ -1214,3 +1253,146 @@ class RelayService:
         for request_id in await self.store.due_requests(team, asker, now, SWEEP_BATCH):
             written += await self._mutate(team, request_id, now, self._sweep_fn(now))
         return written
+
+    # M6 §2: the roster -----------------------------------------------------------------
+    async def roster_list(self, caller: Caller) -> dict[str, Any]:
+        """Every entry; an owner sees every email, anyone else only their own (others'
+        ``emails`` are null). Validated against ``roster_version`` on every call, so a
+        console never shows a roster older than the last change it made."""
+        roster = await self.roster.snapshot(caller.team, fresh=True)
+        is_owner = roster.role(caller.member) == OWNER
+        return {
+            "members": [
+                entry_json(roster.entries[m], show_emails=is_owner or m == caller.member)
+                for m in roster.members()
+            ],
+            "roster_version": roster.version,
+        }
+
+    def _roster_quota(self, caller: Caller, now: datetime) -> Quota:
+        start = int(now.timestamp()) // ROSTER_QUOTA_WINDOW_SECONDS * ROSTER_QUOTA_WINDOW_SECONDS
+        return Quota(
+            key=f"{caller.member}.roster.{start}",
+            limit=self.config.limits.roster_mutations_per_hour,
+            expire_at=datetime.fromtimestamp(start + 2 * ROSTER_QUOTA_WINDOW_SECONDS, UTC),
+        )
+
+    async def _change_roster(self, caller: Caller, fn: Any, now: datetime) -> Any:
+        try:
+            outcome = await self.store.mutate_roster(
+                caller.team, fn, now, [self._roster_quota(caller, now)]
+            )
+        except QuotaExceeded as exc:
+            raise ApiError(
+                429,
+                "rate_limited",
+                f"At most {exc.quota.limit} changes to the members an hour; try again later.",
+            ) from None
+        self.roster.invalidate(caller.team)
+        if outcome.revoked:
+            self.credentials.forget(outcome.revoked)
+        return outcome.result
+
+    async def roster_add(self, caller: Caller, raw: Any) -> dict[str, Any]:
+        async def work() -> dict[str, Any]:
+            body = parse_add(raw, self.config)
+            now = self.now()
+            fn = plan_add(caller.team, caller.member, body, now, self._retention, caller.delegate)
+            entry = await self._change_roster(caller, fn, now)
+            return entry_json(entry, show_emails=True)
+
+        return await self._guarded(caller, "roster.add", None, work)
+
+    async def roster_update(self, caller: Caller, member: str, raw: Any) -> dict[str, Any]:
+        async def work() -> dict[str, Any]:
+            body = parse_update(raw, self.config)
+            now = self.now()
+            fn = plan_update(
+                caller.team, caller.member, member, body, now, self._retention, caller.delegate
+            )
+            entry = await self._change_roster(caller, fn, now)
+            return entry_json(entry, show_emails=True)
+
+        return await self._guarded(caller, "roster.update", None, work)
+
+    async def roster_remove(self, caller: Caller, member: str) -> dict[str, Any]:
+        async def work() -> dict[str, Any]:
+            now = self.now()
+            fn = plan_remove(
+                caller.team,
+                caller.member,
+                member,
+                self.config.teams[caller.team].seed_ids,
+                now,
+                self._retention,
+                caller.delegate,
+            )
+            entry = await self._change_roster(caller, fn, now)
+            self.credentials.forget_member(caller.team, entry.member)
+            return {"removed": entry.member}
+
+        return await self._guarded(caller, "roster.remove", None, work)
+
+    # M5 §3: device credentials ---------------------------------------------------------
+    async def credentials_list(self, caller: Caller) -> dict[str, Any]:
+        """The caller's own live devices, most recently used first."""
+        now = self.now()
+        records = [
+            r for r in await self.store.list_credentials(caller.team, caller.member) if r.live(now)
+        ]
+        records.sort(key=lambda r: (r.last_used_at, r.key), reverse=True)
+        return {
+            "credentials": [
+                {
+                    "id": public_id(r.key),
+                    "device": r.device,
+                    "created_at": format_time(r.created_at),
+                    "last_used_at": format_time(r.last_used_at),
+                    "expires_at": format_time(r.expire_at),
+                    "current": r.key == caller.credential,
+                }
+                for r in records[:MAX_LISTED_CREDENTIALS]
+            ]
+        }
+
+    async def credential_revoke(self, caller: Caller, which: str) -> dict[str, Any]:
+        """``self``: the credential the call came with (logout); otherwise one of the
+        caller's own live credentials by its public id. Anything else: 404."""
+
+        async def work() -> dict[str, Any]:
+            now = self.now()
+            if which == "self":
+                if caller.credential is None:
+                    raise ApiError(
+                        400, "not_a_credential", "This call was not made with a device credential."
+                    )
+                key = caller.credential
+            else:
+                if PUBLIC_ID_RE.fullmatch(which) is None:
+                    raise not_found()
+                matches = [
+                    r.key
+                    for r in await self.store.list_credentials(caller.team, caller.member)
+                    if public_id(r.key) == which and r.live(now)
+                ]
+                if len(matches) != 1:
+                    raise not_found()
+                key = matches[0]
+            entry = self._audit(
+                caller.team,
+                caller.member,
+                "credential.revoke",
+                "revoked",
+                now,
+                member=caller.member,
+                detail=f"credential {public_id(key)}" + ("; logout" if which == "self" else ""),
+            )
+            revoked = await self.store.revoke_credential(
+                caller.team, key, caller.member, now, [entry]
+            )
+            if revoked is None:
+                raise not_found()
+            self.credentials.forget([key])
+            return {"revoked": public_id(key)}
+
+        return await self._guarded(caller, "credential.revoke", None, work)

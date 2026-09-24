@@ -14,7 +14,14 @@ from relay.config import Settings, load_schema, load_team_config, parse_team_con
 from relay.errors import ConfigError
 from relay.store_memory import MemoryStore
 
-from .conftest import REPO_ROOT, SCHEMA_PATH, TOKENS, auth, principal, team_config_data
+from .conftest import (
+    EXAMPLE_CONFIG,
+    SCHEMA_PATH,
+    TOKENS,
+    auth,
+    principal,
+    team_config_data,
+)
 
 pytestmark = pytest.mark.anyio
 
@@ -23,9 +30,14 @@ pytestmark = pytest.mark.anyio
 
 
 def test_example_team_config_loads():
-    config = load_team_config(REPO_ROOT / "config" / "team.example.yaml")
-    assert config.members_of("demo") == ("alice", "bob", "carol")
-    assert config.resolve("google:bob@example.com").member == "bob"
+    config = load_team_config(EXAMPLE_CONFIG)
+    seeds = config.teams["demo"].seeds
+    assert [(s.id, s.role) for s in seeds] == [
+        ("alice", "owner"),
+        ("bob", "member"),
+        ("carol", "member"),
+    ]
+    assert seeds[1].emails == ("bob@example.com",)
     assert config.limits.min_ack_timeout_seconds == 10
     assert config.limits.min_answer_timeout_seconds == 60
     assert config.audit_retention_days == 90
@@ -37,12 +49,12 @@ def test_google_principals_are_lowercased():
             {
                 "id": "demo",
                 "members": [
-                    {"id": "alice", "principals": ["google:Alice@Example.COM"]},
+                    {"id": "alice", "role": "owner", "principals": ["google:Alice@Example.COM"]},
                 ],
             }
         ]
     }
-    assert parse_team_config(data).resolve("google:alice@example.com").member == "alice"
+    assert parse_team_config(data).teams["demo"].seeds[0].emails == ("alice@example.com",)
 
 
 @pytest.mark.parametrize(
@@ -53,12 +65,6 @@ def test_google_principals_are_lowercased():
                 d["teams"][0]["members"][0]["principals"][0]
             ),
             "listed twice",
-        ),
-        (
-            lambda d: d["teams"][1]["members"].append(
-                {"id": "alice", "principals": [principal("x" * 20)]}
-            ),
-            "duplicate member",
         ),
         (
             lambda d: d["teams"][0]["members"].append(
@@ -79,6 +85,22 @@ def test_google_principals_are_lowercased():
         (lambda d: d["teams"][0]["members"][0].__setitem__("id", "Alice"), "member id"),
         (lambda d: d.__setitem__("extra", 1), "extra"),
         (lambda d: d.__setitem__("limits", {"min_ack_timeout_seconds": 0}), "limits"),
+        # M6-SPEC §1: a team needs a seed owner; roles are owner or member.
+        (lambda d: d["teams"][0]["members"][0].pop("role"), "no member with role: owner"),
+        (lambda d: d["teams"][0]["members"][0].__setitem__("role", "admin"), "role"),
+        (lambda d: d["teams"][0]["members"][0].__setitem__("role", "Owner"), "role"),
+        # at most 5 google principals a member
+        (
+            lambda d: d["teams"][0]["members"][1]["principals"].extend(
+                f"google:bob{i}@example.com" for i in range(5)
+            ),
+            "more than 5 google principals",
+        ),
+        # an email is one plain address
+        (
+            lambda d: d["teams"][0]["members"][1]["principals"].append("google:a,b@example.com"),
+            "principal must be",
+        ),
     ],
 )
 def test_bad_team_config_is_a_startup_error(mutate, message):
@@ -87,6 +109,19 @@ def test_bad_team_config_is_a_startup_error(mutate, message):
     with pytest.raises(ConfigError) as exc:
         parse_team_config(data)
     assert message in str(exc.value)
+
+
+def test_a_principal_and_a_member_id_may_be_in_several_teams():
+    """M5-SPEC §4: one member id per team, and member ids are unique within a team only."""
+    data = team_config_data()
+    data["teams"][1]["members"].append(
+        {"id": "alice", "principals": [principal(TOKENS["alice"]), "google:alice@example.com"]}
+    )
+    config = parse_team_config(data)
+    assert config.token_member(principal(TOKENS["alice"]), "demo") == "alice"
+    assert config.token_member(principal(TOKENS["alice"]), "other") == "alice"
+    assert [s.id for s in config.teams["other"].seeds] == ["dave", "alice"]
+    assert config.teams["other"].seeds[1].emails == ("alice@example.com",)
 
 
 def test_duplicate_principal_error_does_not_echo_the_principal():
@@ -148,9 +183,13 @@ def test_static_mode_is_refused_on_cloud_run(tmp_path: Path, monkeypatch, settin
 
 
 def test_google_mode_is_allowed_on_cloud_run(tmp_path: Path):
+    client = tmp_path / "oauth.json"
+    client.write_text(json.dumps({"client_id": "id.example", "client_secret": "s3cret"}))
     env = {
         "RELAY_TEAM_CONFIG": str(_write_config(tmp_path)),
         "RELAY_AUDIENCE": "https://relay.example",
+        "RELAY_PUBLIC_URL": "https://relay.example",
+        "RELAY_OAUTH_CLIENT_FILE": str(client),
         "K_SERVICE": "relay",
     }
     assert Settings.from_env(env).auth_mode == "google"
@@ -216,9 +255,14 @@ async def test_other_team_is_404_and_audited_on_mutations(client, memory_store):
 async def test_me(client):
     r = await client.get("/v1/teams/demo/me", headers=auth("bob"))
     assert r.status_code == 200
-    assert r.json() == {"team": "demo", "member": "bob", "teammates": ["alice", "carol"]}
+    assert r.json() == {
+        "team": "demo",
+        "member": "bob",
+        "teammates": ["alice", "carol"],
+        "role": "member",
+    }
     r = await client.get("/v1/teams/other/me", headers=auth("dave"))
-    assert r.json() == {"team": "other", "member": "dave", "teammates": []}
+    assert r.json() == {"team": "other", "member": "dave", "teammates": [], "role": "owner"}
 
 
 async def test_unknown_routes_and_methods(client):

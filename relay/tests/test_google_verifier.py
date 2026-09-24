@@ -367,7 +367,7 @@ async def google_client(endpoint, clock, capsys):
             {
                 "id": "demo",
                 "members": [
-                    {"id": "alice", "principals": ["google:alice@example.com"]},
+                    {"id": "alice", "role": "owner", "principals": ["google:alice@example.com"]},
                     {"id": "bob", "principals": ["google:bob@example.com"]},
                 ],
             }

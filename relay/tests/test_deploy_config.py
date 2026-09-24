@@ -42,6 +42,14 @@ def _write_config(directory: Path) -> Path:
     return path
 
 
+def _login_env(directory: Path) -> dict[str, str]:
+    """M5-SPEC §5: on Cloud Run the relay also needs its public URL and its OAuth client."""
+    directory.mkdir(parents=True, exist_ok=True)
+    client = directory / "oauth-client.json"
+    client.write_text(json.dumps({"client_id": "id.example", "client_secret": "s3cret"}))
+    return {"RELAY_PUBLIC_URL": SERVICE_URL, "RELAY_OAUTH_CLIENT_FILE": str(client)}
+
+
 # /v1/health ---------------------------------------------------------------------------------
 
 
@@ -111,6 +119,7 @@ def test_settings_carry_every_audience(tmp_path: Path):
         "RELAY_TEAM_CONFIG": str(_write_config(tmp_path)),
         "RELAY_AUDIENCE": f"{GCLOUD_CLIENT},{SERVICE_URL}",
         "K_SERVICE": "team-relay",
+        **_login_env(tmp_path / "oauth"),
     }
     settings = Settings.from_env(env)
     assert settings.auth_mode == "google"
@@ -224,9 +233,10 @@ def test_the_team_config_is_read_from_a_mounted_secret_file(tmp_path: Path):
         "RELAY_TEAM_CONFIG": str(mounted),
         "RELAY_AUDIENCE": f"{GCLOUD_CLIENT},{SERVICE_URL}",
         "K_SERVICE": "team-relay",
+        **_login_env(tmp_path / "oauth"),
     }
     settings = Settings.from_env(env)
-    assert settings.team_config.members_of("demo") == ("alice", "bob", "carol")
+    assert [s.id for s in settings.team_config.teams["demo"].seeds] == ["alice", "bob", "carol"]
 
 
 def test_a_missing_mounted_file_is_a_startup_error(tmp_path: Path):
@@ -279,4 +289,4 @@ def test_static_tokens_still_resolve_under_the_new_settings(tmp_path: Path):
     settings = Settings.from_env(env)
     assert settings.audiences == ()
     principal = "token:sha256:" + hashlib.sha256(TOKENS["alice"].encode()).hexdigest()
-    assert settings.team_config.resolve(principal) is not None
+    assert settings.team_config.token_member(principal, "demo") == "alice"

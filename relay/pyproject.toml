@@ -21,6 +21,9 @@ dependencies = [
     # Teammate-published manifest patterns are evaluated only by RE2 (linear time; M1-SPEC
     # §11.1). Imported as `re2`; ships binary wheels (manylinux for the python:3.12 image).
     "google-re2==1.1.20251105",
+    # Direct, not inherited: relay/oauth.py verifies the login's Google ID token (RS256 over
+    # Google's JWKS) with it.
+    "cryptography==50.0.1",
 ]
 
 [project.optional-dependencies]

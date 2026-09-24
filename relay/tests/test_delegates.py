@@ -11,15 +11,15 @@ import pytest
 from fastapi.routing import APIRoute
 
 from relay.app import DELEGATE_ROUTES, ON_BEHALF_HEADER
-from relay.config import Delegate, load_team_config, parse_team_config
+from relay.config import Delegate, load_team_config, normalise_email, parse_team_config
 from relay.errors import ConfigError
 
 from .conftest import (
     DELEGATE_TOKENS,
     DELEGATES,
     EMAILS,
+    EXAMPLE_CONFIG,
     MANIFEST,
-    REPO_ROOT,
     TOKENS,
     Api,
     FakeClock,
@@ -54,8 +54,8 @@ def test_a_team_file_without_delegates_has_none():
 
 
 def test_the_example_team_config_still_loads():
-    config = load_team_config(REPO_ROOT / "config" / "team.example.yaml")
-    assert config.members_of("demo") == ("alice", "bob", "carol")
+    config = load_team_config(EXAMPLE_CONFIG)
+    assert [s.id for s in config.teams["demo"].seeds] == ["alice", "bob", "carol"]
 
 
 def test_a_delegate_is_parsed_and_lowercased():
@@ -64,10 +64,16 @@ def test_a_delegate_is_parsed_and_lowercased():
           "scope": "read"}]
     )  # fmt: skip
     config = parse_team_config(data)
-    assert config.delegates == {CONSOLE: Delegate(principal=CONSOLE, team="demo", scope="read")}
-    assert config.delegate(CONSOLE) == Delegate(principal=CONSOLE, team="demo", scope="read")
-    # A delegate is never a member: it does not resolve as one.
-    assert config.resolve(CONSOLE) is None
+    expected = Delegate(principal=CONSOLE, team="demo", scopes=frozenset({"read"}))
+    assert config.delegates == {CONSOLE: expected}
+    assert config.delegate(CONSOLE) == expected
+    assert not expected.manages_roster
+    # A delegate is never a member: no seed holds its email.
+    assert all(
+        "console@example-project.iam.gserviceaccount.com" not in seed.emails
+        for team in config.teams.values()
+        for seed in team.seeds
+    )
 
 
 def test_delegates_for_two_teams():
@@ -95,7 +101,14 @@ def test_delegates_for_two_teams():
         # scope has one value
         ([{"principal": CONSOLE, "team": "demo", "scope": "write"}], "delegates.0.scope"),
         ([{"principal": CONSOLE, "team": "demo", "scope": "READ"}], "delegates.0.scope"),
-        ([{"principal": CONSOLE, "team": "demo", "scope": ["read"]}], "delegates.0.scope"),
+        ([{"principal": CONSOLE, "team": "demo", "scope": ["write"]}], "delegates.0.scope"),
+        # M6-SPEC §3: a list must hold read, once each
+        ([{"principal": CONSOLE, "team": "demo", "scope": []}], "must include 'read'"),
+        ([{"principal": CONSOLE, "team": "demo", "scope": ["manage-roster"]}],
+         "must include 'read'"),
+        ([{"principal": CONSOLE, "team": "demo", "scope": ["read", "read"]}], "listed twice"),
+        ([{"principal": CONSOLE, "team": "demo", "scope": "manage-roster"}],
+         "delegates.0.scope"),
         ([{"principal": CONSOLE, "team": "demo"}], "delegates.0.scope"),
         ([{"principal": CONSOLE, "scope": "read"}], "delegates.0.team"),
         ([{"team": "demo", "scope": "read"}], "delegates.0.principal"),
@@ -155,22 +168,40 @@ def test_a_bad_delegate_error_does_not_echo_the_principal():
         ("a" * 320 + "@example.com", None),
     ],
 )
-def test_resolve_on_behalf(email: str, member: str | None):
-    config = parse_team_config(with_delegates(team_config_data()))
-    delegate = config.delegate(DELEGATES["demo"])
-    assert delegate is not None
-    identity = config.resolve_on_behalf(delegate, email)
-    assert (identity.member if identity else None) == member
-    if identity is not None:
-        assert identity.team == "demo"
+async def test_resolve_on_behalf(api: Api, email: str, member: str | None):
+    """The header resolves through the delegate's team roster (M6-SPEC §1)."""
+    if member is None:
+        assert normalise_email(email) is None or email.lower() not in {
+            EMAILS[m] for m in ("alice", "bob", "carol")
+        }
+    if "\n" in email:
+        return  # not a header value an HTTP client can send; refused as an email above
+    r = await api.delegated("GET", "/me", email)
+    if member is None:
+        assert r.status_code == 401, r.text
+    else:
+        assert r.status_code == 200, r.text
+        assert (r.json()["team"], r.json()["member"]) == (api.team, member)
 
 
-def test_a_delegate_resolves_only_its_own_team():
-    config = parse_team_config(with_delegates(team_config_data()))
-    other = config.delegate(DELEGATES["other"])
-    assert other is not None
-    assert config.resolve_on_behalf(other, EMAILS["dave"]).member == "dave"
-    assert config.resolve_on_behalf(other, EMAILS["alice"]) is None
+def test_a_delegate_scope_list_with_manage_roster():
+    data = _config([{"principal": CONSOLE, "team": "demo", "scope": ["read", "manage-roster"]}])
+    delegate = parse_team_config(data).delegate(CONSOLE)
+    assert delegate is not None and delegate.manages_roster
+    assert delegate.scopes == frozenset({"read", "manage-roster"})
+
+
+async def test_a_delegate_resolves_only_its_own_team(api: Api):
+    r = await api.delegated("GET", "/me", EMAILS["dave"], delegate="other")
+    assert r.status_code == 404  # dave's team is "other", the URL's team is api.team
+    r = await api.client.get("/v1/teams/other/me", headers={**_other_delegate(EMAILS["dave"])})
+    assert r.status_code == 200 and r.json()["member"] == "dave"
+    r = await api.client.get("/v1/teams/other/me", headers={**_other_delegate(EMAILS["alice"])})
+    assert r.status_code == 401  # alice is not on team other's roster
+
+
+def _other_delegate(email: str) -> dict[str, str]:
+    return {"Authorization": f"Bearer {DELEGATE_TOKENS['other']}", ON_BEHALF_HEADER: email}
 
 
 # The four reads, as the member named -------------------------------------------------------

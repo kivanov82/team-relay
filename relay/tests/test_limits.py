@@ -15,7 +15,7 @@ from relay.config import Limits, Settings, load_schema, load_team_config, parse_
 from relay.errors import ConfigError
 from relay.store_memory import MemoryStore
 
-from .conftest import REPO_ROOT, SCHEMA_PATH, FakeClock, auth, team_config_data
+from .conftest import EXAMPLE_CONFIG, SCHEMA_PATH, FakeClock, auth, team_config_data
 from .helpers import ack, ask, get, post, question_body, reply, stream
 
 pytestmark = pytest.mark.anyio
@@ -49,7 +49,7 @@ async def limited(memory_store, clock) -> AsyncIterator[httpx.AsyncClient]:
 
 
 def test_limit_defaults():
-    config = load_team_config(REPO_ROOT / "config" / "team.example.yaml")
+    config = load_team_config(EXAMPLE_CONFIG)
     assert config.limits == Limits(
         min_ack_timeout_seconds=10,
         min_answer_timeout_seconds=60,
@@ -58,6 +58,10 @@ def test_limit_defaults():
         audited_refusals_per_minute=60,
         concurrent_polls=2,
         reads_per_minute=120,
+        login_starts_per_minute=20,
+        login_pages_per_minute=30,
+        login_tokens_per_minute=20,
+        roster_mutations_per_hour=30,
     )
 
 

@@ -5,11 +5,12 @@ exist only in this file."""
 from __future__ import annotations
 
 import hashlib
+import http.cookiejar
 import os
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -24,10 +25,17 @@ from relay.config import Settings, load_schema, parse_team_config
 from relay.store import Store
 from relay.store_memory import MemoryStore
 
+from .fake_google import FakeGoogle, FakeGoogleProvider
+
 RELAY_ROOT = Path(__file__).resolve().parent.parent
 REPO_ROOT = RELAY_ROOT.parent
 SCHEMA_PATH = REPO_ROOT / "schema" / "manifest.schema.json"
 PLUGIN_MANIFEST = REPO_ROOT / "plugin" / "manifest.yaml"
+# The shipped example team file. RELAY_TEST_EXAMPLE_CONFIG points the tests at another copy
+# (tests only; the relay never reads it).
+EXAMPLE_CONFIG = Path(
+    os.environ.get("RELAY_TEST_EXAMPLE_CONFIG") or REPO_ROOT / "config" / "team.example.yaml"
+)
 
 TOKENS = {
     "alice": "dev-token-alice-0001",
@@ -36,6 +44,17 @@ TOKENS = {
     "dave": "dev-token-dave-0004",
 }
 START = datetime(2026, 9, 23, 12, 0, 0, tzinfo=UTC)
+# The relay's public origin in the API tests (M5-SPEC §2): the login pages and Google's
+# redirect URI are built from it.
+PUBLIC_URL = "https://relay.example.com"
+# The login endpoints count per client IP in the store, and the Firestore tests share one
+# emulator: every test runs with generous login limits unless it sets its own, and the
+# rate-limit tests use an address of their own.
+LOGIN_LIMITS = {
+    "login_starts_per_minute": 10000,
+    "login_pages_per_minute": 10000,
+    "login_tokens_per_minute": 10000,
+}
 
 # Each member also has a Google principal: the email a delegate names in
 # X-Relay-On-Behalf-Of resolves through it (M3-SPEC §2).
@@ -73,8 +92,13 @@ def team_config_data(**limits: int) -> dict[str, Any]:
         "teams": [
             {
                 "id": "demo",
+                # alice is the seed owner (M6-SPEC §1); bob and carol are seed members.
                 "members": [
-                    {"id": m, "principals": [principal(TOKENS[m]), f"google:{EMAILS[m]}"]}
+                    {
+                        "id": m,
+                        **({"role": "owner"} if m == "alice" else {}),
+                        "principals": [principal(TOKENS[m]), f"google:{EMAILS[m]}"],
+                    }
                     for m in ("alice", "bob", "carol")
                 ],
             },
@@ -83,6 +107,7 @@ def team_config_data(**limits: int) -> dict[str, Any]:
                 "members": [
                     {
                         "id": "dave",
+                        "role": "owner",
                         "principals": [principal(TOKENS["dave"]), f"google:{EMAILS['dave']}"],
                     }
                 ],
@@ -222,6 +247,11 @@ def delegate_auth(on_behalf: str | None, team: str = "demo") -> dict[str, str]:
     return headers
 
 
+def no_cookie_jar() -> http.cookiejar.CookieJar:
+    """A jar that keeps nothing: the login tests send every cookie explicitly."""
+    return http.cookiejar.CookieJar(http.cookiejar.DefaultCookiePolicy(allowed_domains=[]))
+
+
 def unique_team() -> str:
     return "t" + uuid.uuid4().hex[:20]
 
@@ -237,13 +267,38 @@ NO_EMULATOR = "FIRESTORE_EMULATOR_HOST is not set; run scripts/test-relay.sh to 
 class Api:
     """The HTTP API over one store, for tests that must hold on both stores. The team id is
     unique per test (``unique_team()``), so Firestore tests never see each other's data;
-    alice, bob and carol are its members, dave is alone in team ``other``."""
+    alice (the seed owner), bob and carol are its members, dave is alone in team ``other``.
+    The login pages are on, with :class:`FakeGoogle` as Google (``fake``)."""
 
     client: httpx.AsyncClient
     team: str
     store: Store
     clock: FakeClock
     app: FastAPI
+    settings: Settings | None = None
+    fake: FakeGoogle | None = None
+    teams: dict[str, str] = field(default_factory=dict)  # "demo"/"other" -> this test's id
+
+    @asynccontextmanager
+    async def instance(
+        self, client_ip: str = "127.0.0.1"
+    ) -> AsyncIterator[tuple[httpx.AsyncClient, FastAPI]]:
+        """Another relay instance over the same store and settings (its own caches), and
+        a client for it; ``client_ip`` is the socket peer the login rate limits see."""
+        assert self.settings is not None and self.fake is not None
+        app = create_app(
+            self.settings,
+            self.store,
+            clock=self.clock,
+            poll_interval=0.02,
+            verifier=DelegateVerifier(),
+            oauth=FakeGoogleProvider(self.fake),
+        )
+        transport = httpx.ASGITransport(app=app, client=(client_ip, 50000))
+        async with httpx.AsyncClient(
+            transport=transport, base_url=PUBLIC_URL, cookies=no_cookie_jar()
+        ) as c:
+            yield c, app
 
     def url(self, path: str) -> str:
         return f"/v1/teams/{self.team}{path}"
@@ -340,9 +395,16 @@ class Api:
 
 
 @asynccontextmanager
-async def open_api(kind: str, clock: FakeClock, **limits: int) -> AsyncIterator[Api]:
+async def open_api(
+    kind: str,
+    clock: FakeClock,
+    *,
+    configure: Callable[[dict[str, Any]], None] | None = None,
+    **limits: int,
+) -> AsyncIterator[Api]:
     """An :class:`Api` over a fresh ``kind`` store ("memory" or "firestore") for a unique
-    team, with the team's delegate configured and ``limits`` applied."""
+    team, with the teams' delegates configured, ``limits`` applied, and ``configure`` run on
+    the file's data last (it may rename the second team, ``other``, to isolate it)."""
     if kind == "memory":
         store: Store = MemoryStore()
     else:
@@ -352,20 +414,40 @@ async def open_api(kind: str, clock: FakeClock, **limits: int) -> AsyncIterator[
 
         store = FirestoreStore(project=os.environ.get("GOOGLE_CLOUD_PROJECT", "demo-relay"))
     team = unique_team()
-    data = team_config_data(min_ack_timeout_seconds=2, **limits)
+    data = team_config_data(min_ack_timeout_seconds=2, **{**LOGIN_LIMITS, **limits})
     data["teams"][0]["id"] = team
     with_delegates(data)
+    if configure is not None:
+        configure(data)
     settings = Settings(
         team_config=parse_team_config(data),
         manifest_schema=load_schema(SCHEMA_PATH),
         auth_mode="static",
+        public_url=PUBLIC_URL,
     )
-    app = create_app(settings, store, clock=clock, poll_interval=0.02, verifier=DelegateVerifier())
+    fake = FakeGoogle(clock=lambda: clock.current.timestamp())
+    app = create_app(
+        settings,
+        store,
+        clock=clock,
+        poll_interval=0.02,
+        verifier=DelegateVerifier(),
+        oauth=FakeGoogleProvider(fake),
+    )
     try:
         async with httpx.AsyncClient(
-            transport=httpx.ASGITransport(app=app), base_url="http://relay"
+            transport=httpx.ASGITransport(app=app), base_url=PUBLIC_URL, cookies=no_cookie_jar()
         ) as c:
-            yield Api(client=c, team=team, store=store, clock=clock, app=app)
+            yield Api(
+                client=c,
+                team=team,
+                store=store,
+                clock=clock,
+                app=app,
+                settings=settings,
+                fake=fake,
+                teams={"demo": team, "other": data["teams"][1]["id"]},
+            )
     finally:
         await store.aclose()
 
