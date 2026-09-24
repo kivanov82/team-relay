@@ -134,7 +134,13 @@ export class Party {
         party.other.push(n);
       }
     };
-    await client.connect(transport);
+    try {
+      await client.connect(transport);
+    } catch (err) {
+      // The server's own reason (it never logs a token) makes a failed start readable.
+      await sleep(100);
+      throw new Error(`${label} did not start: ${String(err)}; stderr: ${party.err.slice(-800)}`);
+    }
     return party;
   }
 

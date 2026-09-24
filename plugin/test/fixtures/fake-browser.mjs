@@ -11,6 +11,9 @@
 // FAKE_BROWSER_MODE (optional): "ignore" does nothing (a browser that never opened);
 // "wrong-state" goes to the callback with another state; "twice" repeats the callback.
 // FAKE_BROWSER_TEAM (optional): the team to choose on the chooser page.
+// FAKE_BROWSER_EMAIL (optional): the Google account to sign in as at a fake provider's
+// consent page (any URL whose path ends in /authorize gets &email=<it>, which the relay's
+// relay/tests/fake_oauth_app.py reads).
 
 import { appendFileSync, readFileSync } from 'node:fs';
 
@@ -74,6 +77,9 @@ async function main() {
   let contentType;
   for (let i = 0; i < 20; i++) {
     const target = new URL(url);
+    if (process.env.FAKE_BROWSER_EMAIL && target.pathname.endsWith('/authorize') && !target.searchParams.has('email')) {
+      target.searchParams.set('email', process.env.FAKE_BROWSER_EMAIL);
+    }
     const isCallback = target.hostname === '127.0.0.1' && target.pathname === '/callback';
     if (isCallback && mode === 'wrong-state') target.searchParams.set('state', 'x'.repeat(43));
     const headers = { Accept: 'text/html,application/json' };

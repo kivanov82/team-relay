@@ -120,7 +120,8 @@ describe.skipIf(!ENABLED)('M1 end to end (relay + Firestore emulator + bundled s
       expect(JSON.stringify(caps)).not.toContain('permission');
     }
     const askerTools = (await alice.client.listTools()).tools.map((t) => t.name).sort();
-    expect(askerTools).toEqual(['ask_question', 'invoke_capability', 'list_teammates', 'request_status']);
+    // M5-SPEC §6: login, logout and whoami join the asker's tools.
+    expect(askerTools).toEqual(['ask_question', 'invoke_capability', 'list_teammates', 'login', 'logout', 'request_status', 'whoami']);
     const answererTools = (await bob.client.listTools()).tools.map((t) => t.name).sort();
     expect(answererTools).toEqual(['ack_question', 'reply']);
     expect((await bobCaps.client.listTools()).tools.map((t) => t.name)).toEqual(['staging_db_query']);

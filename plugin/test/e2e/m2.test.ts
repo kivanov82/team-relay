@@ -295,7 +295,7 @@ describe.skipIf(!M2)('M2 end to end (plugin side)', () => {
       const base = `http://127.0.0.1:${m[1]}`;
       const get = (path: string, init: RequestInit = {}) => fetch(base + path, { ...init, headers: { 'X-Console-Key': m[2]!, ...(init.headers ?? {}) } });
       const me = await (await get('/api/me')).json();
-      expect(me).toEqual({ team: 'demo', member: 'carol', teammates: ['alice', 'bob'] });
+      expect(me).toMatchObject({ team: 'demo', member: 'carol', teammates: ['alice', 'bob'] });
       const feed = (await (await get('/api/activity?limit=200')).json()) as { requests: FeedEntry[] };
       expect(Array.isArray(feed.requests)).toBe(true);
       const dir = (await (await get('/api/directory')).json()) as { members: Array<{ member: string }> };
