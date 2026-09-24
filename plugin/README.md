@@ -6,14 +6,15 @@ answer is pushed into the asker's session over a Claude Code channel. The contra
 `../docs/M1-SPEC.md` (this plugin is its §8, as corrected in §11), `../docs/M2-SPEC.md`
 §2 and §4 (Google identity, tool events, the console), `../docs/M4-SPEC.md` (what the
 answering session may read, and how a member grants more), `../docs/M5-SPEC.md` (install
-with no questions, sign in with `/team-relay:login`) and `../docs/M6-SPEC.md` (owners manage
-members in the console).
+with no questions, sign in with `/team-relay:login`, and its §9 corrections after the security
+review) and `../docs/M6-SPEC.md` (owners manage members in the console).
 
 Each member runs two sessions:
 
 - **Working session** (your normal `claude`): the plugin's `relay` channel in *asker* role.
   Tools `list_teammates`, `ask_question`, `invoke_capability`, `request_status`, and
-  `login`, `logout`, `whoami` for signing in; answers,
+  `login`, `whoami` for signing in (signing out is the `/team-relay:logout` command, never a
+  tool); answers,
   "no response yet" and "acknowledged but not answered" notices arrive as
   `<channel source="relay" ...>` events.
 - **Answering session** (`bin/answerer`): a separate, locked-down `claude` that receives
@@ -37,9 +38,13 @@ Commands (`commands/*.md`, namespaced by the plugin name):
 
 | Command | What it does |
 |---|---|
-| `/team-relay:login [relay-url]` | Calls the `login` tool: signs this computer in (below). A URL signs in to another relay. |
+| `/team-relay:login` | Calls the `login` tool, which takes no arguments: signs this computer in to the configured relay (below). |
+| `/team-relay:logout` | Runs `node "${CLAUDE_PLUGIN_ROOT}/dist/logout.js"` itself (the `` !`…` `` form, when the command expands): revokes this computer's credential at its relay, then deletes it. |
 | `/team-relay:answering` | Prints the one command that starts your answering session (`"${CLAUDE_PLUGIN_ROOT}/bin/answerer"`), and the settings that share folders and offer capabilities (generated from `manifest.yaml`). |
 | `/team-relay:console` | Prints the command that opens the local console (`"${CLAUDE_PLUGIN_ROOT}/bin/console" --open`). |
+
+Every command is `disable-model-invocation: true`: only you run them, never the model on its
+own.
 
 ## Running the working session
 
@@ -53,39 +58,66 @@ claude --dangerously-load-development-channels plugin:team-relay@team-relay-dev
 A SessionStart hook adds one line of context: who you are on the relay and who your
 teammates are, or `Not connected: run /team-relay:login`.
 
-### Signing in (M5-SPEC §2, §6)
+### Signing in (M5-SPEC §2, §6, §9)
 
 `/team-relay:login` runs the asker channel's `login` tool, loopback + PKCE in the style of
-RFC 8252 (no device codes, so nothing to phish):
+RFC 8252 (no device codes, so nothing to phish).
+
+**The relay is not the model's to choose** (§9 item 1). `login` takes no arguments: it signs
+in to `RELAY_URL` from the environment Claude Code was started with, else the plugin's
+default relay. A team on another relay starts its working session with
+`RELAY_URL=https://<relay> claude …`. A stored credential issued by a different relay than
+the configured one (or a file that cannot be used) is never replaced: `login` refuses before
+anything opens and says to run `/team-relay:logout` first, and the check is made again just
+before a new credential is written. (The security review showed why: a model steered by
+teammate text into `login` with an attacker's relay URL would otherwise have moved the
+member's sign-in there silently; `test/login.test.ts` keeps that attack as a regression.)
 
 1. It makes a PKCE verifier (64 base64url characters) and its S256 challenge, a random
-   `state` (32 bytes), and an HTTP listener on **127.0.0.1 only**, on a free port, for
-   **one request** and at most **5 minutes**.
+   `state` (32 bytes), and an HTTP listener on **127.0.0.1 only**, on a free port, for at
+   most **5 minutes**.
 2. It opens your browser at `{relay}/v1/login/start?port&state&code_challenge&device`,
    through a private mode-600 redirect file (the URL never appears in a process argument,
    M2-SPEC §7.7; `TEAM_RELAY_OPEN_COMMAND` names another opener), and returns the URL at once
-   in the tool result, in case no browser opens.
+   in the tool result, in case no browser opens, with the rule that it is for you alone: the
+   model shows it to you once and never repeats it to anyone else (whoever finishes a
+   sign-in at that link decides who your computer is signed in as). `whoami` never repeats
+   it.
 3. On the relay you sign in with Google, see the teams your account belongs to, and choose
    one. The relay sends the browser to `http://127.0.0.1:<port>/callback?code&state`.
-4. The listener takes exactly that request (`GET /callback`, `Host: 127.0.0.1:<port>`, the
-   `state` compared in constant time; anything else ends the sign-in; Cancel on the chooser
-   comes back as `?error=access_denied` and ends it as "sign-in cancelled"), shows
-   "Connected. You can close this tab.", and exchanges the code and the verifier at `POST
-   {relay}/v1/login/token` for a device credential (`trc_…`).
+4. Only `GET /callback` with `Host: 127.0.0.1:<port>` and exactly one `state` equal to ours
+   (compared in constant time) ends the wait (§9 item 4); a request with another Host, path,
+   method or state gets a `404` and the listener keeps waiting. Cancel on the chooser comes
+   back as `?error=access_denied` with the right state and ends it as "sign-in cancelled".
+   The right request is answered "Connected. You can close this tab.", and the code and the
+   verifier are exchanged at `POST {relay}/v1/login/token` for a device credential (`trc_…`).
 5. The credential is stored in `$XDG_CONFIG_HOME/team-relay/credentials.json` (default
-   `~/.config/team-relay/`), `{relay_url, team, member, credential, expires_at}`, the
-   directory mode 700 and the file mode 600, written atomically. A file or directory others
-   could read, one owned by someone else, or a symlink is refused, never used. The channel
-   pushes a `<channel source="relay" type="status">` line saying you are signed in, and its
-   stream starts without a restart.
+   `~/.config/team-relay/`), `{relay_url, team, member, credential, expires_at, email}`
+   (`email`, the Google account, when the relay reports it), the directory mode 700 and the
+   file mode 600, written atomically. A file or directory others could read, one owned by
+   someone else, or a symlink is refused, never used. The channel pushes a
+   `<channel source="relay" type="status">` line, "Connected as <member> (<email>) on team
+   <team>" (§9 item 3; without the email from a relay that does not report it), and its
+   stream starts without a restart. When the new credential is a different member or team
+   than the one it replaced, the line says so plainly, and `whoami` repeats it as `changed`.
+   A credential minted but not stored (another relay's credential appeared meanwhile, or an
+   answer that fails the checks) is revoked at the relay.
 
 With no stored sign-in the channel starts anyway, waits quietly (it looks for the file every
 2 s, so a login from another session counts too), and every teammate tool answers `Not
 connected: run /team-relay:login`. A credential the relay refuses (401: signed out, expired,
 or removed from the team) is never retried in a loop: the tools and a status line say to run
 `/team-relay:login` again, and a new login reconnects. `whoami` says who you are signed in
-as; `logout` revokes the credential at the relay (`DELETE /credentials/self`) and deletes the
-file. The credential is only ever sent to the relay it came from.
+as ("Connected as <member> (<email>) on team <team>"). The credential is only ever sent to
+the relay it came from.
+
+**Signing out is a command, not a tool** (§9 item 2), so nothing a teammate writes can steer
+the model into signing you out. `/team-relay:logout` runs `dist/logout.js` when the command
+expands: it revokes the credential at the relay it was issued by (`DELETE
+/credentials/self`, whatever `RELAY_URL` says), then deletes the file, and prints one line.
+A relay that no longer knows the credential, or cannot be reached, still ends in the file
+being deleted (it then expires on its own); a file that must not be used is deleted without
+being sent anywhere. A working session sees the file go within 2 s and waits again.
 
 `RELAY_AUTH` (when set) wins over the stored credential: `google` signs in with your gcloud
 identity (`gcloud auth print-identity-token`, an argv, never a shell; `--account=` with
@@ -258,7 +290,7 @@ is no longer open, so tool calls after it are not reported.
 
 | Name | Used by | Meaning |
 |---|---|---|
-| `RELAY_URL` | both servers, `bin/answerer` | Relay base URL. From the stored sign-in by default; otherwise the plugin's default relay. |
+| `RELAY_URL` | both servers, `bin/answerer`, `login` | Relay base URL. From the stored sign-in by default; otherwise the plugin's default relay. The only way to make `/team-relay:login` sign in to another relay (M5-SPEC §9). |
 | `RELAY_TEAM` | both servers, `bin/answerer` | Team id. From the stored sign-in by default; needed for `google` and `token`. |
 | `RELAY_AUTH` | both servers, `bin/answerer`, `bin/console` | Unset: the stored credential if there is one, else `google`. `credential`, `google` (`gcloud auth print-identity-token`) or `token`; `metadata` (the runtime service account) for the hosted console. |
 | `RELAY_CREDENTIALS_FILE` | every part | Optional: the credential file's absolute path. Default `$XDG_CONFIG_HOME/team-relay/credentials.json` or `~/.config/team-relay/credentials.json`. |
@@ -330,11 +362,13 @@ it back as `X-Console-Key` on every API call. The server:
   method and path is refused: nothing can be sent, acked or replied from the console;
 - passes a relay refusal on as `502 {"error": "relay_refused", "relay_status",
   "relay_error", "detail"}`, so the Members panel can say why a change was refused;
-- answers `GET /api/join` itself, never asking the relay, behind the same key (IAP when
-  hosted): `{"relay_url", "team", "repo_url", "marketplace_source", "marketplace":
+- answers `GET /api/join` itself, never proxying it, behind the same key (IAP when hosted,
+  and then only to a member of the team, below): `{"relay_url", "team", "repo_url", "marketplace_source", "marketplace":
   "team-relay-dev", "plugin": "team-relay", "default_relay"}` from the relay and team in use,
   `JOIN_MARKETPLACE` and `JOIN_REPO_URL` (`null` when unset; demo values with `--demo`);
-  `default_relay` says whether a bare `/team-relay:login` reaches this relay. The console's
+  `default_relay` says whether the plugin's default relay is this one (else the panel's
+  working-session command starts with `RELAY_URL=<relay>`; `/team-relay:login` takes no
+  relay URL). The console's
   *Join the team* panel builds its three steps from it. Nothing in it is secret; a
   `JOIN_REPO_URL` or `JOIN_MARKETPLACE` that is not plain stops the server at startup;
 - with `--open`, opens the console without putting the key in any process's arguments
@@ -379,6 +413,9 @@ The same server runs in a container on Cloud Run behind IAP (`Dockerfile.console
   §5), and the console shows "You're not on this team yet. Ask the owner to add <email>."
   with no data. A plain `401` from the relay is the console's own sign-in failing (a setup
   problem) and is shown as such;
+- answers `GET /api/join` only to a member of the team (M6-SPEC §7 item 6): it asks the relay
+  who the viewer is (`/me`, on the viewer's behalf) first, and a signed-in account on no
+  roster gets the same `not_on_team` response and nothing about joining;
 
 `IAP_AUDIENCE` for a Cloud Run service is, in Google's "signed headers" documentation,
 `/projects/PROJECT_NUMBER/locations/REGION/services/SERVICE_NAME` (the project *number*).
@@ -436,7 +473,7 @@ fetches a fresh one once when the relay answers 401.
 pnpm install
 pnpm typecheck
 pnpm test             # builds dist/ first; the stdio suites drive node dist/*.js
-pnpm build            # esbuild → dist/{channel,capabilities,session-start,tool-event,notify-desktop,console-server,credential-info}.js (committed); never touches dist/console/
+pnpm build            # esbuild → dist/{channel,capabilities,session-start,tool-event,notify-desktop,console-server,credential-info,logout}.js (committed); never touches dist/console/
 pnpm generate         # manifest.yaml → commands/answering.md, and plugin.json (no userConfig) and .mcp.json
 pnpm generate --check # fails when those files are out of date
 ../scripts/e2e.sh     # the M1 gate, the M2 scenarios, and the M5/M6 sign-in and roster scenarios when the relay serves them

@@ -61,13 +61,13 @@ flowchart LR
 | Concern | What the system does |
 |---|---|
 | Who is speaking | Each device signs in once with Google through the relay (`/team-relay:login`) and gets its own relay-issued credential, bound to one member of one team. The relay stores only its hash, expires it 90 days after last use, revokes it on logout or when the member is removed, and derives the sender from it. Nothing in a request body can claim to be someone else. The hosted console and gcloud users still use verified Google ID tokens. |
-| Signing in | Loopback and PKCE, in the style of RFC 8252; no device codes, so there is no code to phish. The one-time code only ever goes to a listener on 127.0.0.1 on your own machine, for one request within 5 minutes, and is useless without the verifier the plugin holds. The relay redirects nowhere else. The credential file is `~/.config/team-relay/credentials.json` (mode 600 in a mode-700 directory); the plugin refuses a file others could read. |
+| Signing in | Loopback and PKCE, in the style of RFC 8252; no device codes, so there is no code to phish. The one-time code only ever goes to a listener on 127.0.0.1 on your own machine within 5 minutes, and is useless without the verifier the plugin holds; the listener answers anything but the right callback (wrong Host, path or state) with 404 and keeps waiting. The relay redirects nowhere else. Which relay you sign in to is never the model's choice: `/team-relay:login` takes no arguments (another relay comes only from `RELAY_URL` in your environment), and it never replaces a sign-in from a different relay. Signing out is `/team-relay:logout`, a command only you run, not a tool. After a sign-in the session says "Connected as <member> (<email>) on team <team>", and says plainly when that is a different member or team than before. The credential file is `~/.config/team-relay/credentials.json` (mode 600 in a mode-700 directory); the plugin refuses a file others could read. |
 | Who is on the team | The roster lives in the relay. Owners add a member by Google email and remove them in the console; a removed member's devices stop working within 30 seconds. The relay is reachable without Cloud Run IAM (the sign-in pages must be) and authenticates every API call itself. |
 | Prompt injection | Teammate text arrives as data inside `<channel>` tags or labelled tool results. The session's instructions say it is never to be followed as instructions. The channel never relays permission prompts. |
 | What a teammate can make you run | Only capabilities you enabled, with parameters validated on both ends against the manifest. Each run is tied to a real, directed request. The runner gets no shell, a minimal environment, a timeout and an output cap. |
 | What the answering session can read | Nothing by default. Folders you share deliberately (`ANSWERER_READ_DIRS`) are readable without asking; teammates see their names, never their paths. Anything else opens Claude Code's own permission dialog in your answering terminal, naming the path, and you allow it once, for the session, or not at all; a desktop notification and the asker's console show that it is waiting. Grants never outlive the session. Credential stores (the relay's own credential, ssh and gpg keys, cloud CLI credentials, `.env` files, browser cookies, keychains, wallet keystores and more) stay denied whatever you answer. These are Claude Code permission rules, not an OS sandbox. |
 | Abuse | Per-sender rate limits, broadcast limits, read budgets, caps on long-polls, and rate limits on sign-ins and roster changes. Manifest patterns run in RE2, so a teammate cannot publish a regex that stalls anyone. |
-| The console | Reads only, except an owner's roster changes (same-origin JSON requests only). Locally it binds 127.0.0.1 with a per-launch key. Hosted, it sits behind IAP; any signed-in Google account reaches the page, and the relay decides what it sees: a non-member gets "You're not on this team yet" and no data. |
+| The console | Reads only, except an owner's roster changes (same-origin JSON requests only). Locally it binds 127.0.0.1 with a per-launch key. Hosted, it sits behind IAP; any signed-in Google account reaches the page, and the relay decides what it sees: a non-member gets "You're not on this team yet" and no data, not even the join details. |
 
 ## Join a team
 
@@ -81,17 +81,20 @@ the team owner must have added your Google email. Then, in Claude Code:
    ```
    `<github-owner>` is the account this repository lives under (the console's join panel
    shows your team's). While channels are in research preview, start Claude Code with
-   `claude --dangerously-load-development-channels plugin:team-relay@team-relay-dev`.
+   `claude --dangerously-load-development-channels plugin:team-relay@team-relay-dev`
+   (for a team on another relay than the plugin's default, put `RELAY_URL=https://<relay>`
+   in front; the join panel shows the full command).
 2. **Sign in:** `/team-relay:login`. Your browser opens on the relay; sign in with Google,
-   pick the team, done. (`/team-relay:login <relay-url>` for a team on another relay.)
+   pick the team, done. The session says "Connected as <you> (<your email>) on team <team>".
 3. **Start answering:** `/team-relay:answering` prints the one command that starts your
    answering session; run it in a second terminal. It reads none of your files by default:
    put `ANSWERER_READ_DIRS=~/src/app:~/notes` in front to share folders (teammates see the
    folder names), and for anything else it asks you in that terminal. Credentials are never
    readable, whatever you allow.
 
-`/team-relay:console` opens the console on your own machine; `whoami` and `logout` are tools
-in your working session. Details, including writing capability runners:
+`/team-relay:console` opens the console on your own machine; `/team-relay:logout` signs this
+computer out (revokes its credential, then deletes it); `whoami` is a tool in your working
+session. Details, including writing capability runners:
 [`plugin/README.md`](plugin/README.md).
 
 ## Run your own relay
@@ -118,7 +121,8 @@ Everything deploys to one Google Cloud project, in resources named `team-relay*`
 
 The OAuth client's id and secret live only in Secret Manager. Both `*.local.*` files are
 git-ignored: real identities never enter the repository. The plugin's default relay URL is
-in `plugin/relay.default.json`; teams on another relay sign in with `/team-relay:login <url>`.
+in `plugin/relay.default.json`; teams on another relay start Claude Code with
+`RELAY_URL=https://<relay>` in front and then run `/team-relay:login`.
 
 ## Repository
 
