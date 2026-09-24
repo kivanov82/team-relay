@@ -1,16 +1,26 @@
-# Relay access configuration: which identities may speak for which member of which team.
-# The relay decides who a caller is from a verified credential and this file, never from
-# anything the caller writes in a request body. Copy to config/team.local.yaml (git-ignored)
-# for real identities.
+# Relay access configuration: the teams, each team's seed members, limits and delegates.
+# The relay decides who a caller is from a verified credential and the team's roster (in
+# Firestore), never from anything the caller writes in a request body. Copy to
+# config/team.local.yaml (git-ignored) for real identities.
+#
+# Seed members (M6-SPEC §1): on startup every member listed here whose id the team's roster
+# does not hold yet is added to it, with its role and the emails of its google: principals.
+# An entry already on the roster is never changed by this file (never demoted, never
+# re-promoted), and nobody is ever removed by it. Every team needs at least one
+# `role: owner`; owners add and remove everyone else from the console. A member listed here
+# cannot be removed in the console (they would come back at the next start): take them out
+# of this file first.
 #
 # Principals:
-#   google:<email>           a Google-signed ID token whose verified email matches
+#   google:<email>           a Google account (1..5 per member); signs in with
+#                            /team-relay:login, or sends a Google-signed ID token
 #   token:sha256:<hex>       a static bearer token, stored only as its SHA-256; local
 #                            development only, refused when the relay runs on Cloud Run
 teams:
   - id: demo
     members:
       - id: alice
+        role: owner
         principals:
           - "google:alice@example.com"
       - id: bob
@@ -19,3 +29,11 @@ teams:
       - id: carol
         principals:
           - "google:carol@example.com"
+
+# The hosted console reads as a delegate on behalf of the signed-in member (M3-SPEC §2);
+# with manage-roster it may also change the roster, only for a member who is an owner
+# (M6-SPEC §3).
+# delegates:
+#   - principal: "google:team-relay-console@<project>.iam.gserviceaccount.com"
+#     team: demo
+#     scope: [read, manage-roster]

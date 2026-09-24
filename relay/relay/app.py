@@ -214,6 +214,9 @@ def create_app(
         )
         return JSONResponse({"error": "internal", "detail": "Internal error."}, 500)
 
+    class NotAMember(Unauthenticated):
+        """A delegate named a well-formed email that is on no roster of its team."""
+
     async def on_behalf_of(request: Request, delegate: Delegate) -> Identity:
         """The member a delegate acts for (M3-SPEC §2): exactly one header naming, by email,
         a member of the delegate's team on its roster, else 401. The value is never logged."""
@@ -225,9 +228,13 @@ def create_app(
         if len(values[0]) > MAX_ON_BEHALF_LENGTH:
             raise Unauthenticated("unknown_on_behalf")
         email = normalise_email(values[0])
-        member = await roster.member_for_email(delegate.team, email) if email else None
-        if member is None:
+        if not email:
             raise Unauthenticated("unknown_on_behalf")
+        member = await roster.member_for_email(delegate.team, email)
+        if member is None:
+            # A well-formed email that is simply not on this team's roster (M6-SPEC §4): the
+            # console shows "not on this team" instead of treating it as a broken setup.
+            raise NotAMember("not_a_member")
         return Identity(team=delegate.team, member=member)
 
     async def member_in(principal: str, team: str) -> str | None:
@@ -286,6 +293,10 @@ def create_app(
                 path=request.url.path,
                 **({"delegate": delegate.principal} if delegate is not None else {}),
             )
+            if isinstance(exc, NotAMember):
+                raise ApiError(
+                    403, "not_a_member", "This Google account is not a member of this team."
+                ) from None
             raise ApiError(401, "unauthenticated") from None
 
         if delegate is None:

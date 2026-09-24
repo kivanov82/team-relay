@@ -178,7 +178,9 @@ async def test_resolve_on_behalf(api: Api, email: str, member: str | None):
         return  # not a header value an HTTP client can send; refused as an email above
     r = await api.delegated("GET", "/me", email)
     if member is None:
-        assert r.status_code == 401, r.text
+        # Not an email: 401. A well-formed email that is on no roster: 403 not_a_member.
+        expected = 401 if normalise_email(email) is None else 403
+        assert r.status_code == expected, r.text
     else:
         assert r.status_code == 200, r.text
         assert (r.json()["team"], r.json()["member"]) == (api.team, member)
@@ -197,7 +199,8 @@ async def test_a_delegate_resolves_only_its_own_team(api: Api):
     r = await api.client.get("/v1/teams/other/me", headers={**_other_delegate(EMAILS["dave"])})
     assert r.status_code == 200 and r.json()["member"] == "dave"
     r = await api.client.get("/v1/teams/other/me", headers={**_other_delegate(EMAILS["alice"])})
-    assert r.status_code == 401  # alice is not on team other's roster
+    assert r.status_code == 403  # alice is not on team other's roster
+    assert r.json()["error"] == "not_a_member"
 
 
 def _other_delegate(email: str) -> dict[str, str]:
@@ -459,8 +462,6 @@ def _headers(on_behalf: str | None, team: str = "demo") -> dict[str, str]:
     [
         (None, "missing_on_behalf"),
         ("", "unknown_on_behalf"),
-        ("mallory@example.com", "unknown_on_behalf"),
-        (EMAILS["dave"], "unknown_on_behalf"),  # a member, of another team
         ("alice", "unknown_on_behalf"),
         ("google:alice@example.com", "unknown_on_behalf"),
         ("alice@example.com,bob@example.com", "unknown_on_behalf"),
@@ -482,6 +483,24 @@ async def test_a_delegate_without_a_member_of_its_team_is_401(
     if on_behalf:
         assert on_behalf not in out
     assert DELEGATE_TOKENS["demo"] not in out
+    assert await api.store.list_audit(api.team) == []
+
+
+@pytest.mark.parametrize(
+    "on_behalf",
+    ["mallory@example.com", EMAILS["dave"]],  # nobody; a member of another team
+)
+async def test_a_delegate_naming_a_non_member_is_403_not_a_member(api: Api, capsys, on_behalf: str):
+    capsys.readouterr()
+    for method, path in (("GET", "/me"), ("GET", "/directory"), ("POST", "/requests")):
+        kwargs = {"json": {}} if method == "POST" else {}
+        r = await api.delegated(method, path, on_behalf, **kwargs)
+        assert r.status_code == 403, (on_behalf, path)
+        assert r.json()["error"] == "not_a_member"
+    out = capsys.readouterr().out
+    lines = [e for e in _logs(out) if e["event"] == "auth_rejected"]
+    assert len(lines) == 3 and all(e["reason"] == "not_a_member" for e in lines)
+    assert on_behalf not in out
     assert await api.store.list_audit(api.team) == []
 
 
@@ -507,7 +526,7 @@ async def test_the_on_behalf_email_is_case_insensitive(api: Api):
 
 async def test_another_teams_delegate_cannot_name_this_teams_member(api: Api):
     r = await api.delegated("GET", "/me", EMAILS["alice"], delegate="other")
-    assert r.status_code == 401 and r.json() == {"error": "unauthenticated"}
+    assert r.status_code == 403 and r.json()["error"] == "not_a_member"
     # It can name its own member, and then this team's URL is someone else's team: 404.
     r = await api.delegated("GET", "/me", EMAILS["dave"], delegate="other")
     assert r.status_code == 404 and r.json() == {"error": "not_found"}
