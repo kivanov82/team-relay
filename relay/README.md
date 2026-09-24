@@ -260,12 +260,13 @@ authenticates as before.
    one." with the create form (below).
 3. The chooser: the account, the device, the warning, one radio per team (team id and
    member id; preselected only when there is exactly one team, M6-SPEC §7.5; with several
-   the radios are required and nothing is chosen for the member), Continue / Cancel, and a
-   closed "Create a new team" (`<details>`, no script) with the create form. A team's display
-   name is shown beside its id when it has one. A fresh CSRF token (only its hash is stored),
-   the same in both forms.
-4. `POST /v1/login/choose` (`application/x-www-form-urlencoded`: `csrf`, `team`, `action`;
-   nothing else, each once, at most 4 KiB): the cookie, step `choose`, the CSRF token, an
+   the radios are required and nothing is chosen for the member), Continue / Cancel, and
+   "Create a new team" (M9), a third button of the same form. The page holds that one form and
+   its inputs are only the hidden `csrf` and the `team` radios, as before M9, so a client that
+   submits every input and the first button still chooses a team. A team's display name is
+   shown beside its id when it has one. A fresh CSRF token (only its hash is stored).
+4. `POST /v1/login/choose` (`application/x-www-form-urlencoded`: `csrf`, `team`, `action`
+   = `continue` | `cancel` | `new`; nothing else, each once, at most 4 KiB): the cookie, step `choose`, the CSRF token, an
    `Origin` (when sent) equal to `RELAY_PUBLIC_URL`, a team from the chooser, and the account
    still on that team's roster with its email bound to this account's `sub` (bound now if
    this is the email's first sign-in; one roster transaction). Mints a one-time code (32
@@ -275,17 +276,21 @@ authenticates as before.
    **Cancel** closes the login and redirects to `http://127.0.0.1:<port>/callback?
    error=access_denied&state=…` so the plugin's listener can stop waiting. Nothing but
    `http://127.0.0.1:<port>/callback` is ever a redirect target.
-   **Create a team** (M9-SPEC §3): `POST /v1/login/create` (form: `csrf`, `name`, `team`,
-   `member`, `action` = `create` or `cancel`; nothing else, each once) with the same cookie,
-   `Origin`, CSRF and step (`choose`, unexpired) checks. It creates the team (as `POST
+   **Create a team** (M9-SPEC §3). `action=new` on the chooser (after the same checks)
+   answers the create page: "Create a new team" with Back, or for an account on no team the
+   callback's "You're not on a team yet" page. Its one form posts to `POST /v1/login/create`
+   (form: `csrf` (the chooser's token), `name`, `team` (the id, may be empty), `member`,
+   `action` = `create` | `back` | `cancel`; nothing else, each once) with the same cookie,
+   `Origin`, CSRF and step (`choose`, unexpired) checks. `create` creates the team (as `POST
    /v1/teams` below, with the signed-in account as owner, its email bound to the login's
    `sub`, the per-IP limit counted against the browser's address), adds it to the login's
    choices and answers the chooser with the new team preselected (even among several).
    `team` left empty is made from the name (lower case, `-` for anything else, `team-` in
-   front when needed). A refused creation answers the page again with the refusal's status
-   (`422`, `409`, `429`), its message and the member's own input (escaped; a left-empty id
-   shows the one made from the name, to edit). `cancel` ends the login like the chooser's
-   Cancel. The created team is kept even if the login then expires.
+   front when needed); `member` is prefilled from the email. A refused creation answers the
+   create page again with the refusal's status (`422`, `409`, `429`), its message and the
+   member's own input (escaped; a left-empty id shows the one made from the name, to edit).
+   `back` answers the chooser; `cancel` ends the login like the chooser's Cancel. The created
+   team is kept even if the login then expires.
 5. `POST /v1/login/token` `{"code", "code_verifier"}` (verifier 43..128 RFC 7636 characters):
    the code unused, unexpired and `BASE64URL(SHA256(verifier)) == challenge` → the code is
    marked used and a device credential minted (recording the SHA-256 of the email signed in

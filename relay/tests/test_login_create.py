@@ -91,7 +91,7 @@ async def test_an_account_on_no_team_creates_one_and_signs_in(api: Api):
     assert r.status_code == 200, r.text
     assert team_values(r.text) == [team] and checked_teams(r.text) == [team]
     assert "Night &lt;shift&gt;" in r.text and "<shift>" not in r.text
-    assert "Create a new team" in r.text  # still offered
+    assert "Create a new team</button>" in r.text  # still offered
     # Continue as the new team's owner, then the token.
     chooser_csrf = hidden_csrf(r.text)
     r = await choose(
@@ -121,29 +121,69 @@ async def test_a_blank_id_is_made_from_the_name(api: Api):
     assert team_values(r.text) == [name.lower().replace(" ", "-")]
 
 
+def page_inputs(html: str) -> list[tuple[str, str]]:
+    """Every ``<input>`` on the page as ``(type, name)``, as a naive headless client reads
+    them (the plugin's e2e browser stub collects them all, whatever form they are in)."""
+    tags = re.findall(r"<input\b[^>]*>", html)
+    return [
+        (re.search(r'type="([^"]*)"', t).group(1), re.search(r'name="([^"]*)"', t).group(1))
+        for t in tags
+    ]
+
+
+async def test_the_chooser_keeps_one_form_and_its_fields(api: Api):
+    """The chooser POST contract of M5 is unchanged: one form, a hidden csrf, the team radios,
+    and buttons named action (continue first). "Create a new team" is a button of that same
+    form (action=new), so a client that submits every input and the first button still
+    chooses a team."""
+    chooser = await to_chooser(api.client, api.fake, "alice@example.com")
+    html = chooser.response.text
+    assert html.count("<form") == 1 and 'action="/v1/login/choose"' in html
+    assert {name for _, name in page_inputs(html)} == {"csrf", "team"}
+    assert [t for t, n in page_inputs(html) if n == "csrf"] == ["hidden"]
+    buttons = re.findall(r'<button[^>]*name="action" value="([^"]*)"', html)
+    assert buttons == ["continue", "cancel", "new"]
+    assert "Create a new team</button>" in html
+    # What the stub sends: every input, the checked radio, the first button.
+    r = await choose(
+        api.client,
+        chooser.started.cookie,
+        {"csrf": chooser.csrf, "team": chooser.teams[0], "action": "continue"},
+    )
+    assert r.status_code == 303
+
+
 async def test_an_account_on_teams_creates_another_from_the_chooser(api: Api):
     email, team = new_email(), new_id()
-    chooser = await to_chooser(api.client, api.fake, "alice@example.com")
-    assert "Create a new team" in chooser.response.text
-    assert '<details class="create">' in chooser.response.text  # closed until used
-    # alice's account is shared on the emulator: create with a fresh account instead, then
-    # check that account's chooser offers both teams.
     started, page = await no_team_page(api, email)
+    assert page.text.count("<form") == 1 and 'action="/v1/login/create"' in page.text
+    assert "Back</button>" not in page.text  # no teams to go back to
+    csrf = hidden_csrf(page.text)
     r = await post_create(
-        api.client,
-        started.cookie,
-        fields(hidden_csrf(page.text), team=team, member="mo", action="create"),
+        api.client, started.cookie, fields(csrf, team=team, member="mo", action="create")
     )
     assert r.status_code == 200 and checked_teams(r.text) == [team]
+    assert r.text.count("<form") == 1
+    # The chooser's "Create a new team": the create page, with Back.
+    r = await choose(api.client, started.cookie, {"csrf": csrf, "team": team, "action": "new"})
+    assert r.status_code == 200 and "<h1>Create a new team</h1>" in r.text
+    assert 'action="/v1/login/create"' in r.text and "Back</button>" in r.text
+    assert field_value(r.text, "member") == email.split("@")[0]
+    # Back: the chooser again, nothing created.
+    r = await post_create(api.client, started.cookie, {"csrf": csrf, "action": "back"})
+    assert r.status_code == 200 and team_values(r.text) == [team]
     second = new_id()
     r = await post_create(
-        api.client,
-        started.cookie,
-        fields(hidden_csrf(r.text), team=second, member="mo", action="create"),
+        api.client, started.cookie, fields(csrf, team=second, member="mo", action="create")
     )
     assert r.status_code == 200, r.text
     assert sorted(team_values(r.text)) == sorted([team, second])
     assert checked_teams(r.text) == [second]  # only the new one, though there are two
+    # A refusal here keeps the "Create a new team" page (with Back).
+    r = await post_create(
+        api.client, started.cookie, fields(csrf, team=second, member="mo", action="create")
+    )
+    assert r.status_code == 409 and "<h1>Create a new team</h1>" in r.text
 
 
 async def test_a_refused_creation_shows_the_form_again_escaped(api: Api):
@@ -180,7 +220,6 @@ async def test_a_refused_creation_shows_the_form_again_escaped(api: Api):
         fields(hidden_csrf(page2.text), name="Demo", member="ok2", action="create"),
     )
     assert r.status_code == 409 and field_value(r.text, "team") == "demo"
-    assert '<details class="create" open>' not in r.text  # no teams: the form is the page
 
 
 @pytest.mark.parametrize(

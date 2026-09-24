@@ -8,8 +8,11 @@ Every page carries a strict CSP. ``form-action`` names ``http://127.0.0.1:*`` be
 that redirect (to the member's own plugin listener) is the only place the form leads.
 
 M9-SPEC §3: an account on no team sees "You're not on a team yet" with a form to create
-one; the chooser offers the same form under "Create a new team" (a ``<details>``, so no
-script is needed). Team names are shown escaped like everything else.
+one. The chooser stays one form with the fields it always had (``csrf``, ``team``,
+``action``): "Create a new team" is a third button of it (``action=new``) that answers the
+create page, whose own form posts to ``/v1/login/create``. So a page never holds two forms,
+and a client that submits the chooser as it always did is unaffected. Team names are shown
+escaped like everything else.
 """
 
 from __future__ import annotations
@@ -202,16 +205,20 @@ input[type="text"].mono {
   color: var(--bad);
   font-size: 14px;
 }
-details.create { margin-top: 20px; padding-top: 16px; border-top: 1px solid var(--hairline); }
-details.create summary {
-  cursor: pointer;
+.secondary-actions {
+  margin-top: 16px;
+  padding-top: 12px;
+  border-top: 1px solid var(--hairline);
+}
+button.link {
+  border: 0;
+  background: none;
+  padding: 4px 0;
+  min-height: 0;
   color: var(--signal);
   font-weight: 500;
-  list-style: none;
 }
-details.create summary::-webkit-details-marker { display: none; }
-details.create summary:focus-visible { outline: 2px solid var(--signal); outline-offset: 2px; }
-details.create[open] summary { margin-bottom: 12px; }
+button.link:hover { text-decoration: underline; }
 .choice .name { font-weight: 600; }
 footer { margin-top: 20px; padding-top: 12px; border-top: 1px solid var(--hairline);
   font-size: 12px; color: var(--subtle); }
@@ -282,8 +289,13 @@ def _identity(email: str, device: str) -> str:
     )
 
 
-def _create_fields(form: CreateForm, csrf: str) -> str:
+def _create_fields(form: CreateForm, csrf: str, *, back: bool) -> str:
     error = f'<p class="form-error" role="alert">{escape(form.error)}</p>\n' if form.error else ""
+    back_button = (
+        '<button type="submit" name="action" value="back" formnovalidate>Back</button>'
+        if back
+        else ""
+    )
     return (
         f'<form method="post" action="{escape(form.action)}">\n'
         f'<input type="hidden" name="csrf" value="{escape(csrf)}">\n'
@@ -304,6 +316,7 @@ def _create_fields(form: CreateForm, csrf: str) -> str:
         '<span class="hint">How your teammates see you.</span></label>\n'
         '<div class="actions">'
         '<button class="primary" type="submit" name="action" value="create">Create team</button>'
+        f"{back_button}"
         '<button type="submit" name="action" value="cancel" formnovalidate>Cancel</button>'
         "</div>\n</form>"
     )
@@ -318,7 +331,6 @@ def chooser_page(
     action: str,
     names: dict[str, str] | None = None,
     preselect: str | None = None,
-    create: CreateForm | None = None,
 ) -> str:
     single = len(choices) == 1
     # M6-SPEC §7.5: preselected only when there is exactly one; with several, the member
@@ -353,25 +365,31 @@ def chooser_page(
         '<div class="actions">'
         '<button class="primary" type="submit" name="action" value="continue">Continue</button>'
         '<button type="submit" name="action" value="cancel" formnovalidate>Cancel</button>'
-        "</div>\n</form>"
+        "</div>\n"
+        # M9-SPEC §3: a button of the same form, so the page keeps one form and its fields.
+        '<div class="secondary-actions">'
+        '<button class="link" type="submit" name="action" value="new" formnovalidate>'
+        "Create a new team</button></div>\n</form>"
     )
-    if create is not None:
-        opened = " open" if create.error else ""
-        body += (
-            f'\n<details class="create"{opened}><summary>Create a new team</summary>\n'
-            + _create_fields(create, csrf)
-            + "\n</details>"
-        )
     return _page("Connect", body)
 
 
-def not_on_team_page(*, email: str, device: str, csrf: str, create: CreateForm) -> str:
-    """M9-SPEC §3: the account is on no team yet."""
-    body = (
-        "<h1>You're not on a team yet</h1>\n"
-        f'<p>Ask a team owner to add <span class="mono">{escape(email)}</span>, '
-        "or create one.</p>\n" + _identity(email, device) + _create_fields(create, csrf)
-    )
+def create_page(*, email: str, device: str, csrf: str, form: CreateForm, on_team: bool) -> str:
+    """M9-SPEC §3: the create form on a page of its own. For an account on no team yet it
+    says so; for one on teams (the chooser's "Create a new team") it offers Back."""
+    if on_team:
+        head = (
+            "<h1>Create a new team</h1>\n"
+            '<p class="subtle">You will be its owner, and can add teammates by their Google '
+            "email.</p>\n"
+        )
+    else:
+        head = (
+            "<h1>You're not on a team yet</h1>\n"
+            f'<p>Ask a team owner to add <span class="mono">{escape(email)}</span>, '
+            "or create one.</p>\n"
+        )
+    body = head + _identity(email, device) + _create_fields(form, csrf, back=on_team)
     return _page("Create a team", body)
 
 

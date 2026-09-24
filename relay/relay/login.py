@@ -23,13 +23,16 @@
   recorded (first sign-in) or checked again, in a roster transaction, before a code is
   minted. The credential records the SHA-256 of the email it was minted through (§7.1), and
   the token response names the email (M5-SPEC §9.3).
-- Creating a team (M9-SPEC §3): an account on no team gets "You're not on a team yet" with a
-  form, at step ``choose`` with no choices; the chooser offers the same form. ``POST
-  /v1/login/create`` takes the same cookie, Origin and CSRF checks as the chooser's POST, and
-  the login's step must still be ``choose``: it creates the team with the signed-in account as
-  its owner (bound to its ``sub``), adds the team to the login's choices and shows the
-  chooser with it preselected. A refused creation shows the form again with the reason and
-  the member's own input (escaped). Cancel ends the login as the chooser's Cancel does.
+- Creating a team (M9-SPEC §3): an account on no team gets "You're not on a team yet" with
+  the create form, at step ``choose`` with no choices. The chooser keeps its one form and
+  fields (``csrf``, ``team``, ``action``); its "Create a new team" button is
+  ``action=new``, which answers the create page. ``POST /v1/login/create`` (``csrf``,
+  ``name``, ``team``, ``member``, ``action`` = ``create`` | ``back`` | ``cancel``) takes the
+  same cookie, Origin and CSRF checks as the chooser's POST, and the login's step must still
+  be ``choose``: it creates the team with the signed-in account as its owner (bound to its
+  ``sub``), adds the team to the login's choices and shows the chooser with it preselected.
+  A refused creation shows the form again with the reason and the member's own input
+  (escaped). Back shows the chooser; Cancel ends the login as the chooser's Cancel does.
 """
 
 from __future__ import annotations
@@ -66,9 +69,9 @@ from .pages import (
     SECURITY_HEADERS,
     CreateForm,
     chooser_page,
+    create_page,
     html_response,
     message_page,
-    not_on_team_page,
 )
 from .roster import Roster, email_hash
 from .store import (
@@ -389,36 +392,39 @@ class LoginService:
             return await fail(400, "login_expired", "This sign-in has expired", AGAIN)
         if not choices:
             log_event("login_no_team", login=key[:12])
-        return await self._choose_page(chosen, csrf, CreateForm(CREATE_ACTION))
+        return await self._chooser(chosen, csrf)
 
-    async def _choose_page(
-        self,
-        login: LoginDoc,
-        csrf: str,
-        form: CreateForm,
-        *,
-        status: int = 200,
-        preselect: str | None = None,
-    ) -> Response:
-        """The chooser (with "Create a new team"), or for an account on no team the
-        not-on-team page with the form open (M9-SPEC §3)."""
+    async def _chooser(self, login: LoginDoc, csrf: str, preselect: str | None = None) -> Response:
+        """The chooser; for an account on no team, the create page (M9-SPEC §3)."""
         assert login.email is not None
-        if not form.member and not form.name:
-            form = CreateForm(form.action, member=suggest_member_id(login.email))
         if not login.choices:
-            page = not_on_team_page(email=login.email, device=login.device, csrf=csrf, create=form)
-        else:
-            names = {c.team: await self._teams.name(c.team) for c in login.choices}
-            page = chooser_page(
-                email=login.email,
-                device=login.device,
-                choices=login.choices,
-                csrf=csrf,
-                action="/v1/login/choose",
-                names=names,
-                preselect=preselect,
-                create=form,
-            )
+            return self._create_page(login, csrf, CreateForm(CREATE_ACTION))
+        names = {c.team: await self._teams.name(c.team) for c in login.choices}
+        page = chooser_page(
+            email=login.email,
+            device=login.device,
+            choices=login.choices,
+            csrf=csrf,
+            action="/v1/login/choose",
+            names=names,
+            preselect=preselect,
+        )
+        return html_response(page)
+
+    def _create_page(
+        self, login: LoginDoc, csrf: str, form: CreateForm, status: int = 200
+    ) -> Response:
+        """The create form, prefilled with a member id made from the email when empty."""
+        assert login.email is not None
+        if not form.member and not form.name and not form.error:
+            form = CreateForm(form.action, member=suggest_member_id(login.email))
+        page = create_page(
+            email=login.email,
+            device=login.device,
+            csrf=csrf,
+            form=form,
+            on_team=bool(login.choices),
+        )
         return html_response(page, status)
 
     # POST /v1/login/choose --------------------------------------------------------------------
@@ -470,7 +476,8 @@ class LoginService:
         csrf = form.fields.get("csrf", "")
         action = form.fields.get("action", "continue")
         team = form.fields.get("team")
-        if action not in ("continue", "cancel"):
+        # M9-SPEC §3: "new" is the chooser's "Create a new team" button.
+        if action not in ("continue", "cancel", "new"):
             self._refused("bad_action")
             return self._page(400, "This form could not be read", AGAIN)
         now = self._now()
@@ -497,6 +504,8 @@ class LoginService:
             await self._close(key)
             self._refused("login_without_sub", login=key[:12])
             return self._page(400, "This sign-in has expired", AGAIN, clear=True)
+        if action == "new":
+            return self._create_page(current, csrf, CreateForm(CREATE_ACTION))
         choice = next((c for c in current.choices if team is not None and c.team == team), None)
         if choice is None:
             self._refused("team_not_offered", login=key[:12])
@@ -575,7 +584,7 @@ class LoginService:
         key = _key(cookie)
         csrf = form.fields.get("csrf", "")
         action = form.fields.get("action", "create")
-        if action not in ("create", "cancel"):
+        if action not in ("create", "back", "cancel"):
             self._refused("bad_action")
             return self._page(400, "This form could not be read", AGAIN)
         now = self._now()
@@ -600,6 +609,8 @@ class LoginService:
             await self._close(key)
             self._refused("login_without_sub", login=key[:12])
             return self._page(400, "This sign-in has expired", AGAIN, clear=True)
+        if action == "back":
+            return await self._chooser(current, csrf)
         name = form.fields.get("name", "")
         team = form.fields.get("team", "").strip()
         member = form.fields.get("member", "").strip()
@@ -623,7 +634,7 @@ class LoginService:
                 member=member,
                 error=err.detail or "The team could not be created.",
             )
-            return await self._choose_page(current, csrf, refused, status=err.status)
+            return self._create_page(current, csrf, refused, status=err.status)
         choice = LoginChoice(team=created["team"], member=created["member"])
         now = self._now()
 
@@ -648,9 +659,7 @@ class LoginService:
                 clear=True,
             )
         log_event("login_team_created", login=key[:12], team=choice.team, member=choice.member)
-        return await self._choose_page(
-            offered, csrf, CreateForm(CREATE_ACTION), preselect=choice.team
-        )
+        return await self._chooser(offered, csrf, preselect=choice.team)
 
     def _loopback(self, login: LoginDoc, params: Mapping[str, str]) -> Response:
         # The only redirect target there is: the plugin's own listener on this machine.
