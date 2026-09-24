@@ -45,6 +45,9 @@ flowchart LR
   Write or Edit, and it reads nothing by default: only folders you share, or a file or folder
   you allow when it asks. Credential files stay unreadable. Because it has to acknowledge a
   question before it answers, the asker learns "no response yet" instead of waiting forever.
+  A question sent while your answering session is not running waits for it, and your working
+  session tells you ("2 questions from alice waiting for you. Start your answering session:
+  …"), as do `whoami`, the session's first line and the console.
 - **Capabilities** are declared in one manifest (`plugin/manifest.yaml`): named operations
   whose every parameter is an enum, a bounded number, a boolean, or a length-capped string
   matched by an RE2 pattern. Never free-form SQL, shell or paths. The same file drives the
@@ -54,7 +57,9 @@ flowchart LR
   with each hop (sent, delivered, acknowledged, tools used, answered, returned), who is
   waiting for a teammate to allow access, which folders each member shares, and a detail
   sheet with timings. Everyone sees the metadata; question and answer text is visible only
-  to the people in that request. Team owners add and remove members there, by Google email.
+  to the people in that request. It marks a member whose answering session stopped with
+  questions waiting, and tells you when some wait for yours. Team owners add and remove
+  members there, by Google email.
 
 ## Security model
 
@@ -136,7 +141,7 @@ in `plugin/relay.default.json`; teams on another relay start Claude Code with
 | [`plugin/`](plugin/README.md) | The Claude Code plugin: channel server, capability server, answering-session launcher, local and hosted console server. |
 | `console/` | The console UI: React, Vite, TypeScript, Tailwind, shadcn/ui. It builds into `plugin/dist/console`. |
 | `schema/` | The capability manifest's JSON Schema. |
-| `docs/` | The contracts, milestone by milestone, with dated corrections: [M1](docs/M1-SPEC.md) (relay and channel), [M2](docs/M2-SPEC.md) (deploy, identity, console), [M3](docs/M3-SPEC.md) (hosted console), [M4](docs/M4-SPEC.md) (granted reads), [M5](docs/M5-SPEC.md) (install and sign in), [M6](docs/M6-SPEC.md) (members in the console). |
+| `docs/` | The contracts, milestone by milestone, with dated corrections: [M1](docs/M1-SPEC.md) (relay and channel), [M2](docs/M2-SPEC.md) (deploy, identity, console), [M3](docs/M3-SPEC.md) (hosted console), [M4](docs/M4-SPEC.md) (granted reads), [M5](docs/M5-SPEC.md) (install and sign in), [M6](docs/M6-SPEC.md) (members in the console), [M7](docs/M7-SPEC.md) (questions waiting). |
 | `scripts/` | Emulator, tests, bootstrap, deploy and smoke checks. |
 
 ## Development
