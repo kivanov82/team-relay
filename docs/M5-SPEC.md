@@ -132,3 +132,20 @@ The join panel becomes the three steps of §1, with copy buttons; nothing else c
   `scripts/e2e.sh` adds the full login flow with the fake OAuth provider.
 - Console: join panel; build.
 - Deploy: smoke checks above; Kiril signs in once for real.
+
+## 9. Corrections
+
+### 24 Sep 2026: after the M5/M6 security review
+
+1. **The relay a member signs in to is not the model's to choose.** The `login` tool takes no
+   arguments. A non-default relay comes only from `RELAY_URL` in the environment. The plugin
+   refuses to replace a stored credential issued by a different relay than the configured one.
+2. **Logout is not a tool.** `/team-relay:logout` runs `node ${CLAUDE_PLUGIN_ROOT}/dist/logout.js`
+   (revokes the credential at the relay, then deletes the file); the model cannot be steered
+   into signing a member out.
+3. **Say who you became.** `/v1/login/token` also returns the Google account `email`; the
+   plugin's status event and `whoami` state "Connected as <member> (<email>) on team <team>",
+   and when the member or team differs from the credential it replaces, it says so plainly.
+   The tool result tells the model never to repeat the sign-in URL to anyone.
+4. **The loopback listener** answers a request with the wrong `Host`, path or `state` with
+   `404` and keeps waiting; only the request with the right `state` ends it.

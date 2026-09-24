@@ -74,3 +74,32 @@ the local key or IAP as today.
   Sec-Fetch-Site, key/IAP); e2e: owner adds a member, the new member logs in (M5 flow with the
   fake provider) and appears in the directory; removal revokes within 30 s.
 - Console: Members panel for owner and member views, not-on-team page; tests; build.
+
+## 7. Corrections
+
+### 24 Sep 2026: after the M5/M6 security review (binds M5 as well)
+
+1. **No identity handover by email.** An owner may not add an email to another member's entry
+   (`PATCH … add_email` on someone else: `403 forbidden`, "remove and re-add the member");
+   a member may add an email to their own entry only by signing in with it is not offered
+   either: emails are set when a member is added. `remove_email` revokes, in the same
+   transaction, every credential minted through that email (credentials record
+   `email_sha256`).
+2. **Accounts are bound by Google `sub`.** The first successful relay sign-in for a roster
+   email records that account's `sub` on the entry; later sign-ins with that email must
+   present the same `sub` (else the login ends with "This email now belongs to a different
+   Google account; ask the owner"). Removing the email clears its binding.
+3. **Seed members** listed in the team file cannot be removed through the API
+   (`409 seed_member`); take them out of the file first. **Retired ids**: a removed member id
+   is kept 31 days and can only return to someone holding one of its old emails
+   (`409 member_id_retired`). **At most 20 live credentials** per member (a new one revokes
+   the least recently used). **Login rate limits** per client IP per minute: start 20,
+   callback and choose together 30, token 20. These were built with M5/M6 and are recorded
+   here.
+4. **404 versus 401:** a principal that is on no team at all gets `401`; one that is on
+   another team but not the URL's gets `404`.
+5. The chooser preselects a team only when the account has exactly one.
+6. The hosted console answers `/api/join` only to a signed-in member of its team (else the
+   not-on-team response).
+7. The relay logs, once per login start, the number of `X-Forwarded-For` hops it saw (never
+   the addresses), so the client-IP derivation can be checked on the live service.
