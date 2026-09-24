@@ -64,11 +64,12 @@ const CONFUSABLES: Record<string, string> = {
   '\u03A5': 'Y', '\u03A7': 'X', '\u03BF': 'o', '\u03BD': 'v', '\u03B1': 'a', '\u03B9': 'i',
   '\u03BA': 'k', '\u03C1': 'p', '\u03C4': 't', '\u03C5': 'u', '\u03C7': 'x',
 };
-const CONFUSABLE_RE = new RegExp(`[${Object.keys(CONFUSABLES).join('')}]`, 'gu');
 
 /** NFKC (full-width letters and the like), invisible characters removed, look-alikes folded. */
 export function normalise(text: string): string {
-  return text.normalize('NFKC').replace(INVISIBLE, '').replace(CONFUSABLE_RE, (c) => CONFUSABLES[c] ?? c);
+  let out = '';
+  for (const c of text.normalize('NFKC').replace(INVISIBLE, '')) out += CONFUSABLES[c] ?? c;
+  return out;
 }
 
 /** A token at the end of a line joined to a token at the start of the next one. */
