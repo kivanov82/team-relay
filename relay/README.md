@@ -96,7 +96,8 @@ block, all optional:
 
 Membership lives in Firestore (`teams/{team}/roster/{member}`: `member`, `emails` (1..5
 lower-cased Google emails), `role` (`owner` or `member`), `added_by`, `added_at`,
-`updated_at`; `teams/{team}.roster_version` counts every change). The team file keeps the
+`updated_at`, `subs` (`[{email, sub}]`, the Google account each email is bound to);
+`teams/{team}.roster_version` counts every change). The team file keeps the
 teams, each team's **seed** members, `limits`, `audit_retention_days` and `delegates`:
 
 ```yaml
@@ -143,6 +144,27 @@ delegates:
   then validates it with one read of `roster_version` (a full reload only when it moved).
   A change made through this process takes effect at once there; on other instances within
   30 s. `GET /roster` always validates.
+- **401 versus 404** (M6-SPEC §7.4, pinned by `tests/test_review_corrections.py`): whatever
+  the kind of bearer (Google ID token, static token, device credential), a principal that is
+  on no team at all is `401 unauthenticated`; one on another team but not the URL's is
+  `404 not_found`. A removed member (on no team) is `401`.
+- **Accounts are bound by Google `sub`** (M6-SPEC §7.2). The first successful relay sign-in
+  with a roster email records that Google account's `sub` on the entry (`subs`; audited
+  `roster.bind`, actor the member, the email's hash). From then on that email belongs to that
+  account: a sign-in by another account with the same email ends at the callback with "This
+  email now belongs to a different Google account" and "Ask the owner." (logged
+  `login_refused` `sub_mismatch`; never the sub). The binding is recorded (or checked again)
+  at `POST /v1/login/choose` in one roster transaction, so of two first sign-ins racing only
+  one binds, and the other is refused before a code is minted. **Removing the email clears
+  its binding**; removing the member deletes the entry and its bindings. Neither the seed nor
+  any other change touches a binding.
+  - **Google ID tokens (gcloud users):** the token's `sub` is checked against the binding
+    (another account: `401`, or `404` when the principal is a member elsewhere); an unbound
+    email is bound by its first call to its own team (not by a call to another team's URL).
+    The verifier refuses an ID token without a `sub`.
+  - **Delegates** (the hosted console): the delegate's token is the console's service
+    account; `X-Relay-On-Behalf-Of` names the member by email only, so there is no member
+    `sub` on that path to bind or check. The console's IAP identity is the check there.
 - **Invariants,** checked inside the transaction that writes: at least one owner; an email
   in at most one entry of a team; member ids `^[a-z][a-z0-9_]{1,31}$`, unique in the team;
   at most 50 members; 1..5 emails an entry (a token-only seed member may have none); a
@@ -158,8 +180,9 @@ delegates:
 
 Owner role required for the mutations (else `403 forbidden`), checked against the roster the
 transaction reads. Every change is audited (`roster.add`, `roster.email_add`,
-`roster.email_remove`, `roster.role`, `roster.remove`) with `actor`, the `member` it is about
-and `email_sha256` (never an email); refusals are audited like any refused mutation.
+`roster.email_remove`, `roster.role`, `roster.remove`; the sign-in's `roster.bind`) with
+`actor`, the `member` it is about and `email_sha256` (never an email); refusals are audited
+like any refused mutation.
 
 - `GET /v1/teams/{team}/roster` → `{"members": [{member, emails, role, added_by, added_at}],
   "roster_version"}`, by member id. An owner sees every email; anyone else sees only their
@@ -173,6 +196,16 @@ and `email_sha256` (never an email); refusals are audited like any refused mutat
   email_taken`, `409 too_many_emails`, `409 no_such_email`, `409 last_email` (removing the
   only email, unless the same call adds one), `409 last_owner` (demoting the last owner);
   `404` for an unknown member.
+  - **No identity handover by email** (M6-SPEC §7.1): `add_email` is accepted only on the
+    caller's own entry (an owner adding their own second Google account). On anyone else's
+    entry the whole call is `403 forbidden` ("… remove and re-add the member"), whatever else
+    it asks, so an owner can never sign in as someone else through an email of their own.
+    Through a delegate the caller is the owner it names, so the same rule holds.
+  - **`remove_email` revokes**, in the same transaction, every live credential of that
+    member minted through that email (credentials record `email_sha256`), and also any of
+    their live credentials that records no email (minted before it was recorded; it may have
+    come through that email). Credentials minted through the member's other emails keep
+    working.
 - `DELETE /v1/teams/{team}/roster/{member}` → `200 {"removed": member}`: the entry is
   deleted, the id retired, and every live device credential of the member revoked, in one
   transaction. `409 last_owner`, `409 seed_member`, `404`.
@@ -210,24 +243,32 @@ authenticates as before.
    the client secret and the relay's PKCE verifier; the ID token is verified (RS256 over
    Google's JWKS, cached for its `Cache-Control`; `iss` Google; `aud` and `azp` the client id;
    `exp` in the future; `iat` at most 60 s ahead), then the nonce (constant time) and
-   `email_verified is True`. Any failure closes the login. An account on no team: `403` and
-   "Ask the team owner to add <email>." Otherwise step `choose` and the chooser.
+   `email_verified is True`, and a `sub` (1..255 printable ASCII). Any failure closes the
+   login. An account on no team: `403` and "Ask the team owner to add <email>." An email
+   bound, on any of its teams, to another Google account: `403`, "This email now belongs to a
+   different Google account" (M6-SPEC §7.2). Otherwise step `choose` (the email and the `sub`
+   kept on the login) and the chooser.
 3. The chooser: the account, the device, the warning, one radio per team (team id and
-   member id; the first preselected), Continue / Cancel. A fresh CSRF token (only its hash is
-   stored).
+   member id; preselected only when there is exactly one team, M6-SPEC §7.5; with several
+   the radios are required and nothing is chosen for the member), Continue / Cancel. A fresh
+   CSRF token (only its hash is stored).
 4. `POST /v1/login/choose` (`application/x-www-form-urlencoded`: `csrf`, `team`, `action`;
    nothing else, each once, at most 4 KiB): the cookie, step `choose`, the CSRF token, an
    `Origin` (when sent) equal to `RELAY_PUBLIC_URL`, a team from the chooser, and the account
-   still on that team's roster. Mints a one-time code (32 bytes; `login_codes/{sha256}`, team,
-   member, the plugin's challenge, `expire_at` in 2 minutes), marks the login `done`, clears
+   still on that team's roster with its email bound to this account's `sub` (bound now if
+   this is the email's first sign-in; one roster transaction). Mints a one-time code (32
+   bytes; `login_codes/{sha256}`, team, member, the email, the plugin's challenge,
+   `expire_at` in 2 minutes), marks the login `done`, clears
    the cookie and redirects `303` to `http://127.0.0.1:<port>/callback?code=…&state=…`.
    **Cancel** closes the login and redirects to `http://127.0.0.1:<port>/callback?
    error=access_denied&state=…` so the plugin's listener can stop waiting. Nothing but
    `http://127.0.0.1:<port>/callback` is ever a redirect target.
 5. `POST /v1/login/token` `{"code", "code_verifier"}` (verifier 43..128 RFC 7636 characters):
    the code unused, unexpired and `BASE64URL(SHA256(verifier)) == challenge` → the code is
-   marked used and a device credential minted: `200 {"credential": "trc_…", "team", "member",
-   "relay_url", "expires_at"}` (`Cache-Control: no-store`). Unknown, expired or wrong verifier
+   marked used and a device credential minted (recording the SHA-256 of the email signed in
+   with): `200 {"credential": "trc_…", "team", "member", "email", "relay_url",
+   "expires_at"}` (`Cache-Control: no-store`); `email` is the Google account's email,
+   lower-cased, so the plugin can say who the member became (M5-SPEC §9.3). Unknown, expired or wrong verifier
    (which burns the code): `400 {"error": "invalid_grant"}`. A code presented a second time
    also revokes the credential it minted. A malformed body: `400 invalid_request`.
 
@@ -239,7 +280,8 @@ authenticates as before.
   `Referrer-Policy: same-origin` (no Referer leaves the relay; `no-referrer` would make
   browsers send `Origin: null` on the chooser's POST, whose `Origin` the relay checks),
   `Cache-Control: no-store`. The stylesheet is linked as `style.css?v=<content hash>`.
-- **Rate limits** per client IP (`limits.login_*`), counted in the store
+- **Rate limits** per client IP (`limits.login_*`, defaults: start 20, callback and choose
+  together 30, token 20 a minute), counted in the store
   (`login_limits/{kind}.{sha256(ip)[:32]}.{minute}`; the address itself is never stored):
   `429`.
 - **The client IP.** Off Cloud Run the socket peer. On Cloud Run (`K_SERVICE` set) the
@@ -247,7 +289,11 @@ authenticates as before.
   connection came from, so that entry is the only one a client cannot write; anything left of
   it is client-supplied and would let anyone pick their own bucket. (If Google ever put its
   own address last, every client would share one bucket: logins would be limited globally,
-  never bypassed.) IPv6 counts per /64.
+  never bypassed.) IPv6 counts per /64. To check the derivation on the live service, every
+  login start logs `x_forwarded_for_hops`, the number of `X-Forwarded-For` entries it saw
+  over all such headers (never an address), once, on the event that ends it
+  (`login_started`, `login_refused` `bad_start`, or `login_rate_limited`); compare it with
+  the number of entries a test client sent.
 - **Logs** never carry a code, a credential, a cookie, a state, an email or an IP: login
   events carry the first 12 hex of the login's key, team, member and the credential's public
   id.
@@ -259,7 +305,12 @@ authenticates as before.
 
 - `Bearer trc_<43 base64url>`: 32 random bytes. Stored only as its SHA-256
   (`teams/{team}/credentials/{sha256}`: member, device, created_at, last_used_at,
-  expire_at, revoked, revoked_at); its public id is the first 16 hex of that hash.
+  expire_at, revoked, revoked_at, `email_sha256` of the email it was minted through); its
+  public id is the first 16 hex of that hash.
+- Taking that email off the member revokes it in the same transaction (M6-SPEC §7.1), and a
+  credential whose recorded email is no longer on its entry is refused (`401`) even on an
+  instance whose credential cache has not seen the revocation yet: within that instance's
+  30 s roster cache instead of its 60 s credential cache.
 - It is its member on its team only: another team in the URL is `404` (audited on a
   mutation, like any member's). It stops working when the member leaves the roster (within
   30 s on other instances, at once here), and a member removed and added again does not
@@ -277,7 +328,8 @@ authenticates as before.
   one of the caller's own by public id (anyone else's, unknown or already revoked: `404`).
   Both return `{"revoked": id}` and are audited (`credential.revoke`). Delegates may not call
   them.
-- Google ID tokens, static tokens and delegates keep working unchanged.
+- Google ID tokens, static tokens and delegates keep working (ID tokens now also carry the
+  `sub` check above).
 
 ## The fake OAuth relay for end-to-end tests
 
