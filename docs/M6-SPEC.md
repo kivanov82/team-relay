@@ -79,12 +79,10 @@ the local key or IAP as today.
 
 ### 24 Sep 2026: after the M5/M6 security review (binds M5 as well)
 
-1. **No identity handover by email.** An owner may not add an email to another member's entry
-   (`PATCH … add_email` on someone else: `403 forbidden`, "remove and re-add the member");
-   a member may add an email to their own entry only by signing in with it is not offered
-   either: emails are set when a member is added. `remove_email` revokes, in the same
-   transaction, every credential minted through that email (credentials record
-   `email_sha256`).
+1. **No identity handover by email.** `add_email` is accepted only on the caller's own entry
+   (an owner adding their own second account); on anyone else's entry it is `403 forbidden`
+   ("remove and re-add the member"). `remove_email` revokes, in the same transaction, every
+   credential minted through that email (credentials record `email_sha256`).
 2. **Accounts are bound by Google `sub`.** The first successful relay sign-in for a roster
    email records that account's `sub` on the entry; later sign-ins with that email must
    present the same `sub` (else the login ends with "This email now belongs to a different
