@@ -3,8 +3,9 @@
 Lets the members of a small team ask each other's Claude Code sessions questions, and ask a
 teammate to run one of a fixed set of named, parameterised operations (a *capability*). The
 answer is pushed into the asker's session over a Claude Code channel. The contract is
-`../docs/M1-SPEC.md` (this plugin is its §8, as corrected in §11) and `../docs/M2-SPEC.md`
-§2 and §4 (Google identity, answering-session reads, tool events, the console).
+`../docs/M1-SPEC.md` (this plugin is its §8, as corrected in §11), `../docs/M2-SPEC.md`
+§2 and §4 (Google identity, tool events, the console) and `../docs/M4-SPEC.md` (what the
+answering session may read, and how a member grants more).
 
 Each member runs two sessions:
 
@@ -79,8 +80,32 @@ export RELAY_TEAM=demo
 export RELAY_GCLOUD_ACCOUNT=you@example.com                  # optional; RELAY_AUTH=google is the default
 export CAP_STAGING_DB_QUERY_ENABLED=true
 export CAP_STAGING_DB_QUERY_RUNNER=/absolute/path/to/your/runner
+export ANSWERER_READ_DIRS=~/src/orders-service:~/notes/runbooks   # optional: folders it may read without asking
 bin/answerer
 ```
+
+**Nothing is readable by default** (M4-SPEC §1). The answering session reads a local file
+only when it is inside a folder you share, or when you allow it at the moment it is needed:
+
+- **Shared folders** (`ANSWERER_READ_DIRS`, optional, `:`-separated, at most 16, `~/`
+  allowed): readable without asking. Share folders deliberately: a teammate's question can
+  ask for anything in them. Each entry must be an existing directory (after `~` and symlinks
+  are resolved) that is not `/`, not your home directory, not above it, and not inside
+  `ANSWERER_HOME`, `~/.claude`, `CLAUDE_CONFIG_DIR` or a credential location on the deny list
+  below; otherwise `bin/answerer` refuses to start, naming the entry and the reason. Their
+  names (the basename only, never the path; characters outside `A-Z a-z 0-9 . _ -` become
+  `_`) are published to your team with your capabilities, so the console shows
+  "Shares: orders-service, runbooks".
+- **Grants, per request:** any other `Read`, `Glob` or `Grep` opens Claude Code's own
+  permission dialog in the answering session's terminal, naming the path. Allow it once,
+  allow that folder for the rest of the session, or deny it. A desktop notification tells you
+  when the dialog is waiting, and the asker's console shows "waiting for <you> to allow
+  access" (below). Grants last at most for the session: `bin/answerer` starts every session
+  with none (it removes the working directory's `.claude/settings.local.json`, where "don't
+  ask again" is saved).
+- **Never:** credentials and other secrets on the deny list stay unreadable whatever you
+  answer (deny rules beat an approval), and no dialog can enable `Bash`, `Write`, `Edit`,
+  `NotebookEdit`, `WebFetch`, `WebSearch`, `Agent` or `Task`.
 
 `bin/answerer` creates `${ANSWERER_HOME:-~/.claude-team-relay/answerer}` (mode 700) with:
 
@@ -92,7 +117,13 @@ bin/answerer
   `RELAY_TOKEN` value is written to `token` (mode 600) and never into `mcp.json`, and it is
   removed from the session's environment.
 - `settings.json`:
-  - allows `mcp__relay__*`, `mcp__capabilities__*`, `Read`, `Glob` and `Grep`;
+  - `permissions.defaultMode` `default` (Claude Code's Manual mode: anything not allowed
+    prompts), with auto mode and bypass mode disabled for the session
+    (`disableAutoMode`, `disableBypassPermissionsMode`); the command also passes
+    `--permission-mode default`;
+  - allows `mcp__relay__*`, `mcp__capabilities__*` and one `Read(//<folder>/**)` per shared
+    folder (the physical path, glob characters escaped). There is no bare `Read`, `Glob` or
+    `Grep` allow: Claude Code applies `Read` rules to `Glob` and `Grep`;
   - denies `Bash`, `Write`, `Edit`, `NotebookEdit`, `WebFetch`, `WebSearch`, `Agent`, `Task`;
   - denies reading credential stores and other secrets with `Read(...)` path rules only.
     Claude Code evaluates path rules for `Read` (and applies them to `Glob` and `Grep`); a
@@ -111,10 +142,13 @@ bin/answerer
     `.env`, `.env.*`, `.envrc`, `*.pem`, `*.key`, `id_rsa*`, `id_ed25519*`, `*.p12`, `*.pfx`,
     `*.keystore`, `*.jks`, `credentials.json`, `*.tfvars`, `keystore/**`;
   - and the session's own files: `~/.claude.json`, `ANSWERER_HOME`, the token file (token
-    mode) and `CLOUDSDK_CONFIG` when set (literal paths, with glob characters escaped);
-  - `PostToolUse` and `PostToolUseFailure` hooks (exec form, `"async": true`, so they run
-    in the background and never delay a tool call) running
-    `node dist/tool-event.js --config $ANSWERER_HOME/tool-event.json` (below).
+    mode), `CLOUDSDK_CONFIG` and your own `CLAUDE_CONFIG_DIR` when set (literal paths, with
+    glob characters escaped);
+  - `PostToolUse`, `PostToolUseFailure` and `PermissionRequest` hooks (exec form,
+    `"async": true`, so they run in the background and never delay a tool call or a dialog)
+    running `node dist/tool-event.js --config $ANSWERER_HOME/tool-event.json` (below);
+  - a `Notification` hook for `permission_prompt` only (exec form, async) running
+    `node dist/notify-desktop.js` (below).
 - `tool-event.json`: the hook's relay settings (URL, team, sign-in mode, account or token
   file path, state directory); no secret.
 - `state/` (mode 700): `active.json`, the requests this session has acknowledged and not yet
@@ -131,39 +165,64 @@ The session's working directory is **not** under `ANSWERER_HOME`: Claude Code lo
 files from every ancestor of its working directory, which `CLAUDE_CONFIG_DIR` does not cover,
 and your home directory holds your own `~/.claude/`. So it runs from
 `${TMPDIR:-/tmp}/team-relay-answerer-<uid>/work` (both levels mode 700, created when missing,
-owned by you and never a symlink), or from `ANSWERER_WORKDIR` when set (an absolute path). The
-launcher refuses to start, before writing anything, when the working directory:
+owned by you and never a symlink), or from `ANSWERER_WORKDIR` when set (an absolute path).
+
+Before anything else the launcher removes the working directory's
+`.claude/settings.local.json` (and `.claude/` when that leaves it empty): outside a git
+repository, that is where Claude Code saves a "don't ask again" answer, and grants must not
+outlive the session. It never removes through a symlink or in a directory you do not own. It
+then refuses to start, before writing anything, when `ANSWERER_READ_DIRS` has an entry it
+refuses (above), or when the working directory:
 
 - is inside `$HOME` (compared after resolving symlinks; a `TMPDIR` inside `$HOME` needs
   `ANSWERER_WORKDIR`),
-- is not empty, or
+- is not empty (anything besides that one file), or
 - or any ancestor contains `CLAUDE.md`, `CLAUDE.local.md`, `.claude/CLAUDE.md`,
   `.claude/rules/`, `.claude/settings.json` or `.claude/settings.local.json`.
 
-It then runs `claude --mcp-config … --strict-mcp-config --settings … --disallowedTools Bash
-Write Edit NotebookEdit WebFetch WebSearch Agent Task --dangerously-load-development-channels
-server:relay` from that directory. Extra arguments are passed through to `claude`.
+It then runs `claude --mcp-config … --strict-mcp-config --settings … --permission-mode default
+--disallowedTools Bash Write Edit NotebookEdit WebFetch WebSearch Agent Task
+--dangerously-load-development-channels server:relay` from that directory. Extra arguments are passed through to `claude`.
 `bin/answerer --print-command` writes the files and prints the command instead of running it.
 
 At startup the answering channel publishes your discovery payload: the manifest restricted
-to the capabilities this session will actually run.
+to the capabilities this session will actually run, and `shares`, the names of your shared
+folders (an empty list when you share none), validated against the same schema the relay
+uses.
 
-**Reading files is a guard rail, not a sandbox.** The answering session can read any file
-your user can read, except what the deny rules above name; a teammate's question can ask
-for any file. The deny rules cover the usual credential stores, not every secret on your
-machine (a key under another name, a database dump, a document). The instructions tell the
-session never to send secrets to teammates, but that is an instruction to a model, not a
-boundary. If a directory holds something no teammate may see, keep it out of reach of the
-user that runs the answering session.
+**These are permission rules, not an OS sandbox.** Claude Code enforces them for its own
+file tools; nothing stops another process your user runs from reading a file. Whatever is in
+a shared folder, and whatever you allow in a dialog, a teammate can ask for and the session
+can read. The deny rules cover the usual credential stores, not every secret on your machine
+(a key under another name, a database dump, a document), so do not share a folder that
+holds one, and read the path in a dialog before you allow it. The instructions tell the
+session never to try to read credentials and never to send secrets to teammates, but that is
+an instruction to a model, not a boundary.
+
+### Seeing a grant happen (M4-SPEC §2)
+
+- **You:** when a permission dialog has waited about six seconds (Claude Code's timing for
+  `permission_prompt` notifications), `dist/notify-desktop.js` shows a desktop notification
+  with a fixed text, "Team relay: your answering session is waiting for your permission", via
+  `osascript` on macOS or `notify-send` on Linux when it is installed (nothing elsewhere). It
+  reads the hook input only to check that it is a permission prompt; no text from the hook
+  input or from a teammate is ever passed to the notifier, and it runs no shell. It always
+  exits 0 and gives up after 3 s.
+- **The asker and the team:** the `PermissionRequest` hook posts a tool event with
+  `status: "waiting"` (the tool's name only, never the path) to the request being answered.
+  The console shows "waiting for <you> to allow access" in amber until the next event for
+  that tool arrives. If you deny, no event follows (Claude Code runs no hook for a denied
+  dialog), so the console shows the waiting state until the next tool event or the answer.
 
 ### Tool events (M2-SPEC §4.3)
 
-Every tool call in the answering session (and every failed one) runs `dist/tool-event.js`.
+Every tool call in the answering session (and every failed one), and every permission
+request, runs `dist/tool-event.js`.
 It takes the tool's name from the hook input (an `mcp__<server>__` prefix stripped; the
 relay's own `ack_question` and `reply` are skipped), finds the most recently acknowledged
 open request in `state/active.json` (none open: nothing is sent), and posts
-`{"tool", "status": "ok"|"error", "duration_ms"}` to that request's
-`/requests/{id}/events`. Claude Code's hook input carries `duration_ms` (the tool's run time)
+`{"tool", "status": "ok"|"error"|"waiting", "duration_ms"}` to that request's
+`/requests/{id}/events` (`waiting` for a permission request, with no duration). Claude Code's hook input carries `duration_ms` (the tool's run time)
 on both events, so it is sent when present. The tool's input, output and error text are
 never sent. The hook runs asynchronously, the script always exits 0 and gives up after 3 s,
 so a slow or unreachable relay never holds up the session. A request past its answer deadline
@@ -183,6 +242,8 @@ is no longer open, so tool calls after it are not reported.
 | `ALLOW_PRODUCTION` | answerer channel, capability server | Only the exact value `true` allows production capabilities. |
 | `CAP_<NAME>_ENABLED` | answerer channel, capability server | Only `true` enables `<name>` (`NAME` is the capability name uppercased). |
 | `CAP_<NAME>_RUNNER` | answerer channel, capability server | Absolute path of an executable regular file. |
+| `ANSWERER_READ_DIRS` | `bin/answerer` | Optional: the folders the answering session reads without asking, `:`-separated, at most 16 (`~/` allowed). Refused entries stop the launcher. Their basenames are published as `shares`. |
+| `ANSWERER_SHARES` | answerer channel | Set by `bin/answerer`: the JSON list of shared folder names to publish. |
 | `ANSWERER_HOME` | `bin/answerer` | Where the session's configuration lives (`mcp.json`, `settings.json`, `tool-event.json`, `config/`, `state/`). Default `~/.claude-team-relay/answerer`. |
 | `ANSWERER_STATE_DIR` | answerer channel | Set by `bin/answerer` to `$ANSWERER_HOME/state`: where `active.json` is kept. |
 | `CONSOLE_PORT` | `bin/console` | Default 4317; `0` picks a free port. |
@@ -316,10 +377,12 @@ fetches a fresh one once when the relay answers 401.
   resolved from a verified credential; nothing a client writes can claim another sender.
 - The token (static or Google ID token) is never logged, never put in an error and never
   written to a file by the plugin. All logs go to stderr (stdout is the MCP transport).
-- **The answering session reads local files** (except credential stores, by path); that is a
-  guard rail, not a sandbox (see above).
-- **Tool events carry a name, an outcome and a duration**, never a tool's input, output,
-  error text or path.
+- **The answering session reads nothing by default**: only folders you share, and files or
+  folders you allow in Claude Code's own dialog for that session; credential stores stay
+  denied whatever you answer. These are permission rules, not an OS sandbox (see above).
+- **The desktop notice is fixed text**; no teammate or hook-input text reaches it.
+- **Tool events carry a name, an outcome (`ok`, `error`, or `waiting` for your permission)
+  and a duration**, never a tool's input, output, error text or path.
 - Network errors, 5xx and 429 (`rate_limited`, `too_many_polls`) are retried with
   exponential backoff; other refusals (for example `422 invalid_timeouts`) are tool errors.
 
@@ -329,7 +392,7 @@ fetches a fresh one once when the relay answers 401.
 pnpm install
 pnpm typecheck
 pnpm test             # builds dist/ first; the stdio suites drive node dist/*.js
-pnpm build            # esbuild → dist/{channel,capabilities,session-start,tool-event,console-server}.js (committed); never touches dist/console/
+pnpm build            # esbuild → dist/{channel,capabilities,session-start,tool-event,notify-desktop,console-server}.js (committed); never touches dist/console/
 pnpm generate         # manifest.yaml → .claude-plugin/plugin.json userConfig and .mcp.json
 pnpm generate --check # fails when those files are out of date
 ../scripts/e2e.sh     # the M1 gate (all seven §9 scenarios) and the M2 scenarios when the relay serves them

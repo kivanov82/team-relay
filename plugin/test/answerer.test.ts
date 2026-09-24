@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { spawnSync } from 'node:child_process';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
@@ -39,6 +39,24 @@ function expectedDeny(home: string, tokenFile: string | null, extra: string[] = 
     ...(tokenFile ? [`Read(/${tokenFile})`] : []),
     ...extra.map((p) => `Read(${p})`),
   ];
+}
+/** The hooks the launcher must write (M2-SPEC §4.3, §7.4; M4-SPEC §2), exactly. */
+function expectedHooks(home: string) {
+  const nodeBin = spawnSync('bash', ['-c', 'command -v node'], { encoding: 'utf8' }).stdout.trim();
+  const toolEvent = {
+    type: 'command',
+    command: nodeBin,
+    args: [join(PLUGIN_ROOT, 'dist', 'tool-event.js'), '--config', join(home, 'tool-event.json')],
+    async: true,
+    timeout: 5,
+  };
+  const notify = { type: 'command', command: nodeBin, args: [join(PLUGIN_ROOT, 'dist', 'notify-desktop.js')], async: true, timeout: 5 };
+  return {
+    PostToolUse: [{ matcher: '*', hooks: [toolEvent] }],
+    PostToolUseFailure: [{ matcher: '*', hooks: [toolEvent] }],
+    PermissionRequest: [{ matcher: '*', hooks: [toolEvent] }],
+    Notification: [{ matcher: 'permission_prompt', hooks: [notify] }],
+  };
 }
 const TOKEN = 'tok-bob-answerer-secret-7';
 
@@ -127,15 +145,32 @@ describe('bin/answerer --print-command', () => {
     expect(() => statSync(join(home, 'token'))).toThrow();
   });
 
-  it('writes settings.json with exactly the M2 allow and deny lists (reads allowed, credential stores denied)', () => {
+  it('writes settings.json exactly: normal permission mode, nothing readable by default, the deny list intact (M4-SPEC §1)', () => {
     const { home } = setup();
     const settings = JSON.parse(readFileSync(join(home, 'settings.json'), 'utf8'));
-    expect(settings.permissions.allow).toEqual(['mcp__relay__*', 'mcp__capabilities__*', 'Read', 'Glob', 'Grep']);
-    expect(settings.permissions.deny).toEqual(expectedDeny(home, join(home, 'token')));
-    // Nothing that writes, runs or reaches the web is allowed anywhere.
-    for (const tool of ['Bash', 'Write', 'Edit', 'NotebookEdit', 'WebFetch', 'WebSearch', 'Agent', 'Task']) {
+    expect(settings.permissions).toEqual({
+      // Manual mode (config value "default"): anything not allowed prompts; auto and bypass cannot be entered.
+      defaultMode: 'default',
+      disableAutoMode: 'disable',
+      disableBypassPermissionsMode: 'disable',
+      deny: expectedDeny(home, join(home, 'token')),
+      // No shared folder: no read rule at all, and never a bare Read, Glob or Grep.
+      allow: ['mcp__relay__*', 'mcp__capabilities__*'],
+    });
+    expect(settings.hooks).toEqual(expectedHooks(home));
+    expect(Object.keys(settings).sort()).toEqual(['hooks', 'permissions']);
+    // Nothing that reads, writes, runs or reaches the web is allowed as a whole tool.
+    for (const tool of ['Read', 'Glob', 'Grep', 'Bash', 'Write', 'Edit', 'NotebookEdit', 'WebFetch', 'WebSearch', 'Agent', 'Task']) {
       expect(settings.permissions.allow).not.toContain(tool);
+      expect(settings.permissions.allow.some((a: string) => a.startsWith(`${tool}(`) && tool !== 'Read')).toBe(false);
     }
+  });
+
+  it('starts claude in the normal permission mode (not dontAsk, not auto)', () => {
+    const { r } = setup();
+    expect(r.stdout).toContain(' --settings ');
+    expect(r.stdout).toContain(' --permission-mode default --disallowedTools ');
+    expect(r.stdout).not.toMatch(/dontAsk|--permission-mode (auto|acceptEdits|bypassPermissions|plan)|dangerously-skip-permissions/);
   });
 
   it('has no Glob(...) or Grep(...) path rule, and a Read rule for every §7.5 path in every form', () => {
@@ -160,21 +195,20 @@ describe('bin/answerer --print-command', () => {
     expect(new Set(deny).size).toBe(deny.length);
   });
 
-  it('adds the tool-event hooks in exec form for PostToolUse and PostToolUseFailure, async, and nothing else', () => {
+  it('adds the hooks in exec form, async: tool events, waiting on a permission request, and the desktop notice for permission prompts only', () => {
     const { home } = setup();
     const settings = JSON.parse(readFileSync(join(home, 'settings.json'), 'utf8'));
-    const nodeBin = spawnSync('bash', ['-c', 'command -v node'], { encoding: 'utf8' }).stdout.trim();
-    const hook = {
-      type: 'command',
-      command: nodeBin,
-      args: [join(PLUGIN_ROOT, 'dist', 'tool-event.js'), '--config', join(home, 'tool-event.json')],
-      async: true,
-      timeout: 5,
-    };
-    expect(settings.hooks).toEqual({
-      PostToolUse: [{ matcher: '*', hooks: [hook] }],
-      PostToolUseFailure: [{ matcher: '*', hooks: [hook] }],
-    });
+    expect(settings.hooks).toEqual(expectedHooks(home));
+    for (const groups of Object.values(settings.hooks) as Array<Array<{ hooks: Array<Record<string, unknown>> }>>) {
+      for (const h of groups.flatMap((g) => g.hooks)) {
+        // Exec form (args, no shell), in the background, from an absolute node.
+        expect(h.async).toBe(true);
+        expect(Array.isArray(h.args)).toBe(true);
+        expect(String(h.command).startsWith('/')).toBe(true);
+      }
+    }
+    // M4-SPEC §2: the notice runs for permission prompts, not for idle or other notifications.
+    expect(settings.hooks.Notification.map((g: { matcher: string }) => g.matcher)).toEqual(['permission_prompt']);
     expect(Object.keys(settings).sort()).toEqual(['hooks', 'permissions']);
   });
 
@@ -390,7 +424,9 @@ describe('bin/answerer working directory (§11.13)', () => {
       if (name.endsWith('rules')) mkdirSync(target);
       else writeFileSync(target, '# memory\n');
       refused({ ANSWERER_WORKDIR: join(root, 'x', 'work') }, new RegExp(`${target.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')} would load`));
-      // The same file in the working directory itself.
+      // The same file in the working directory itself (its own .claude/settings.local.json is
+      // where a previous session saved grants: removed at start instead, tested below).
+      if (name === '.claude/settings.local.json') return;
       const own = join(base(), 'work');
       mkdirSync(join(own, name, '..'), { recursive: true });
       if (name.endsWith('rules')) mkdirSync(join(own, name));
@@ -398,6 +434,71 @@ describe('bin/answerer working directory (§11.13)', () => {
       refused({ ANSWERER_WORKDIR: own }, /would load into the answering session/);
     });
   }
+
+  describe('grants never outlive a session (M4-SPEC §1)', () => {
+    const GRANT = JSON.stringify({ permissions: { allow: ['Read(//Users/bob/private/**)'] } });
+    const plant = (dir: string) => {
+      mkdirSync(join(dir, '.claude'), { recursive: true, mode: 0o700 });
+      writeFileSync(join(dir, '.claude', 'settings.local.json'), GRANT);
+    };
+
+    it('removes the working directory\'s .claude/settings.local.json a previous session left, and starts', () => {
+      const dir = join(base(), 'work');
+      plant(dir);
+      const r = runAnswerer(settings({ ANSWERER_WORKDIR: dir }));
+      expect(r.status, r.stderr).toBe(0);
+      expect(r.stderr).toContain(join(dir, '.claude', 'settings.local.json'));
+      expect(existsSync(join(dir, '.claude'))).toBe(false);
+      expect(readdirSync(dir)).toEqual([]);
+    });
+
+    it('does the same in the default working directory', () => {
+      const tmp = base();
+      const dir = join(tmp, `team-relay-answerer-${process.getuid!()}`, 'work');
+      plant(dir);
+      const r = runAnswerer(settings({ TMPDIR: tmp }));
+      expect(r.status, r.stderr).toBe(0);
+      expect(readdirSync(dir)).toEqual([]);
+    });
+
+    it('still refuses anything else in the working directory, beside the grants file or in .claude/', () => {
+      const beside = join(base(), 'work');
+      plant(beside);
+      writeFileSync(join(beside, 'notes.txt'), 'x');
+      refused({ ANSWERER_WORKDIR: beside }, /must be empty/);
+      expect(existsSync(join(beside, '.claude', 'settings.local.json'))).toBe(false);
+
+      const inside = join(base(), 'work');
+      plant(inside);
+      writeFileSync(join(inside, '.claude', 'other.json'), '{}');
+      refused({ ANSWERER_WORKDIR: inside }, /must be empty/);
+      expect(existsSync(join(inside, '.claude', 'other.json'))).toBe(true);
+
+      const memory = join(base(), 'work');
+      plant(memory);
+      writeFileSync(join(memory, '.claude', 'settings.json'), '{}');
+      refused({ ANSWERER_WORKDIR: memory }, /settings\.json would load/);
+    });
+
+    it('never removes through a symlinked .claude, and refuses it', () => {
+      const dir = join(base(), 'work');
+      mkdirSync(dir);
+      const elsewhere = base();
+      writeFileSync(join(elsewhere, 'settings.local.json'), GRANT);
+      symlinkSync(elsewhere, join(dir, '.claude'));
+      refused({ ANSWERER_WORKDIR: dir }, /\.claude is a symlink/);
+      expect(readFileSync(join(elsewhere, 'settings.local.json'), 'utf8')).toBe(GRANT);
+    });
+
+    it('never removes anything in a working directory reached through a symlink', () => {
+      const root = base();
+      const real = join(root, 'real');
+      plant(real);
+      symlinkSync(real, join(root, 'link'));
+      refused({ ANSWERER_WORKDIR: join(root, 'link') }, /settings\.local\.json would load|is a symlink/);
+      expect(readFileSync(join(real, '.claude', 'settings.local.json'), 'utf8')).toBe(GRANT);
+    });
+  });
 
   it('refuses a working directory that is not empty', () => {
     const dir = join(base(), 'work');
@@ -460,6 +561,185 @@ describe('bin/answerer session files drive working servers', () => {
       expect(relay.requests.every((q) => q.member === 'bob')).toBe(true);
     } finally {
       for (const c of clients) await c.close().catch(() => {});
+      await relay.stop();
+    }
+  });
+});
+
+describe('bin/answerer ANSWERER_READ_DIRS: shared folders (M4-SPEC §1, §3)', () => {
+  const esc = (p: string) => p.replace(/[\\*?[\]!#]/g, (c) => `\\${c}`);
+  /** A synthetic $HOME with folders to share and credential locations to refuse. */
+  function fakeHome() {
+    const home = realpathSync(mkdtempSync(join(tmpdir(), 'team-relay-rd-home-')));
+    for (const d of [
+      'src/app',
+      'My Notes',
+      'odd[1]*',
+      'docs/app',
+      '.ssh/keys',
+      '.config/gcloud/configurations',
+      '.config/gh/hosts',
+      'Library/Application Support/Google/Chrome/Default',
+      'Library/Application Support/Arc/Cookies-store',
+      'proj/keystore/sub',
+      'proj/.env',
+      'proj/prod.pem',
+      '.claude/projects',
+      '.claude-team-relay/x',
+      '.foundry/cache',
+      'custom-claude/sub',
+      'gcloud-conf/sub',
+      'relay-home/state',
+    ]) {
+      mkdirSync(join(home, d), { recursive: true });
+    }
+    writeFileSync(join(home, 'file.txt'), 'x');
+    symlinkSync(join(home, 'src', 'app'), join(home, 'link-to-app'));
+    symlinkSync(join(home, '.ssh', 'keys'), join(home, 'link-to-ssh'));
+    return home;
+  }
+  function run(home: string, readDirs: string | undefined, extra: Record<string, string> = {}) {
+    const tmp = realpathSync(mkdtempSync(join(tmpdir(), 'team-relay-rd-tmp-')));
+    const answererHome = join(home, 'relay-home');
+    const r = runAnswerer({
+      HOME: home,
+      TMPDIR: tmp,
+      ANSWERER_HOME: answererHome,
+      RELAY_URL: 'https://relay.example.com',
+      RELAY_TEAM: 'demo',
+      RELAY_TOKEN: TOKEN,
+      ...(readDirs === undefined ? {} : { ANSWERER_READ_DIRS: readDirs }),
+      ...extra,
+    });
+    return { r, answererHome, workParent: join(tmp, `team-relay-answerer-${process.getuid!()}`) };
+  }
+
+  it('allows one Read(//<abs>/**) per shared folder: ~ expanded, symlinks resolved, glob characters escaped, repeats once', () => {
+    const home = fakeHome();
+    const { r, answererHome } = run(home, `~/src/app:${home}/My Notes:${home}/link-to-app:${home}/odd[1]*:${home}/src/app/`);
+    expect(r.status, r.stderr).toBe(0);
+    const settings = JSON.parse(readFileSync(join(answererHome, 'settings.json'), 'utf8'));
+    expect(settings.permissions.allow).toEqual([
+      'mcp__relay__*',
+      'mcp__capabilities__*',
+      `Read(/${home}/src/app/**)`,
+      `Read(/${home}/My Notes/**)`,
+      `Read(/${esc(join(home, 'odd[1]*'))}/**)`,
+    ]);
+    for (const rule of settings.permissions.allow.slice(2)) expect(rule).toMatch(/^Read\(\/\/.+\/\*\*\)$/);
+    // The deny list is intact beside them, and still beats them.
+    expect(settings.permissions.deny).toEqual(expectedDeny(answererHome, join(answererHome, 'token')));
+    expect(settings.permissions.defaultMode).toBe('default');
+  });
+
+  it('hands the channel only the folder names, never the paths, to publish (M4-SPEC §3)', () => {
+    const home = fakeHome();
+    const { r, answererHome } = run(home, `~/src/app:${home}/My Notes:${home}/odd[1]*:${home}/docs/app`);
+    expect(r.status, r.stderr).toBe(0);
+    const raw = readFileSync(join(answererHome, 'mcp.json'), 'utf8');
+    const mcp = JSON.parse(raw);
+    // Two folders named app are one share name.
+    expect(JSON.parse(mcp.mcpServers.relay.env.ANSWERER_SHARES)).toEqual(['app', 'My_Notes', 'odd_1__']);
+    expect(mcp.mcpServers.capabilities.env.ANSWERER_SHARES).toBeUndefined();
+    expect(raw).not.toContain(join(home, 'src'));
+    expect(raw).not.toContain('My Notes');
+    expect(mcp.mcpServers.relay.env.ANSWERER_READ_DIRS).toBeUndefined();
+  });
+
+  it('shares nothing when unset or empty: no read rule, no share names', () => {
+    const home = fakeHome();
+    for (const value of [undefined, '']) {
+      const { r, answererHome } = run(home, value);
+      expect(r.status, r.stderr).toBe(0);
+      const settings = JSON.parse(readFileSync(join(answererHome, 'settings.json'), 'utf8'));
+      expect(settings.permissions.allow).toEqual(['mcp__relay__*', 'mcp__capabilities__*']);
+      const mcp = JSON.parse(readFileSync(join(answererHome, 'mcp.json'), 'utf8'));
+      expect(mcp.mcpServers.relay.env.ANSWERER_SHARES).toBeUndefined();
+    }
+  });
+
+  it('accepts 16 folders and refuses 17', () => {
+    const home = fakeHome();
+    for (let i = 0; i < 17; i++) mkdirSync(join(home, 'many', `d${i}`), { recursive: true });
+    const list = (n: number) => Array.from({ length: n }, (_, i) => join(home, 'many', `d${i}`)).join(':');
+    const ok = run(home, list(16));
+    expect(ok.r.status, ok.r.stderr).toBe(0);
+    expect(JSON.parse(readFileSync(join(ok.answererHome, 'settings.json'), 'utf8')).permissions.allow).toHaveLength(18);
+    const tooMany = run(home, list(17));
+    expect(tooMany.r.status).not.toBe(0);
+    expect(tooMany.r.stderr).toMatch(/ANSWERER_READ_DIRS names 17 folders; at most 16/);
+  });
+
+  // Every refusal: which entry and why, and nothing written or created.
+  const REFUSALS: Array<[string, (home: string) => { dirs: string; env?: Record<string, string> }, RegExp]> = [
+    ['an empty entry', (h) => ({ dirs: `${h}/src/app::${h}/My Notes` }), /entry 2 \(""\) is empty/],
+    ['a trailing colon', (h) => ({ dirs: `${h}/src/app:` }), /entry 2 \(""\) is empty/],
+    ['a relative path', () => ({ dirs: 'src/app' }), /entry 1 \("src\/app"\) must be an absolute path or start with ~\//],
+    ['~user', () => ({ dirs: '~bob/src' }), /entry 1 \("~bob\/src"\) uses ~user/],
+    ['a folder that does not exist', (h) => ({ dirs: `${h}/src/app:${h}/missing` }), /entry 2 \(".*\/missing"\) does not exist/],
+    ['a file', (h) => ({ dirs: `${h}/file.txt` }), /entry 1 .* is not a directory/],
+    ['/', () => ({ dirs: '/' }), /entry 1 \("\/"\) is the root directory/],
+    ['$HOME', (h) => ({ dirs: h }), /entry 1 .* is your home directory/],
+    ['~', () => ({ dirs: '~' }), /entry 1 \("~"\) is your home directory/],
+    ['~/', () => ({ dirs: '~/' }), /entry 1 \("~\/"\) is your home directory/],
+    ['a folder above $HOME', (h) => ({ dirs: join(h, '..') }), /entry 1 .* contains your home directory/],
+    ['ANSWERER_HOME itself', (h) => ({ dirs: join(h, 'relay-home') }), /entry 1 .* is inside ANSWERER_HOME/],
+    ['a folder inside ANSWERER_HOME', (h) => ({ dirs: join(h, 'relay-home', 'state') }), /entry 1 .* is inside ANSWERER_HOME/],
+    ['~/.claude', (h) => ({ dirs: `${h}/src/app:~/.claude/projects` }), /entry 2 .* is inside a Claude config directory/],
+    ['a folder inside CLAUDE_CONFIG_DIR', (h) => ({ dirs: join(h, 'custom-claude', 'sub'), env: { CLAUDE_CONFIG_DIR: join(h, 'custom-claude') } }), /is inside a Claude config directory/],
+    ['~/.ssh', (h) => ({ dirs: join(h, '.ssh', 'keys') }), /is inside a credential location on the deny list \(~\/\.ssh\/\*\*\)/],
+    ['a symlink into ~/.ssh', (h) => ({ dirs: join(h, 'link-to-ssh') }), /is inside a credential location on the deny list \(~\/\.ssh\/\*\*\)/],
+    ['~/.config/gcloud', () => ({ dirs: '~/.config/gcloud/configurations' }), /\(~\/\.config\/gcloud\/\*\*\)/],
+    ['~/.config/gh', () => ({ dirs: '~/.config/gh/hosts' }), /\(~\/\.config\/gh\/\*\*\)/],
+    ['the Chrome profile', () => ({ dirs: '~/Library/Application Support/Google/Chrome/Default' }), /\(~\/Library\/Application Support\/Google\/Chrome\/\*\*\)/],
+    ['a browser cookie store', () => ({ dirs: '~/Library/Application Support/Arc/Cookies-store' }), /\(~\/Library\/Application Support\/\*\*\/Cookies\*\)/],
+    ['~/.claude-team-relay', () => ({ dirs: '~/.claude-team-relay/x' }), /\(~\/\.claude-team-relay\/\*\*\)/],
+    ['~/.foundry', () => ({ dirs: '~/.foundry/cache' }), /\(~\/\.foundry\/\*\*\)/],
+    ['a keystore folder anywhere', (h) => ({ dirs: join(h, 'proj', 'keystore', 'sub') }), /\(\*\*\/keystore\/\*\*\)/],
+    ['a folder named .env', (h) => ({ dirs: join(h, 'proj', '.env') }), /\(\*\*\/\.env\)/],
+    ['a folder named like a key file', (h) => ({ dirs: join(h, 'proj', 'prod.pem') }), /\(\*\*\/\*\.pem\)/],
+    ['a folder inside CLOUDSDK_CONFIG', (h) => ({ dirs: join(h, 'gcloud-conf', 'sub'), env: { CLOUDSDK_CONFIG: join(h, 'gcloud-conf') } }), /\(CLOUDSDK_CONFIG\)/],
+  ];
+  for (const [what, make, why] of REFUSALS) {
+    it(`refuses ${what}, naming the entry and the reason, before writing anything`, () => {
+      const home = fakeHome();
+      const { dirs, env } = make(home);
+      const { r, answererHome, workParent } = run(home, dirs, env);
+      expect(r.status, r.stdout).not.toBe(0);
+      expect(r.stdout).toBe('');
+      expect(r.stderr).toMatch(/^answerer: refusing to start: ANSWERER_READ_DIRS /);
+      expect(r.stderr).toMatch(why);
+      for (const f of ['mcp.json', 'settings.json', 'tool-event.json', 'token']) expect(existsSync(join(answererHome, f))).toBe(false);
+      expect(existsSync(workParent)).toBe(false);
+    });
+  }
+});
+
+describe('bin/answerer session files publish the shared folder names (M4-SPEC §3)', () => {
+  it('the channel started from mcp.json publishes basenames, never a path', async () => {
+    const relay = await new FakeRelay().start();
+    let client: Client | null = null;
+    try {
+      const shared = realpathSync(mkdtempSync(join(tmpdir(), 'team-relay-share-')));
+      mkdirSync(join(shared, 'orders-service'));
+      mkdirSync(join(shared, 'Team Runbooks'));
+      const { home, r } = setup({
+        RELAY_URL: relay.url,
+        RELAY_TOKEN: TOKEN_OF.bob!,
+        ANSWERER_READ_DIRS: `${shared}/orders-service:${shared}/Team Runbooks`,
+      });
+      expect(r.status, r.stderr).toBe(0);
+      const def = JSON.parse(readFileSync(join(home, 'mcp.json'), 'utf8')).mcpServers.relay;
+      client = new Client({ name: 'test', version: '0' }, { capabilities: {} });
+      await client.connect(
+        new StdioClientTransport({ command: def.command, args: def.args, env: { PATH: process.env.PATH ?? '', ...def.env }, stderr: 'pipe' }),
+      );
+      const published = relay.manifests.get('bob') as { shares: unknown };
+      expect(published.shares).toEqual([{ name: 'orders-service' }, { name: 'Team_Runbooks' }]);
+      const put = relay.requests.find((q) => q.method === 'PUT')!;
+      expect(put.raw).not.toContain(shared);
+    } finally {
+      await client?.close().catch(() => {});
       await relay.stop();
     }
   });

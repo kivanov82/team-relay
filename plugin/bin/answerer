@@ -1,16 +1,22 @@
 #!/usr/bin/env bash
-# Launch the dedicated answering session (M1-SPEC §8.5, §11.13; M2-SPEC §4).
+# Launch the dedicated answering session (M1-SPEC §8.5, §11.13; M2-SPEC §4; M4-SPEC §1, §2).
 #
 # The session loads only the relay channel (answerer role) and the capability server. It
-# may read local files (Read, Glob, Grep) except credential stores, which stay denied by
-# path; it has no shell, no file writing or editing and no web tools. It runs with its own
-# CLAUDE_CONFIG_DIR so none of your personal memory, CLAUDE.md, plugins or hooks load into
-# it. Claude Code also loads memory files from every ancestor of its working directory, so
-# the session runs from an empty directory outside $HOME, and the launcher refuses to start
-# when that directory or any ancestor holds CLAUDE.md, CLAUDE.local.md, .claude/CLAUDE.md,
-# .claude/rules/, .claude/settings.json or .claude/settings.local.json.
+# reads no local file by default (M4-SPEC §1): only the folders you share with
+# ANSWERER_READ_DIRS are readable without asking, and any other Read, Glob or Grep opens
+# Claude Code's own permission dialog in this terminal, where you allow it once, allow that
+# folder for the session, or deny it. Grants never outlive the session. Credential stores
+# stay denied by path whatever you answer; it has no shell, no file writing or editing and no
+# web tools. It runs in Claude Code's normal permission mode (not auto, not dontAsk) with its
+# own CLAUDE_CONFIG_DIR, so none of your personal memory, CLAUDE.md, plugins or hooks load
+# into it. Claude Code also loads memory files from every ancestor of its working directory,
+# so the session runs from an empty directory outside $HOME, and the launcher refuses to
+# start when that directory or any ancestor holds CLAUDE.md, CLAUDE.local.md,
+# .claude/CLAUDE.md, .claude/rules/, .claude/settings.json or .claude/settings.local.json
+# (the working directory's own .claude/settings.local.json, where a "don't ask again" answer
+# is saved, is removed instead: see below).
 #
-# The read-deny rules are a guard rail, not a sandbox: see the plugin README.
+# These are permission rules, not an OS sandbox: see the plugin README.
 #
 # Environment:
 #   RELAY_URL, RELAY_TEAM                  required
@@ -23,6 +29,13 @@
 #   ALLOW_PRODUCTION                       "true" to allow production-data capabilities
 #   CAP_<NAME>_ENABLED, CAP_<NAME>_RUNNER  per capability (NAME is the capability name uppercased)
 #   MANIFEST_PATH                          optional; defaults to the plugin's manifest.yaml
+#   ANSWERER_READ_DIRS                     optional; the folders the session may read without
+#                                          asking, :-separated (at most 16; ~/ allowed). Each
+#                                          must be an existing directory that is not /, not
+#                                          $HOME, not above $HOME, and not inside ANSWERER_HOME,
+#                                          a Claude config directory or a credential location
+#                                          on the deny list; otherwise nothing starts. Their
+#                                          basenames (never the paths) are published to the team.
 #   ANSWERER_HOME                          optional; defaults to ~/.claude-team-relay/answerer
 #                                          (the session's config: mcp.json, settings.json,
 #                                          tool-event.json, config/, state/)
@@ -70,8 +83,6 @@ node_bin="$(command -v node || true)"
 [[ -n "${HOME:-}" ]] || die "HOME is required"
 home_phys="$(cd "$HOME" 2>/dev/null && pwd -P)" || die "HOME is not a directory"
 
-# --- The session's working directory (M1-SPEC §11.13) -----------------------------------
-
 # The physical path `path` would have, resolving the part that exists (symlinks included).
 physical_path() {
   local path="$1" rest="" phys
@@ -86,6 +97,143 @@ physical_path() {
   [[ "$phys" == "/" ]] && phys=""
   printf '%s\n' "${phys}${rest:-}"
 }
+
+home="${ANSWERER_HOME:-$HOME/.claude-team-relay/answerer}"
+home_target="$(physical_path "$home")"
+
+# --- The credential deny list (M2-SPEC §4.2, §7.5) ---------------------------------------
+# One copy, used by the ANSWERER_READ_DIRS checks and by settings.json below. Claude Code
+# consults path rules for Read only (it applies them to Glob and Grep; a Glob(...) or
+# Grep(...) path rule is accepted but never evaluated), so every rule is a Read rule.
+read -r -d '' DENY_LISTS_JS <<'JS' || true
+// Paths in the home directory, home-anchored:
+const HOME_PATHS = [
+  "~/.ssh/**", "~/.gnupg/**", "~/.aws/**", "~/.config/gcloud/**", "~/.azure/**", "~/.kube/**",
+  "~/.docker/**", "~/.netrc", "~/.npmrc", "~/.pypirc", "~/.git-credentials", "~/.claude/**",
+  "~/.claude-team-relay/**", "~/Library/Keychains/**",
+  "~/.config/gh/**", "~/.zsh_history", "~/.bash_history", "~/.*_history",
+  "~/Library/Application Support/**/Cookies*", "~/Library/Application Support/Firefox/**",
+  "~/Library/Application Support/Google/Chrome/**", "~/.terraform.d/**", "~/.cargo/credentials*",
+  "~/.vault-token", "~/.pgpass", "~/.config/solana/**", "~/.foundry/**", "~/.ethereum/**",
+];
+// Files that can be anywhere. A "**/x" rule resolves from the session working directory
+// (empty here), so each also goes in home-anchored ("~/**/x") and root-anchored ("//**/x").
+const ANY_DEPTH = [
+  "**/.env", "**/.env.*", "**/.envrc", "**/*.pem", "**/*.key", "**/id_rsa*", "**/id_ed25519*",
+  "**/*.p12", "**/*.pfx", "**/*.keystore", "**/*.jks", "**/credentials.json", "**/*.tfvars",
+  "**/keystore/**",
+];
+// Literal paths are escaped, so a glob character in them matches only itself.
+const escapeGlob = (p) => p.replace(/[\\*?\[\]!#]/g, (c) => "\\" + c);
+const anchored = (p) => "/" + escapeGlob(p);
+JS
+
+# --- Shared folders (M4-SPEC §1) ---------------------------------------------------------
+# ANSWERER_READ_DIRS is checked before anything is written: every entry must be an existing
+# directory (after ~ expansion and resolving symlinks) that is not /, not $HOME, not above
+# $HOME, and not inside ANSWERER_HOME, a Claude config directory or a credential location on
+# the deny list. The first entry that fails stops the launcher, naming the entry and why.
+# Prints {"dirs": [physical paths], "shares": [basenames]} as JSON.
+read -r -d '' READ_DIRS_JS <<'JS' || true
+import { realpathSync, statSync } from "node:fs";
+import { basename, normalize } from "node:path";
+const e = process.env;
+const MAX = 16;
+const refuse = (msg) => {
+  process.stderr.write("answerer: refusing to start: " + msg + "\n");
+  process.exit(1);
+};
+const within = (p, dir) => p === dir || p.startsWith(dir.endsWith("/") ? dir : dir + "/");
+const realOr = (p) => {
+  try {
+    return realpathSync(p);
+  } catch {
+    return normalize(p);
+  }
+};
+// A deny-list glob (gitignore style) as a full-match RegExp over a relative path.
+const globRe = (glob) => {
+  let re = "";
+  for (let i = 0; i < glob.length; i++) {
+    const c = glob[i];
+    if (c === "*" && glob[i + 1] === "*") {
+      if (glob[i + 2] === "/") {
+        re += "(?:.*/)?";
+        i += 2;
+      } else {
+        re += ".*";
+        i += 1;
+      }
+    } else if (c === "*") re += "[^/]*";
+    else if (c === "?") re += "[^/]";
+    else re += c.replace(/[.+^${}()|[\]\\]/g, "\\$&");
+  }
+  return new RegExp("^" + re + "$");
+};
+const homes = [...new Set([normalize(e.HOME), realOr(e.HOME)])];
+// The deny-list entry a path is inside (or is), if any.
+const credentialHit = (p) => {
+  for (const rule of HOME_PATHS) {
+    const re = globRe(rule.slice(2).replace(/\/\*\*$/, ""));
+    for (const h of homes) {
+      if (p === h || !within(p, h)) continue;
+      const parts = p.slice(h.length).split("/").filter(Boolean);
+      for (let k = 1; k <= parts.length; k++) if (re.test(parts.slice(0, k).join("/"))) return rule;
+    }
+  }
+  for (const rule of ANY_DEPTH) {
+    const re = globRe(rule.replace(/^\*\*\//, "").replace(/\/\*\*$/, ""));
+    if (p.split("/").some((part) => part !== "" && re.test(part))) return rule;
+  }
+  if (e.CLOUDSDK_CONFIG && e.CLOUDSDK_CONFIG.startsWith("/") && within(p, realOr(e.CLOUDSDK_CONFIG))) return "CLOUDSDK_CONFIG";
+  return null;
+};
+const homeReal = realOr(e.HOME);
+const answererHome = e.ANSWERER_HOME_TARGET;
+const configDirs = [realOr(e.HOME + "/.claude")];
+if (e.CLAUDE_CONFIG_DIR && e.CLAUDE_CONFIG_DIR.startsWith("/")) configDirs.push(realOr(e.CLAUDE_CONFIG_DIR));
+
+const raw = e.ANSWERER_READ_DIRS ?? "";
+const entries = raw === "" ? [] : raw.split(":");
+if (entries.length > MAX) refuse(`ANSWERER_READ_DIRS names ${entries.length} folders; at most ${MAX} may be shared`);
+const dirs = [];
+const shares = [];
+entries.forEach((entry, i) => {
+  const bad = (why) => refuse(`ANSWERER_READ_DIRS entry ${i + 1} (${JSON.stringify(entry)}) ${why}`);
+  if (entry === "") bad("is empty");
+  let p = entry;
+  if (p === "~") p = e.HOME;
+  else if (p.startsWith("~/")) p = e.HOME + p.slice(1);
+  else if (p.startsWith("~")) bad("uses ~user; write the path out");
+  if (!p.startsWith("/")) bad("must be an absolute path or start with ~/");
+  let real;
+  try {
+    real = realpathSync(p);
+  } catch {
+    bad("does not exist");
+  }
+  if (!statSync(real).isDirectory()) bad("is not a directory");
+  if (real === "/") bad("is the root directory");
+  if (real === homeReal || normalize(p) === normalize(e.HOME)) bad("is your home directory");
+  if (within(homeReal, real) || within(normalize(e.HOME), real)) bad("contains your home directory");
+  if (within(real, answererHome)) bad("is inside ANSWERER_HOME (the answering session's own files)");
+  for (const c of configDirs) if (within(real, c)) bad(`is inside a Claude config directory (${c})`);
+  for (const candidate of [normalize(p), real]) {
+    const hit = credentialHit(candidate);
+    if (hit) bad(`is inside a credential location on the deny list (${hit})`);
+  }
+  if (dirs.includes(real)) return;
+  dirs.push(real);
+  // Only the folder's name is published, in the manifest's share-name alphabet.
+  const name = basename(real).replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 64) || "folder";
+  if (!shares.includes(name)) shares.push(name);
+});
+process.stdout.write(JSON.stringify({ dirs, shares }));
+JS
+read_dirs_json="$(ANSWERER_HOME_TARGET="${home_target:-/}" "$node_bin" --input-type=module -e "${DENY_LISTS_JS}
+${READ_DIRS_JS}")"
+
+# --- The session's working directory (M1-SPEC §11.13) -----------------------------------
 
 # The first file in `dir` that Claude Code would load into the session, if any.
 loaded_file_in() {
@@ -108,6 +256,26 @@ own_private_dir() {
   chmod 700 "$dir"
 }
 
+# M4-SPEC §1: grants last at most for the session. Answering "don't ask again" in a session
+# saves an allow rule to .claude/settings.local.json in its working directory (outside a git
+# repository Claude Code keeps that file in the directory it started in), so a previous
+# session's file is removed and every session starts with no persisted grant. Only that
+# file, and then .claude/ when it is left empty; anything else in the working directory is
+# still refused below. Nothing is removed through a symlink or in a directory you do not own.
+remove_saved_grants() {
+  local dir="$1" cdir file
+  [[ -d "$dir" && ! -L "$dir" && -O "$dir" ]] || return 0
+  cdir="$dir/.claude"
+  [[ -L "$cdir" ]] && die "refusing to start: $cdir is a symlink"
+  [[ -d "$cdir" && -O "$cdir" ]] || return 0
+  file="$cdir/settings.local.json"
+  if [[ -L "$file" || -f "$file" ]]; then
+    rm -f "$file" || die "cannot remove $file"
+    printf 'answerer: removed %s: permissions granted in an earlier session do not carry over\n' "$file" >&2
+  fi
+  rmdir "$cdir" 2>/dev/null || true
+}
+
 uid="$(id -u)"
 if [[ -n "${ANSWERER_WORKDIR:-}" ]]; then
   workdir="$ANSWERER_WORKDIR"
@@ -126,6 +294,9 @@ esac
 workdir_phys="$(physical_path "$workdir")"
 if [[ "$workdir_phys" == "$home_phys" || "$workdir_phys" == "$home_phys"/* || "$home_phys" == "" ]]; then
   die "refusing to start: the working directory $workdir_phys is inside \$HOME ($home_phys), whose memory files would load into the session; set ANSWERER_WORKDIR (or TMPDIR) to a directory outside \$HOME"
+fi
+if [[ ! -L "$workdir" && ( -z "$workdir_base" || ! -L "$workdir_base" ) ]]; then
+  remove_saved_grants "$workdir_phys"
 fi
 dir="$workdir_phys"
 while :; do
@@ -148,7 +319,6 @@ fi
 
 # --- The session's configuration --------------------------------------------------------
 
-home="${ANSWERER_HOME:-$HOME/.claude-team-relay/answerer}"
 mkdir -p "$home" "$home/config" "$home/state"
 chmod 700 "$home" "$home/config" "$home/state"
 home="$(cd "$home" && pwd -P)"
@@ -171,14 +341,13 @@ manifest_path="${MANIFEST_PATH:-$plugin_root/manifest.yaml}"
 [[ -r "$manifest_path" ]] || die "manifest not readable: $manifest_path"
 
 # JSON is written by node from the environment, so no value is ever spliced into JSON text.
-ANSWERER_OUT="$home" ANSWERER_NODE="$node_bin" ANSWERER_PLUGIN_ROOT="$plugin_root" \
-ANSWERER_AUTH="$relay_auth" ANSWERER_TOKEN_FILE="$token_file" ANSWERER_MANIFEST="$manifest_path" \
-  "$node_bin" --input-type=module -e '
+read -r -d '' SETTINGS_JS <<'JS' || true
 import { writeFileSync } from "node:fs";
 const e = process.env;
 const out = e.ANSWERER_OUT;
 const google = e.ANSWERER_AUTH === "google";
 const stateDir = out + "/state";
+const { dirs, shares } = JSON.parse(e.ANSWERER_READ_DIRS_JSON);
 const common = {
   RELAY_URL: e.RELAY_URL,
   RELAY_TEAM: e.RELAY_TEAM,
@@ -200,49 +369,37 @@ for (const [k, v] of Object.entries(e)) {
   if (/^CAP_[A-Z][A-Z0-9_]*_(ENABLED|RUNNER)$/.test(k) && typeof v === "string") common[k] = v;
 }
 const root = e.ANSWERER_PLUGIN_ROOT;
+const relayEnv = { ...common, RELAY_ROLE: "answerer", ANSWERER_STATE_DIR: stateDir };
+// M4-SPEC §3: the answering channel publishes the shared folders' names (never their paths).
+if (shares.length > 0) relayEnv.ANSWERER_SHARES = JSON.stringify(shares);
 const mcp = {
   mcpServers: {
-    relay: { command: e.ANSWERER_NODE, args: [root + "/dist/channel.js"], env: { ...common, RELAY_ROLE: "answerer", ANSWERER_STATE_DIR: stateDir } },
+    relay: { command: e.ANSWERER_NODE, args: [root + "/dist/channel.js"], env: relayEnv },
     capabilities: { command: e.ANSWERER_NODE, args: [root + "/dist/capabilities.js"], env: { ...common } },
   },
 };
 
-// M2-SPEC §4.2 and §7.5: reads are allowed, credential stores and secrets are not. Claude
-// Code consults path rules for Read only (it applies them to Glob and Grep; a Glob(...) or
-// Grep(...) path rule is accepted but never evaluated), so every rule here is a Read rule.
-// Paths in the home directory, home-anchored:
-const HOME_PATHS = [
-  "~/.ssh/**", "~/.gnupg/**", "~/.aws/**", "~/.config/gcloud/**", "~/.azure/**", "~/.kube/**",
-  "~/.docker/**", "~/.netrc", "~/.npmrc", "~/.pypirc", "~/.git-credentials", "~/.claude/**",
-  "~/.claude-team-relay/**", "~/Library/Keychains/**",
-  "~/.config/gh/**", "~/.zsh_history", "~/.bash_history", "~/.*_history",
-  "~/Library/Application Support/**/Cookies*", "~/Library/Application Support/Firefox/**",
-  "~/Library/Application Support/Google/Chrome/**", "~/.terraform.d/**", "~/.cargo/credentials*",
-  "~/.vault-token", "~/.pgpass", "~/.config/solana/**", "~/.foundry/**", "~/.ethereum/**",
-];
-// Files that can be anywhere. A "**/x" rule resolves from the session working directory
-// (empty here), so each also goes in home-anchored ("~/**/x") and root-anchored ("//**/x").
-const ANY_DEPTH = [
-  "**/.env", "**/.env.*", "**/.envrc", "**/*.pem", "**/*.key", "**/id_rsa*", "**/id_ed25519*",
-  "**/*.p12", "**/*.pfx", "**/*.keystore", "**/*.jks", "**/credentials.json", "**/*.tfvars",
-  "**/keystore/**",
-];
-// Literal paths (the files of this session) are escaped, so a glob character in them matches
-// only itself.
-const escapeGlob = (p) => p.replace(/[\\*?\[\]!#]/g, (c) => "\\" + c);
-const anchored = (p) => "/" + escapeGlob(p);
+// M2-SPEC §4.2 and §7.5: credential stores and secrets are never readable. Deny rules beat
+// any allow rule and any answer in a permission dialog.
 const readDeny = [...HOME_PATHS];
 for (const p of ANY_DEPTH) readDeny.push(p, "~/" + p, "//" + p);
 readDeny.push("~/.claude.json", anchored(out) + "/**");
 if (e.ANSWERER_TOKEN_FILE) readDeny.push(anchored(e.ANSWERER_TOKEN_FILE));
 if (google && e.CLOUDSDK_CONFIG && e.CLOUDSDK_CONFIG.startsWith("/")) readDeny.push(anchored(e.CLOUDSDK_CONFIG) + "/**");
+if (e.CLAUDE_CONFIG_DIR && e.CLAUDE_CONFIG_DIR.startsWith("/")) readDeny.push(anchored(e.CLAUDE_CONFIG_DIR) + "/**");
 const deny = ["Bash", "Write", "Edit", "NotebookEdit", "WebFetch", "WebSearch", "Agent", "Task"];
 for (const p of readDeny) deny.push("Read(" + p + ")");
 
-// M2-SPEC §4.3: every tool call (and failure) reports its name, outcome and duration. The
-// hook runs in the background (§7.4, "async": true on the handler), so it never delays a
-// tool call; Claude Code does not enforce "timeout" on an async hook, and the script gives
-// up by itself after 3 s.
+// M4-SPEC §1: nothing is readable by default. No bare Read, Glob or Grep allow: only the
+// shared folders, one Read(//<abs>/**) rule each (Claude Code applies Read rules to Glob and
+// Grep). Any other read prompts the member in this session's terminal.
+const allow = ["mcp__relay__*", "mcp__capabilities__*"];
+for (const d of dirs) allow.push("Read(" + anchored(d) + "/**)");
+
+// M2-SPEC §4.3: every tool call (and failure) reports its name, outcome and duration, and
+// M4-SPEC §2: every permission request reports "waiting". The hooks run in the background
+// (§7.4, "async": true), so they never delay a tool call or a dialog; Claude Code does not
+// enforce "timeout" on an async hook, and the scripts give up by themselves after 3 s.
 const hook = {
   type: "command",
   command: e.ANSWERER_NODE,
@@ -250,14 +407,29 @@ const hook = {
   async: true,
   timeout: 5,
 };
+// M4-SPEC §2: a desktop notification with a fixed text when a permission prompt waits.
+const notifyHook = {
+  type: "command",
+  command: e.ANSWERER_NODE,
+  args: [root + "/dist/notify-desktop.js"],
+  async: true,
+  timeout: 5,
+};
 const settings = {
   permissions: {
+    // Claude Code's normal (Manual) mode: anything not allowed prompts. Auto mode (which
+    // would let reads outside the shared folders through) and bypass mode cannot be entered.
+    defaultMode: "default",
+    disableAutoMode: "disable",
+    disableBypassPermissionsMode: "disable",
     deny,
-    allow: ["mcp__relay__*", "mcp__capabilities__*", "Read", "Glob", "Grep"],
+    allow,
   },
   hooks: {
     PostToolUse: [{ matcher: "*", hooks: [hook] }],
     PostToolUseFailure: [{ matcher: "*", hooks: [hook] }],
+    PermissionRequest: [{ matcher: "*", hooks: [hook] }],
+    Notification: [{ matcher: "permission_prompt", hooks: [notifyHook] }],
   },
 };
 const toolEvent = { relay_url: e.RELAY_URL, relay_team: e.RELAY_TEAM, relay_auth: e.ANSWERER_AUTH, state_dir: stateDir };
@@ -267,7 +439,12 @@ const write = (name, value) => writeFileSync(out + "/" + name, JSON.stringify(va
 write("mcp.json", mcp);
 write("settings.json", settings);
 write("tool-event.json", toolEvent);
-'
+JS
+ANSWERER_OUT="$home" ANSWERER_NODE="$node_bin" ANSWERER_PLUGIN_ROOT="$plugin_root" \
+ANSWERER_AUTH="$relay_auth" ANSWERER_TOKEN_FILE="$token_file" ANSWERER_MANIFEST="$manifest_path" \
+ANSWERER_READ_DIRS_JSON="$read_dirs_json" \
+  "$node_bin" --input-type=module -e "${DENY_LISTS_JS}
+${SETTINGS_JS}"
 chmod 600 "$home/mcp.json" "$home/settings.json" "$home/tool-event.json"
 
 cmd=(
@@ -276,6 +453,7 @@ cmd=(
   --mcp-config "$home/mcp.json"
   --strict-mcp-config
   --settings "$home/settings.json"
+  --permission-mode default
   --disallowedTools Bash Write Edit NotebookEdit WebFetch WebSearch Agent Task
   --dangerously-load-development-channels server:relay
 )
