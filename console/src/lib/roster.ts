@@ -23,20 +23,27 @@ export function entries(roster: Roster | undefined): RosterMember[] {
   )
 }
 
+/** M9 §7.2: an entry an owner added and its person has not accepted yet (absent: active). */
+export function isInvited(m: RosterMember): boolean {
+  return m.status !== undefined && m.status !== 'active'
+}
+
 export function isOwner(roster: Roster | undefined, member: string | null): boolean {
   if (!member) return false
-  return entries(roster).some((m) => m.member === member && m.role === 'owner')
+  return entries(roster).some((m) => m.member === member && m.role === 'owner' && !isInvited(m))
 }
 
+/** Owners who have accepted: an invitation to be an owner is not one. */
 export function ownerCount(roster: Roster | undefined): number {
-  return entries(roster).filter((m) => m.role === 'owner').length
+  return entries(roster).filter((m) => m.role === 'owner' && !isInvited(m)).length
 }
 
-/** Owners first, then by member id. */
+/** Active members, owners first, then by member id; the open invitations after them. */
 export function sortedMembers(roster: Roster | undefined): RosterMember[] {
-  return [...entries(roster)].sort(
-    (a, b) => (a.role === b.role ? a.member.localeCompare(b.member) : a.role === 'owner' ? -1 : 1),
-  )
+  return [...entries(roster)].sort((a, b) => {
+    if (isInvited(a) !== isInvited(b)) return isInvited(a) ? 1 : -1
+    return a.role === b.role ? a.member.localeCompare(b.member) : a.role === 'owner' ? -1 : 1
+  })
 }
 
 /** The emails the viewer may see (others' are masked to null for a member). */
@@ -76,6 +83,6 @@ export function addProblem(roster: Roster | undefined, member: string, email: st
   const members = entries(roster)
   if (members.some((m) => m.member === member)) return `${member} is already a member id on this team.`
   if (members.some((m) => visibleEmails(m).includes(e))) return 'That email already belongs to a member of the team.'
-  if (members.length >= MAX_MEMBERS) return `A team has at most ${MAX_MEMBERS} members.`
+  if (members.length >= MAX_MEMBERS) return `A team has at most ${MAX_MEMBERS} members, open invitations included.`
   return null
 }

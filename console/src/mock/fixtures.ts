@@ -15,7 +15,7 @@
 //                       (M4 §2: the tool event is `waiting`)
 // bob shares two folders with his answering session; carol shares none (M4 §3).
 
-import type { ActivityPage, ActivityRequest, Directory, Join, Manifest, Me, RequestDetail, Roster } from '@/api/types'
+import type { ActivityPage, ActivityRequest, AdminTeam, Directory, Join, Manifest, Me, RequestDetail, Roster, Teams } from '@/api/types'
 
 export const FIXTURE_NOW = '2026-09-23T10:15:00.000Z'
 
@@ -38,8 +38,36 @@ export const fixtureRoster: Roster = {
     { member: 'alice', emails: ['alice@example.com'], role: 'owner', added_by: 'alice', added_at: '2026-09-17T09:00:00Z' },
     { member: 'bob', emails: ['bob@example.com'], role: 'member', added_by: 'alice', added_at: '2026-09-17T09:02:00Z' },
     { member: 'carol', emails: ['carol@example.com', 'carol.w@example.org'], role: 'member', added_by: 'alice', added_at: '2026-09-18T14:30:00Z' },
+    // M9 §7.2: an invitation dana has not answered yet (owners see it).
+    { member: 'dana', emails: ['dana@example.com'], role: 'member', added_by: 'alice', added_at: '2026-09-22T11:15:00Z', status: 'invited' },
   ],
 }
+
+/** GET /api/teams as alice reads it (M9 §2): two teams, an invitation, and she is a relay admin. */
+export const fixtureTeams: Teams = {
+  teams: [
+    { team: 'demo', name: 'Demo', member: 'alice', role: 'owner' },
+    { team: 'research', name: 'Research', member: 'alice', role: 'owner' },
+  ],
+  invitations: [{ team: 'ops', name: 'Operations', member: 'alice', role: 'member', invited_by_member: 'olga' }],
+  admin: true,
+  teams_created: 1,
+  max_teams_created: 3,
+  suggested_member: 'alice',
+  can_manage_teams: true,
+  default_team: 'demo',
+}
+
+/** GET /api/admin/teams (M9 §4): every team, with no emails and no content. */
+export const fixtureAdminTeams: AdminTeam[] = [
+  { id: 'demo', name: 'Demo', status: 'active', seed: true, created_at: '2026-08-25T09:00:00Z', created_by_member: null, members: 3, owners: 1, last_activity_at: '2026-09-24T09:59:40Z' },
+  { id: 'design-guild', name: 'Design guild', status: 'active', seed: false, created_at: '2026-09-04T10:12:00Z', created_by_member: 'hana', members: 4, owners: 2, last_activity_at: '2026-09-22T16:40:00Z' },
+  { id: 'field-notes', name: 'Field notes', status: 'active', seed: false, created_at: '2026-09-16T08:30:00Z', created_by_member: 'ivo', members: 1, owners: 1, last_activity_at: null },
+  { id: 'old-pilot', name: 'Old pilot', status: 'deleted', seed: false, created_at: '2026-08-15T12:00:00Z', created_by_member: 'jun', members: 0, owners: 0, last_activity_at: '2026-09-20T13:05:00Z', removal: 'complete', deleted_at: '2026-09-21T09:00:00Z', reserved_until: '2026-10-22T09:00:00Z' },
+  { id: 'ops', name: 'Operations', status: 'active', seed: false, created_at: '2026-09-12T15:45:00Z', created_by_member: 'olga', members: 2, owners: 1, last_activity_at: '2026-09-24T07:20:00Z' },
+  { id: 'research', name: 'Research', status: 'active', seed: false, created_at: '2026-09-19T10:00:00Z', created_by_member: 'alice', members: 2, owners: 1, last_activity_at: '2026-09-23T18:02:00Z' },
+  { id: 'support-rota', name: 'Support rota', status: 'active', seed: false, created_at: '2026-09-10T07:00:00Z', created_by_member: 'kai', members: 6, owners: 2, last_activity_at: '2026-09-24T09:31:00Z' },
+]
 
 const stagingDbQuery: Manifest['capabilities'][number] = {
   name: 'staging_db_query',

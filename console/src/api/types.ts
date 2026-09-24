@@ -5,9 +5,70 @@
 
 export type Iso = string
 
+/** One of the viewer's teams (M9 §2, GET /api/teams). */
+export interface TeamEntry {
+  team: string
+  /** Display name: someone's text, always shown escaped (React does). */
+  name: string
+  member: string
+  role: RosterRole
+}
+
+/** An open invitation (M9 §7.2): accepting makes the viewer `member` with `role` there. */
+export interface InvitationEntry {
+  team: string
+  name: string
+  member: string
+  role: RosterRole
+  invited_by_member: string | null
+}
+
+/** GET /api/teams: the viewer's teams, as the console server checks them (M9 §2, §5). */
+export interface Teams {
+  teams: TeamEntry[]
+  invitations: InvitationEntry[]
+  /** A relay admin (M9 §4): may list and delete every team. */
+  admin: boolean
+  /** Teams this account created and has not deleted, and the most it may (3). Null: unknown. */
+  teams_created: number | null
+  max_teams_created: number | null
+  suggested_member: string | null
+  /** False for a sign-in bound to one team (a device credential): no creating, no invitations. */
+  can_manage_teams: boolean
+  /** RELAY_TEAM: the console's default team. */
+  default_team: string
+  /** Hosted: the signed-in Google account. */
+  email?: string
+}
+
+/** One row of GET /api/admin/teams (M9 §4): no emails, no content. */
+export interface AdminTeam {
+  id: string
+  name: string
+  status: 'active' | 'deleted'
+  /** A team of the relay's team file: never deleted through the API. */
+  seed: boolean
+  created_at: Iso | null
+  created_by_member: string | null
+  members: number
+  owners: number
+  last_activity_at: Iso | null
+  removal?: 'complete' | 'pending'
+  deleted_at?: Iso
+  reserved_until?: Iso
+}
+
+export interface AdminTeamsPage {
+  teams: AdminTeam[]
+  /** The `after` of the next page, or null on the last. */
+  next: string | null
+}
+
 /** GET /api/me (M1 §3.2). */
 export interface Me {
   team: string
+  /** The team's display name (M9), from relays that say. */
+  name?: string
   member: string
   teammates: string[]
   /** The viewer's email, when the server gives it (the join panel's commands use it). */
@@ -48,6 +109,11 @@ export interface RosterMember {
   role: RosterRole
   added_by?: string | null
   added_at?: Iso | null
+  /**
+   * M9 §7.2: an entry an owner added is `invited` until its person accepts; only owners see
+   * invitations. Absent from older relays (read as active).
+   */
+  status?: 'active' | 'invited'
 }
 
 export interface Roster {

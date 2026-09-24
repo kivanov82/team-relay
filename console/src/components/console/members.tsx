@@ -6,14 +6,16 @@ import type { Roster, RosterMember } from '@/api/types'
 import { Button } from '@/components/ui/button'
 import { Skeleton } from '@/components/ui/skeleton'
 import { useRosterChange } from '@/hooks/queries'
-import { addProblem, entries, ownerCount, sortedMembers, suggestMemberId, visibleEmails } from '@/lib/roster'
+import { addProblem, entries, isInvited, ownerCount, sortedMembers, suggestMemberId, visibleEmails } from '@/lib/roster'
 import { cn } from '@/lib/utils'
 import { Avatar, Panel } from './primitives'
 
-// The Members panel (M6 §4). An owner adds a member by Google email (with a member id
+// The Members panel (M6 §4). An owner invites a member by Google email (with a member id
 // suggested from the email's local part, editable), removes one after a confirm step that
 // names the person, and makes or unmakes owners; every refusal is shown inline, where it
-// happened. A member sees a read-only list of names and roles.
+// happened. A member sees a read-only list of names and roles. M9 §7.2: an addition is an
+// invitation until its person accepts (at sign-in, or in the console); the owner sees it as
+// Invited, and can withdraw it (which retires nothing).
 
 function RoleBadge() {
   return (
@@ -33,6 +35,14 @@ function InlineError({ id, children }: { id?: string; children: string | null })
   )
 }
 
+function InvitedBadge() {
+  return (
+    <span className="inline-flex h-[18px] items-center rounded border border-dashed border-faint px-1.5 text-[10.5px] font-medium text-subtle">
+      Invited
+    </span>
+  )
+}
+
 function who(m: RosterMember): string {
   const emails = visibleEmails(m)
   return emails.length > 0 ? `${m.member} (${emails.join(', ')})` : m.member
@@ -45,6 +55,7 @@ function MemberRow({ m, me, owner, lastOwner }: { m: RosterMember; me: string | 
   const you = m.member === me
   const emails = visibleEmails(m)
   const errorId = useId()
+  const invited = isInvited(m)
 
   const run = (c: Parameters<typeof change.mutate>[0], after?: () => void) => {
     setError(null)
@@ -55,14 +66,25 @@ function MemberRow({ m, me, owner, lastOwner }: { m: RosterMember; me: string | 
   }
 
   return (
-    <li className="flex flex-col gap-1.5 px-4 py-2.5" data-member={m.member} data-role={m.role}>
+    <li className="flex flex-col gap-1.5 px-4 py-2.5" data-member={m.member} data-role={m.role} data-status={invited ? 'invited' : 'active'}>
       <div className="flex flex-wrap items-center gap-x-2.5 gap-y-1.5">
-        <Avatar member={m.member} you={you} />
+        <span className={cn(invited && 'opacity-55')}>
+          <Avatar member={m.member} you={you} />
+        </span>
         <div className="flex min-w-0 flex-1 flex-col">
           <div className="flex min-w-0 items-center gap-1.5 [&>*:not(:first-child)]:shrink-0">
-            <span className="min-w-0 truncate text-[13px] font-semibold leading-tight">{m.member}</span>
+            <span className={cn('min-w-0 truncate text-[13px] leading-tight', invited ? 'font-medium text-subtle' : 'font-semibold')}>{m.member}</span>
             {you ? <span className="text-[12px] text-subtle">(you)</span> : null}
-            {m.role === 'owner' ? <RoleBadge /> : <span className="text-[11.5px] text-subtle">Member</span>}
+            {invited ? (
+              <>
+                <InvitedBadge />
+                {m.role === 'owner' ? <span className="text-[11.5px] text-subtle">as an owner</span> : null}
+              </>
+            ) : m.role === 'owner' ? (
+              <RoleBadge />
+            ) : (
+              <span className="text-[11.5px] text-subtle">Member</span>
+            )}
           </div>
           {owner && emails.length > 0 ? (
             <span className="truncate font-mono text-[11px] text-subtle" title={emails.join(', ')}>
@@ -70,7 +92,15 @@ function MemberRow({ m, me, owner, lastOwner }: { m: RosterMember; me: string | 
             </span>
           ) : null}
         </div>
-        {owner && !confirming ? (
+        {owner && invited ? (
+          <div className="flex shrink-0 items-center gap-1 max-sm:basis-full max-sm:pl-[30px] sm:ml-auto">
+            <span className="mr-1 hidden text-[11.5px] text-faint md:inline">Waiting for them to accept</span>
+            <Button size="xs" variant="ghost" disabled={change.isPending} onClick={() => run({ kind: 'remove', member: m.member })}>
+              {change.isPending ? 'Withdrawing…' : 'Withdraw'}
+            </Button>
+          </div>
+        ) : null}
+        {owner && !invited && !confirming ? (
           <div className="flex shrink-0 items-center gap-1 max-sm:basis-full max-sm:pl-[30px] sm:ml-auto">
             {m.role === 'owner' ? (
               <Button
@@ -190,11 +220,12 @@ function AddMember({ roster }: { roster: Roster | undefined }) {
   }
 
   return (
-    <form onSubmit={submit} noValidate className="flex flex-col gap-2.5 px-4 py-3.5" aria-label="Add a member" data-add-member>
+    <form onSubmit={submit} noValidate className="flex flex-col gap-2.5 px-4 py-3.5" aria-label="Invite a member" data-add-member>
       <div className="flex flex-col gap-0.5">
-        <h3 className="text-[12.5px] font-semibold">Add a member</h3>
+        <h3 className="text-[12.5px] font-semibold">Invite a member</h3>
         <p className="text-[12px] leading-snug text-subtle">
-          They sign in with this Google account. The member id is how teammates address them.
+          They accept with this Google account when they sign in, or here in the console. The member id is how teammates
+          address them.
         </p>
       </div>
       <div className="grid grid-cols-1 gap-2 sm:grid-cols-[minmax(0,1.4fr)_minmax(0,1fr)_auto] sm:items-end">
@@ -241,13 +272,13 @@ function AddMember({ roster }: { roster: Roster | undefined }) {
           />
         </label>
         <Button type="submit" size="default" disabled={change.isPending || email.trim() === ''}>
-          {change.isPending ? 'Adding…' : 'Add'}
+          {change.isPending ? 'Inviting…' : 'Invite'}
         </Button>
       </div>
       <InlineError id={errorId}>{error}</InlineError>
       {added ? (
         <p role="status" className="text-[12px] text-ok" data-added={added}>
-          Added {added}. Send them the install steps from Join the team.
+          Invited {added}. Send them the install steps from Join the team; they accept when they sign in.
         </p>
       ) : null}
     </form>
@@ -271,6 +302,8 @@ export function Members({
 }) {
   const members = sortedMembers(roster)
   const owners = ownerCount(roster)
+  const invitedCount = members.filter(isInvited).length
+  const activeCount = members.length - invitedCount
   return (
     <Panel
       id="members"
@@ -279,7 +312,8 @@ export function Members({
       aside={
         roster ? (
           <span className="tnum text-[12px] text-subtle">
-            {members.length} {members.length === 1 ? 'member' : 'members'}, {owners} {owners === 1 ? 'owner' : 'owners'}
+            {activeCount} {activeCount === 1 ? 'member' : 'members'}, {owners} {owners === 1 ? 'owner' : 'owners'}
+            {invitedCount > 0 ? `, ${invitedCount} invited` : ''}
           </span>
         ) : null
       }
@@ -304,7 +338,7 @@ export function Members({
             </div>
           ) : (
             <p className="border-t border-hairline px-4 py-2.5 text-[12px] text-subtle">
-              Owners add and remove members. Ask an owner to invite someone.
+              Owners invite and remove members. Ask an owner to invite someone.
             </p>
           )}
         </div>

@@ -27,6 +27,18 @@ function FullPage({ icon, title, children }: { icon: ReactNode; title: string; c
   )
 }
 
+/** While the viewer's teams are read, the first moment after the page opens. */
+export function Loading() {
+  return (
+    <main className="flex min-h-dvh items-center justify-center px-4" aria-busy="true">
+      <div className="flex items-center gap-2 text-[13px] text-subtle" role="status">
+        <RelayMark className="size-4" />
+        Loading your teams
+      </div>
+    </main>
+  )
+}
+
 export function MissingKey() {
   return (
     <FullPage icon={<KeyRound className="size-4" />} title="Open the console from its link">

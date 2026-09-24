@@ -163,7 +163,7 @@ function Steps({ owner }: { owner: boolean }) {
         >
           <UserPlus aria-hidden className="mt-0.5 size-3.5 shrink-0 text-subtle" />
           <span>
-            <span className="font-medium">Inviting someone?</span> Add their Google email{' '}
+            <span className="font-medium">Inviting someone?</span> Invite their Google email{' '}
             <button
               type="button"
               className="rounded font-medium text-signal underline decoration-signal/40 underline-offset-2 hover:decoration-signal"
@@ -210,9 +210,9 @@ function Steps({ owner }: { owner: boolean }) {
                 as <span className="text-foreground">{email}</span>
               </>
             ) : (
-              ' with the account the owner added'
+              ' with the account the owner invited'
             )}
-            , pick the team, and you are connected.
+            , accept the invitation, pick the team, and you are connected.
           </Note>
         </Step>
 

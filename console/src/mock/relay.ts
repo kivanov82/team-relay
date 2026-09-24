@@ -16,8 +16,10 @@ import type {
   InboxSummary,
   ProgressEntry,
   RequestDetail,
+  AdminTeam,
   Roster,
   RosterMember,
+  Teams,
 } from '@/api/types'
 import {
   FIXTURE_NOW,
@@ -26,8 +28,10 @@ import {
   fixtureDirectory,
   fixtureJoin,
   fixtureMe,
+  fixtureAdminTeams,
   fixtureRequests,
   fixtureRoster,
+  fixtureTeams,
 } from './fixtures'
 
 export const CYCLE_MS = 100_000
@@ -517,6 +521,20 @@ export class MockRelay {
   role: 'owner' | 'member' = 'owner'
   /** M6 §1, in memory: changes an owner makes, under the relay's invariants. */
   private rosterEntries: RosterMember[] = structuredClone(fixtureRoster.members)
+  /** M9: the viewer's teams, invitations and the relay's other teams, in memory. */
+  private account: Teams = structuredClone(fixtureTeams)
+  private world: AdminTeam[] = structuredClone(fixtureAdminTeams)
+  /** The quiet teams (every team but `demo`): their rosters; no traffic. */
+  private quiet = new Map<string, RosterMember[]>([
+    [
+      'research',
+      [
+        { member: 'alice', emails: ['alice@example.com'], role: 'owner', added_by: 'alice', added_at: '2026-09-19T10:00:00Z' },
+        { member: 'erin', emails: ['erin@example.com'], role: 'member', added_by: 'alice', added_at: '2026-09-19T10:05:00Z' },
+        { member: 'frank', emails: ['frank@example.com'], role: 'member', added_by: 'alice', added_at: '2026-09-23T08:00:00Z', status: 'invited' },
+      ],
+    ],
+  ])
   private readonly shift: number
   private readonly now: () => number
 
@@ -670,7 +688,7 @@ export class MockRelay {
     // As a member (?role=member), bob owns the team and alice is a member.
     const view = this.role === 'owner' ? this.rosterEntries : this.rosterEntries.map((m) => ({ ...m, role: m.member === 'bob' ? ('owner' as const) : ('member' as const) }))
     return {
-      members: view.map((m) => ({
+      members: view.filter((m) => owner || m.status !== 'invited').map((m) => ({
         ...m,
         emails: owner || m.member === this.viewer ? [...(m.emails ?? [])] : (m.emails ?? []).map(() => null),
       })),
@@ -699,7 +717,7 @@ export class MockRelay {
       if (this.rosterEntries.some((m) => emailsOf(m).includes(email))) {
         return refuse(409, 'conflict', 'That email already belongs to a member of the team.')
       }
-      const entry: RosterMember = { member, emails: [email], role: 'member', added_by: this.viewer, added_at: new Date(this.now()).toISOString() }
+      const entry: RosterMember = { member, emails: [email], role: 'member', added_by: this.viewer, added_at: new Date(this.now()).toISOString(), status: 'invited' }
       this.rosterEntries.push(entry)
       return json(entry, 201)
     }
@@ -721,15 +739,162 @@ export class MockRelay {
     return json({ error: 'method_not_allowed' }, 405)
   }
 
+  // --- M9: teams ---------------------------------------------------------------------------
+
+  private refuse(status: number, code: string, detail: string): Response {
+    return json({ error: 'relay_refused', relay_status: status, relay_error: code, detail }, 502)
+  }
+
+  /** A team other than `demo`: its roster, and no traffic yet. */
+  private quietTeam(team: string, method: string, p: string, init?: RequestInit): Response {
+    const roster = this.quiet.get(team) ?? []
+    const mine = this.account.teams.find((t) => t.team === team)!
+    const active = roster.filter((m) => m.status !== 'invited')
+    const owner = active.some((m) => m.member === mine.member && m.role === 'owner')
+    if (method !== 'GET') {
+      if (!owner) return this.refuse(403, 'forbidden', 'Only owners can change the roster.')
+      const b = (typeof init?.body === 'string' && init.body ? JSON.parse(init.body) : {}) as Record<string, unknown>
+      if (method === 'POST' && p === '/api/roster') {
+        const entry: RosterMember = { member: String(b.member), emails: [String(b.email).toLowerCase()], role: 'member', added_by: mine.member, added_at: new Date(this.now()).toISOString(), status: 'invited' }
+        if (roster.some((m) => m.member === entry.member)) return this.refuse(409, 'member_exists', 'That member id is already on the team.')
+        this.quiet.set(team, [...roster, entry])
+        return json(entry, 201)
+      }
+      const target = roster.find((m) => `/api/roster/${m.member}` === p)
+      if (!target) return json({ error: 'not_found' }, 404)
+      if (method === 'DELETE') this.quiet.set(team, roster.filter((m) => m !== target))
+      else if (b.role === 'owner' || b.role === 'member') target.role = b.role
+      return json(target)
+    }
+    const now = this.now()
+    if (p === '/api/me') return json({ team, name: mine.name, member: mine.member, role: mine.role, teammates: active.map((m) => m.member).filter((m) => m !== mine.member) })
+    if (p === '/api/join') return json({ ...fixtureJoin, team })
+    if (p === '/api/roster') {
+      return json({
+        members: roster
+          .filter((m) => owner || m.status !== 'invited')
+          .map((m) => ({ ...m, emails: owner || m.member === mine.member ? m.emails : (m.emails ?? []).map(() => null) })),
+      })
+    }
+    if (p === '/api/directory') {
+      return json({
+        members: active
+          .filter((m) => m.member !== mine.member)
+          .map((m) => ({
+            member: m.member,
+            last_seen: null,
+            manifest: null,
+            published_at: null,
+            sessions: { working: { last_seen: null }, answering: { last_seen: null } },
+            stats: { asked: 0, answered: 0, open: 0, median_answer_seconds: null },
+            inbox_waiting: 0,
+          })),
+        stats_complete: true,
+      } satisfies Directory)
+    }
+    if (p === '/api/inbox/summary') return json({ pending: 0, more: false, oldest_at: null, from: [], answering: { last_seen: null } })
+    if (p === '/api/activity') return json({ requests: [], next_since: iso(now - DAY_MS), server_time: iso(now) } satisfies ActivityPage)
+    return json({ error: 'not_found' }, 404)
+  }
+
+  private adminList(url: URL): Response {
+    if (!this.account.admin || this.stranger) return this.refuse(403, 'forbidden', 'Only a relay admin can do this.')
+    const after = url.searchParams.get('after')
+    const limit = Math.min(1000, Math.max(1, Number(url.searchParams.get('limit') ?? 200)))
+    const seeds = after === null ? this.world.filter((t) => t.seed) : []
+    const rest = this.world.filter((t) => !t.seed && (after === null || t.id > after)).sort((a, b) => a.id.localeCompare(b.id))
+    const page = rest.slice(0, limit)
+    return json({ teams: [...seeds, ...page], next: rest.length > limit ? (page.at(-1)?.id ?? null) : null })
+  }
+
+  private removeTeam(id: string, confirm: unknown): Response {
+    const t = this.world.find((w) => w.id === id)
+    if (!t || t.status !== 'active') return this.refuse(404, 'not_found', 'No such team.')
+    if (t.seed) return this.refuse(409, 'seed_team', "This team comes from the relay's team file.")
+    if (confirm !== id) return this.refuse(422, 'confirm_mismatch', 'Send {"confirm": "<team id>"}.')
+    const now = this.now()
+    Object.assign(t, { status: 'deleted', removal: 'complete', deleted_at: iso(now), reserved_until: iso(now + 31 * DAY_MS), members: 0, owners: 0 })
+    const mine = this.account.teams.find((x) => x.team === id)
+    this.account.teams = this.account.teams.filter((x) => x.team !== id)
+    this.account.invitations = this.account.invitations.filter((x) => x.team !== id)
+    if (mine && t.created_by_member === mine.member && this.account.teams_created !== null) this.account.teams_created -= 1
+    this.quiet.delete(id)
+    return json({ team: id, status: 'deleted', removal: 'complete', deleted_at: t.deleted_at, reserved_until: t.reserved_until })
+  }
+
+  /** M9's changes, refused as the relay refuses them. */
+  accountChange(method: string, p: string, body: unknown): Response {
+    const b = (typeof body === 'object' && body !== null ? body : {}) as Record<string, unknown>
+    const now = this.now()
+    if (method === 'POST' && p === '/api/teams') {
+      const name = String(b.name ?? '').trim()
+      const member = String(b.owner_member_id ?? '')
+      const id = typeof b.id === 'string' ? b.id : name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '')
+      const reserved = ['admin', 'api', 'login', 'v1', 'health', 'static', 'www', 'team', 'teams', 'relay', 'console', 'demo', 'test']
+      if (reserved.includes(id) || this.world.some((w) => w.id === id)) return this.refuse(409, 'team_id_unavailable', 'That team id is not available.')
+      if (name.toLowerCase() === 'demo') return this.refuse(409, 'team_name_unavailable', "That name belongs to a team in the relay's configuration.")
+      if ((this.account.teams_created ?? 0) >= (this.account.max_teams_created ?? 3)) return this.refuse(409, 'team_limit', 'You have created 3 teams.')
+      this.world.push({ id, name, status: 'active', seed: false, created_at: iso(now), created_by_member: member, members: 1, owners: 1, last_activity_at: null })
+      this.account.teams = [...this.account.teams, { team: id, name, member, role: 'owner' }]
+      this.account.teams_created = (this.account.teams_created ?? 0) + 1
+      this.quiet.set(id, [{ member, emails: ['alice@example.com'], role: 'owner', added_by: member, added_at: iso(now) }])
+      return json({ team: id, name, status: 'active', created_at: iso(now), member, role: 'owner' }, 201)
+    }
+    let m = /^\/api\/invitations\/([a-z][a-z0-9_-]{1,31})$/.exec(p)
+    if (method === 'POST' && m) {
+      const inv = this.account.invitations.find((i) => i.team === m![1])
+      if (!inv) return this.refuse(404, 'not_found', 'That invitation is no longer open.')
+      this.account.invitations = this.account.invitations.filter((i) => i !== inv)
+      if (b.accept !== true) return json({ team: inv.team, member: inv.member, status: 'declined' })
+      this.account.teams = [...this.account.teams, { team: inv.team, name: inv.name, member: inv.member, role: inv.role }]
+      this.quiet.set(inv.team, [
+        { member: inv.invited_by_member ?? 'olga', emails: ['olga@example.com'], role: 'owner', added_by: 'olga', added_at: '2026-09-12T15:45:00Z' },
+        { member: inv.member, emails: ['alice@example.com'], role: inv.role, added_by: 'olga', added_at: iso(now) },
+      ])
+      return json({ team: inv.team, name: inv.name, member: inv.member, role: inv.role, status: 'active' })
+    }
+    m = /^\/api\/teams\/([a-z][a-z0-9_-]{1,31})$/.exec(p)
+    if (method === 'DELETE' && m) {
+      const mine = this.account.teams.find((t) => t.team === m![1])
+      if (!mine) return json({ error: 'not_on_team', team: m[1] }, 403)
+      if (mine.role !== 'owner') return this.refuse(403, 'forbidden', 'Only an owner can delete the team.')
+      return this.removeTeam(m[1]!, b.confirm)
+    }
+    m = /^\/api\/admin\/teams\/([a-z][a-z0-9_-]{1,31})$/.exec(p)
+    if (method === 'DELETE' && m) return this.removeTeam(m[1]!, b.confirm)
+    return json({ error: 'method_not_allowed' }, 405)
+  }
+
+  /** Simulated network time per call, in ms (a range); tests set it to 0. */
+  latency: [number, number] = [35, 105]
+
   /** A Transport for the API client (src/api/client.ts). */
   handle = async (path: string, init?: RequestInit): Promise<Response> => {
-    await new Promise((resolve) => setTimeout(resolve, 35 + Math.random() * 70))
+    const [lo, hi] = this.latency
+    if (hi > 0) await new Promise((resolve) => setTimeout(resolve, lo + Math.random() * (hi - lo)))
     const url = new URL(path, 'http://console.invalid/')
     const p = url.pathname.replace(/^\/+/, '/')
     const method = (init?.method ?? 'GET').toUpperCase()
+    // M9 §2: the viewer's teams. A stranger (?mock=stranger) is on none, with one invitation.
+    if (p === '/api/teams' && method === 'GET') {
+      if (this.stranger) {
+        return json({ ...this.account, teams: [], admin: false, teams_created: 0, email: 'dana@example.com' } satisfies Teams)
+      }
+      return json(this.account)
+    }
+    if (p === '/api/admin/teams' && method === 'GET') return this.adminList(url)
+    if (method !== 'GET' && (p === '/api/teams' || p.startsWith('/api/teams/') || p.startsWith('/api/invitations/') || p.startsWith('/api/admin/teams/'))) {
+      let body: unknown = undefined
+      if (typeof init?.body === 'string' && init.body !== '') body = JSON.parse(init.body)
+      return this.accountChange(method, p, body)
+    }
     // A stranger gets nothing, the join details included (M6-SPEC §7 item 6: the hosted
     // console answers /api/join only to a member of its team).
     if (this.stranger) return json({ error: 'not_on_team', email: 'dana@example.com' }, 403)
+    // M9 §5: a call about one team names it; a team the viewer is not on gets no data.
+    const team = new Headers(init?.headers).get('X-Relay-Team') ?? 'demo'
+    if (!this.account.teams.some((t) => t.team === team)) return json({ error: 'not_on_team', team }, 403)
+    if (team !== 'demo') return this.quietTeam(team, method, p, init)
     // Answered by the console server itself, so it does not depend on the relay being reachable.
     if (p === '/api/join') return json(fixtureJoin)
     if (!this.reachable) return json({ error: 'relay_unreachable' }, 502)
@@ -741,7 +906,7 @@ export class MockRelay {
       return this.change(method, p, body)
     }
     if (p === '/api/roster') return json(this.roster())
-    if (p === '/api/me') return json(fixtureMe)
+    if (p === '/api/me') return json({ ...fixtureMe, name: 'Demo', role: this.role })
     if (p === '/api/directory') return json(this.directory())
     if (p === '/api/inbox/summary') return json(this.inboxSummary())
     if (p === '/api/activity') {

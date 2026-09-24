@@ -171,13 +171,15 @@ describe('mock roster (M6 §2, §4)', () => {
       ['alice', 'owner', true],
       ['bob', 'member', true],
       ['carol', 'member', true],
+      // M9 §7.2: an open invitation, which only owners see.
+      ['dana', 'member', true],
     ])
-    const added = owner.change('POST', '/api/roster', { member: 'dana', email: 'Dana@Example.com' })
+    const added = owner.change('POST', '/api/roster', { member: 'erin', email: 'Erin@Example.com' })
     expect(added.status).toBe(201)
-    expect(owner.roster().members.at(-1)).toMatchObject({ member: 'dana', emails: ['dana@example.com'] })
-    expect((await owner.change('POST', '/api/roster', { member: 'dana', email: 'x@example.com' }).json()).relay_status).toBe(409)
+    expect(owner.roster().members.at(-1)).toMatchObject({ member: 'erin', emails: ['erin@example.com'], status: 'invited' })
+    expect((await owner.change('POST', '/api/roster', { member: 'erin', email: 'x@example.com' }).json()).relay_status).toBe(409)
     expect((await owner.change('DELETE', '/api/roster/alice', undefined).json()).relay_error).toBe('last_owner')
-    expect(owner.change('DELETE', '/api/roster/dana', undefined).status).toBe(200)
+    expect(owner.change('DELETE', '/api/roster/erin', undefined).status).toBe(200)
 
     const member = relayAt('alice', 0)
     member.role = 'member'

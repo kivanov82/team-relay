@@ -1,8 +1,13 @@
 import { QueryClient, useMutation, useQuery, useQueryClient, type Query } from '@tanstack/react-query'
 
 import { ApiError, ChangeError, api } from '@/api/client'
-import type { ApprovalsSummary, Directory, InboxSummary, Join, Me, RequestDetail, Roster, RosterRole } from '@/api/types'
+import type { AdminTeamsPage, ApprovalsSummary, Directory, InboxSummary, Join, Me, RequestDetail, Roster, RosterRole, Teams } from '@/api/types'
 import { emptyActivity, pollActivity, PollError, type ActivityState } from '@/lib/activity'
+import { readTeams } from '@/lib/teams'
+import { useTeam } from './team'
+
+// Every query about one team is keyed by it (M9 §5), so switching teams reads the other team
+// afresh and never mixes two teams' data; the team comes from TeamContext.
 
 // Polling cadence (M2 §5): the feed every 3 s, incrementally from `next_since` (less the
 // overlap of M2 §7.1); the
@@ -70,12 +75,13 @@ function whileVisible<T>(name: string, ms: number) {
   }
 }
 
-export const activityKey = ['activity'] as const
+export const activityKey = (team: string | null) => ['activity', team] as const
 
 export function useMe() {
+  const team = useTeam()
   return useQuery<Me, ApiError>({
-    queryKey: ['me'],
-    queryFn: async () => (await api.me()).data,
+    queryKey: ['me', team],
+    queryFn: async () => (await api.me(team)).data,
     staleTime: Infinity,
     retry: (count, err) => err.kind !== 'unauthorized' && err.kind !== 'session_expired' && err.kind !== 'not_on_team' && count < 100,
     retryDelay: (count, err) => (err.kind === 'rate_limited' ? slowDelay(count + 1, err.retryAfterMs) : 3_000),
@@ -84,9 +90,10 @@ export function useMe() {
 
 /** The join panel's values (the console server's own configuration): read once. */
 export function useJoin() {
+  const team = useTeam()
   return useQuery<Join, ApiError>({
-    queryKey: ['join'],
-    queryFn: async () => (await api.join()).data,
+    queryKey: ['join', team],
+    queryFn: async () => (await api.join(team)).data,
     staleTime: Infinity,
     retry: (count, err) =>
       err.kind !== 'unauthorized' && err.kind !== 'session_expired' && err.kind !== 'not_found' && count < 5,
@@ -95,9 +102,10 @@ export function useJoin() {
 }
 
 export function useDirectory() {
+  const team = useTeam()
   return useQuery<Directory, ApiError>({
-    queryKey: ['directory'],
-    queryFn: () => tracked('directory', async () => (await api.directory()).data),
+    queryKey: ['directory', team],
+    queryFn: () => tracked('directory', async () => (await api.directory(team)).data),
     refetchInterval: whileVisible('directory', DIRECTORY_INTERVAL_MS),
   })
 }
@@ -107,9 +115,10 @@ export function useDirectory() {
  * console server or relay without the route (404) is not asked again.
  */
 export function useInboxSummary() {
+  const team = useTeam()
   return useQuery<InboxSummary, ApiError>({
-    queryKey: ['inbox-summary'],
-    queryFn: () => tracked('inbox-summary', async () => (await api.inboxSummary()).data),
+    queryKey: ['inbox-summary', team],
+    queryFn: () => tracked('inbox-summary', async () => (await api.inboxSummary(team)).data),
     refetchInterval: (query) => (query.state.error?.kind === 'not_found' ? false : whileVisible<InboxSummary>('inbox-summary', DIRECTORY_INTERVAL_MS)(query)),
   })
 }
@@ -128,13 +137,14 @@ export function useApprovalsSummary() {
 }
 
 export const ROSTER_INTERVAL_MS = 30_000
-export const rosterKey = ['roster'] as const
+export const rosterKey = (team: string | null) => ['roster', team] as const
 
 /** M6 §2: the team's roster, for the Members panel (owners see emails; members names and roles). */
 export function useRoster() {
+  const team = useTeam()
   return useQuery<Roster, ApiError>({
-    queryKey: rosterKey,
-    queryFn: () => tracked('roster', async () => (await api.roster()).data),
+    queryKey: rosterKey(team),
+    queryFn: () => tracked('roster', async () => (await api.roster(team)).data),
     refetchInterval: whileVisible('roster', ROSTER_INTERVAL_MS),
   })
 }
@@ -147,14 +157,92 @@ export type RosterChange =
 /** M6 §3: an owner's change, sent once; the roster and the directory are read again after it. */
 export function useRosterChange() {
   const qc = useQueryClient()
+  const team = useTeam()
   return useMutation<unknown, ChangeError, RosterChange>({
     mutationFn: (c) =>
-      c.kind === 'add' ? api.addMember(c.member, c.email) : c.kind === 'role' ? api.setRole(c.member, c.role) : api.removeMember(c.member),
+      c.kind === 'add'
+        ? api.addMember(c.member, c.email, team)
+        : c.kind === 'role'
+          ? api.setRole(c.member, c.role, team)
+          : api.removeMember(c.member, team),
     retry: false,
     onSettled: () => {
-      void qc.invalidateQueries({ queryKey: rosterKey })
-      void qc.invalidateQueries({ queryKey: ['directory'] })
-      void qc.invalidateQueries({ queryKey: ['me'] })
+      void qc.invalidateQueries({ queryKey: rosterKey(team) })
+      void qc.invalidateQueries({ queryKey: ['directory', team] })
+      void qc.invalidateQueries({ queryKey: ['me', team] })
+    },
+  })
+}
+
+// ---------------------------------------------------------------------------------------
+// The viewer's teams (M9 §2, §4, §5, §7).
+
+export const TEAMS_INTERVAL_MS = 60_000
+export const teamsKey = ['teams'] as const
+
+/**
+ * GET /api/teams, read on start and every minute (new invitations show up). A console
+ * server without it (404) serves one team: the console then names none.
+ */
+export function useTeams() {
+  return useQuery<Teams, ApiError>({
+    queryKey: teamsKey,
+    queryFn: () =>
+      tracked('teams', async () => {
+        const teams = readTeams((await api.teams()).data)
+        if (teams === null) throw new ApiError('failed', null, 'Not a teams answer')
+        return teams
+      }),
+    staleTime: 5_000,
+    // A failure shows the console's default team at once (with its own error states); the
+    // teams are read again on the next interval.
+    retry: false,
+    refetchInterval: (query) => (query.state.error?.kind === 'not_found' ? false : whileVisible<Teams>('teams', TEAMS_INTERVAL_MS)(query)),
+  })
+}
+
+export type TeamChange =
+  | { kind: 'create'; name: string; id?: string; owner_member_id: string }
+  | { kind: 'answer'; team: string; accept: boolean }
+  | { kind: 'delete'; team: string; confirm: string }
+
+/** M9: create a team, answer an invitation, or delete a team; the teams are read again after. */
+export function useTeamChange() {
+  const qc = useQueryClient()
+  return useMutation<unknown, ChangeError, TeamChange>({
+    mutationFn: (c) =>
+      c.kind === 'create'
+        ? api.createTeam({ name: c.name, owner_member_id: c.owner_member_id, ...(c.id ? { id: c.id } : {}) })
+        : c.kind === 'answer'
+          ? api.answerInvitation(c.team, c.accept)
+          : api.deleteTeam(c.team, c.confirm),
+    retry: false,
+    onSettled: () => {
+      void qc.invalidateQueries({ queryKey: teamsKey })
+      void qc.invalidateQueries({ queryKey: ['admin-teams'] })
+    },
+  })
+}
+
+/** M9 §4: one page of every team, for relay admins. */
+export function useAdminTeams(after: string | null) {
+  return useQuery<AdminTeamsPage, ApiError>({
+    queryKey: ['admin-teams', after],
+    queryFn: async () => (await api.adminTeams(after)).data,
+    retry: (count, err) => err.kind !== 'unauthorized' && err.kind !== 'session_expired' && err.kind !== 'not_found' && count < 2,
+    retryDelay: 2_000,
+  })
+}
+
+/** M9 §4: an admin deletes a team (its id typed again). */
+export function useAdminDelete() {
+  const qc = useQueryClient()
+  return useMutation<unknown, ChangeError, { team: string; confirm: string }>({
+    mutationFn: (c) => api.adminDeleteTeam(c.team, c.confirm),
+    retry: false,
+    onSettled: () => {
+      void qc.invalidateQueries({ queryKey: ['admin-teams'] })
+      void qc.invalidateQueries({ queryKey: teamsKey })
     },
   })
 }
@@ -169,21 +257,23 @@ export function resetFeedHealth(): void {
 
 export function useActivity() {
   const qc = useQueryClient()
+  const team = useTeam()
+  const key = activityKey(team)
   return useQuery<ActivityState, ApiError>({
-    queryKey: activityKey,
+    queryKey: key,
     queryFn: () =>
       tracked('activity', async () => {
-        const prev = qc.getQueryData<ActivityState>(activityKey) ?? emptyActivity()
+        const prev = qc.getQueryData<ActivityState>(key) ?? emptyActivity()
         let state: ActivityState
         try {
-          state = await pollActivity(prev, (since) => api.activity(since, ACTIVITY_PAGE), {
+          state = await pollActivity(prev, (since) => api.activity(since, ACTIVITY_PAGE, team), {
             pageSize: ACTIVITY_PAGE,
             maxPages: MAX_PAGES_PER_POLL,
           })
         } catch (e) {
           const err = e instanceof PollError ? e.cause : e
           // Keep the pages that did arrive; the next poll resumes after them.
-          if (e instanceof PollError && e.partial !== null) qc.setQueryData(activityKey, e.partial)
+          if (e instanceof PollError && e.partial !== null) qc.setQueryData(key, e.partial)
           if (!(err instanceof ApiError && err.kind === 'rate_limited')) failingSince ??= Date.now()
           throw err
         }
@@ -197,9 +287,10 @@ export function useActivity() {
 
 /** The side surface (M1 §3.11), for participants only; polled while the request is open. */
 export function useRequestDetail(id: string | null, enabled: boolean, live: boolean) {
+  const team = useTeam()
   return useQuery<RequestDetail, ApiError>({
-    queryKey: ['request', id],
-    queryFn: () => tracked('request', async () => (await api.request(id ?? '')).data),
+    queryKey: ['request', team, id],
+    queryFn: () => tracked('request', async () => (await api.request(id ?? '', team)).data),
     enabled: enabled && id !== null,
     refetchInterval: live ? whileVisible('request', ACTIVITY_INTERVAL_MS) : false,
   })

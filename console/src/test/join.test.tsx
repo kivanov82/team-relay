@@ -159,7 +159,7 @@ describe('join panel: the steps (M5 §1)', () => {
     expect(steps()).toHaveTextContent('/zeta-relay:console')
     expect(steps()).toHaveTextContent('No questions to answer.')
     expect(steps()).toHaveTextContent('Claude Code 2.1.280 or newer and Node.js 22 or newer')
-    await waitFor(() => expect(steps()).toHaveTextContent(/Sign in with Google as dana@team\.example, pick the team, and you are connected/))
+    await waitFor(() => expect(steps()).toHaveTextContent(/Sign in with Google as dana@team\.example, accept the invitation, pick the team, and you are connected/))
     // No gcloud, no clone, no install questions, no environment to export.
     expect(steps()).not.toHaveTextContent(/gcloud|git clone|RELAY_URL|RELAY_TEAM|relay_auth|export /)
     // Nothing from the demo leaks in.
@@ -204,7 +204,7 @@ describe('join panel: the steps (M5 §1)', () => {
     server({ me: noEmail })
     renderWithClient(<JoinPanel />)
     await screen.findByText('Install the plugin')
-    await waitFor(() => expect(steps()).toHaveTextContent(/Sign in with Google with the account the owner added/))
+    await waitFor(() => expect(steps()).toHaveTextContent(/Sign in with Google with the account the owner invited, accept the invitation, pick the team/))
   })
 
   it('asks the owner where to add the plugin from when there is no marketplace source', async () => {
@@ -230,7 +230,7 @@ describe('join panel: the steps (M5 §1)', () => {
     renderWithClient(<JoinPanel owner />)
     await screen.findByText('Install the plugin')
     const hint = document.querySelector('[data-invite-hint]') as HTMLElement
-    expect(hint).toHaveTextContent('Add their Google email here, then send them the install steps.')
+    expect(hint).toHaveTextContent('Invite their Google email here, then send them the install steps.')
     expect(within(hint).getByRole('button', { name: 'here' })).toBeInTheDocument()
   })
 

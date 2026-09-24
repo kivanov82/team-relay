@@ -1,10 +1,25 @@
 import { consoleKey, isHosted } from './key'
-import type { ActivityPage, ApprovalsSummary, Directory, InboxSummary, Join, Me, RequestDetail, Roster, RosterRole } from './types'
+import type {
+  ActivityPage,
+  AdminTeamsPage,
+  ApprovalsSummary,
+  Directory,
+  InboxSummary,
+  Join,
+  Me,
+  RequestDetail,
+  Roster,
+  RosterRole,
+  Teams,
+} from './types'
 
 // Every call goes to the console server's proxy: locally (M2 §4.4) with the key in
-// X-Console-Key; hosted behind IAP (M3 §4) without a key, with the IAP session cookie. The only
-// writes are an owner's roster changes (M6 §3): a same-origin JSON POST, PATCH or DELETE,
-// which the browser marks Sec-Fetch-Site: same-origin. Nothing can be sent, acked or replied.
+// X-Console-Key; hosted behind IAP (M3 §4) without a key, with the IAP session cookie. A call
+// about one team names it in X-Relay-Team (M9 §5), and the console server checks the viewer is
+// on it. The only writes are an owner's roster changes (M6 §3) and the account's own (M9:
+// create a team, answer an invitation, delete a team, an admin's delete): a same-origin JSON
+// POST, PATCH or DELETE, which the browser marks Sec-Fetch-Site: same-origin. Nothing can be
+// sent, acked or replied.
 
 export type Transport = (path: string, init: RequestInit) => Promise<Response>
 
@@ -100,7 +115,14 @@ function isJson(res: Response): boolean {
   return /^application\/json\b/i.test(res.headers.get('Content-Type') ?? '')
 }
 
-export async function getJson<T>(path: string): Promise<Timed<T>> {
+/** A team id as the relay shapes them; anything else is never sent. */
+export const TEAM_ID_RE = /^[a-z][a-z0-9_-]{1,31}$/
+
+function teamHeader(headers: Record<string, string>, team: string | null | undefined): void {
+  if (team !== null && team !== undefined && TEAM_ID_RE.test(team)) headers['X-Relay-Team'] = team
+}
+
+export async function getJson<T>(path: string, team?: string | null): Promise<Timed<T>> {
   const key = consoleKey()
   const keyless = key === null
   if (keyless && !isHosted()) {
@@ -108,6 +130,7 @@ export async function getJson<T>(path: string): Promise<Timed<T>> {
   }
   const headers: Record<string, string> = { Accept: 'application/json' }
   if (!keyless) headers['X-Console-Key'] = key
+  teamHeader(headers, team)
   const started = performance.now()
   let res: Response
   try {
@@ -198,18 +221,37 @@ async function relayRateLimited(res: Response): Promise<boolean> {
 // ---------------------------------------------------------------------------------------
 // Roster changes (M6 §3, §4): the owner's only writes.
 
-/** Why a roster change did not happen, in words for the Members panel. */
+/** Why a change did not happen, in words for the panel or dialog it was made in. */
 export class ChangeError extends Error {
   readonly status: number | null
   readonly relayStatus: number | null
+  /** The relay's error code (team_limit, team_id_unavailable, ...), when it refused. */
+  readonly relayError: string | null
+  /** The relay's own detail, when it is plain short text. */
+  readonly detail: string | null
   /** The session is gone (local key refused, or the IAP sign-in lapsed): reload. */
   readonly signedOut: boolean
-  constructor(message: string, opts: { status?: number | null; relayStatus?: number | null; signedOut?: boolean } = {}) {
+  /** The console server says the viewer is not on that team (any more). */
+  readonly notOnTeam: boolean
+  constructor(
+    message: string,
+    opts: {
+      status?: number | null
+      relayStatus?: number | null
+      relayError?: string | null
+      detail?: string | null
+      signedOut?: boolean
+      notOnTeam?: boolean
+    } = {},
+  ) {
     super(message)
     this.name = 'ChangeError'
     this.status = opts.status ?? null
     this.relayStatus = opts.relayStatus ?? null
+    this.relayError = opts.relayError ?? null
+    this.detail = opts.detail ?? null
     this.signedOut = opts.signedOut ?? false
+    this.notOnTeam = opts.notOnTeam ?? false
   }
 }
 
@@ -232,7 +274,7 @@ async function changeError(res: Response): Promise<ChangeError> {
     }
   }
   if (res.status === 403 && body.error === 'not_on_team') {
-    return new ChangeError('This Google account is not on the team.', { status: 403 })
+    return new ChangeError('This Google account is not on the team.', { status: 403, notOnTeam: true })
   }
   // A refused key (local), or IAP's refusal, which is not the console server's JSON (hosted).
   if (res.status === 401 || (res.status === 403 && (!isJson(res) || body.detail === 'wrong console key'))) {
@@ -259,18 +301,20 @@ async function changeError(res: Response): Promise<ChangeError> {
               : rs === 401
                 ? 'The relay refused your sign-in. Run /team-relay:login again.'
                 : (detail ?? `The relay refused that change (${rs ?? 'error'}).`)
-    return new ChangeError(message, { status: 502, relayStatus: rs })
+    const code = typeof body.relay_error === 'string' && /^[a-z_]{1,40}$/.test(body.relay_error) ? body.relay_error : null
+    return new ChangeError(message, { status: 502, relayStatus: rs, relayError: code, detail })
   }
   if (res.status >= 500) return new ChangeError('The relay did not answer. Try again.', { status: res.status })
   return new ChangeError(`The change failed (${res.status}).`, { status: res.status })
 }
 
-/** A roster change: JSON, same origin, no redirects followed. Resolves with the relay's answer. */
-export async function sendChange<T>(method: 'POST' | 'PATCH' | 'DELETE', path: string, body?: unknown): Promise<T> {
+/** A change: JSON, same origin, no redirects followed. Resolves with the relay's answer. */
+export async function sendChange<T>(method: 'POST' | 'PATCH' | 'DELETE', path: string, body?: unknown, team?: string | null): Promise<T> {
   const key = consoleKey()
   if (key === null && !isHosted()) throw new ChangeError('No console key.', { signedOut: true })
   const headers: Record<string, string> = { Accept: 'application/json', 'Content-Type': 'application/json' }
   if (key !== null) headers['X-Console-Key'] = key
+  teamHeader(headers, team)
   let res: Response
   try {
     res = await transport(path, {
@@ -297,25 +341,42 @@ export async function sendChange<T>(method: 'POST' | 'PATCH' | 'DELETE', path: s
   }
 }
 
+const seg = (v: string) => encodeURIComponent(v)
+
 export const api = {
-  me: () => getJson<Me>('api/me'),
-  directory: () => getJson<Directory>('api/directory'),
-  join: () => getJson<Join>('api/join'),
-  roster: () => getJson<Roster>('api/roster'),
-  inboxSummary: () => getJson<InboxSummary>('api/inbox/summary'),
+  /** M9 §2: the viewer's teams (not about one team). */
+  teams: () => getJson<Teams>('api/teams'),
+  me: (team?: string | null) => getJson<Me>('api/me', team),
+  directory: (team?: string | null) => getJson<Directory>('api/directory', team),
+  join: (team?: string | null) => getJson<Join>('api/join', team),
+  roster: (team?: string | null) => getJson<Roster>('api/roster', team),
+  inboxSummary: (team?: string | null) => getJson<InboxSummary>('api/inbox/summary', team),
   approvalsSummary: () => getJson<ApprovalsSummary>('api/approvals/summary'),
-  addMember: (member: string, email: string) => sendChange<unknown>('POST', 'api/roster', { member, email }),
-  setRole: (member: string, role: RosterRole) => sendChange<unknown>('PATCH', `api/roster/${encodeURIComponent(member)}`, { role }),
-  removeMember: (member: string) => sendChange<unknown>('DELETE', `api/roster/${encodeURIComponent(member)}`),
-  activity: (since: string | null, limit = 200) => {
+  addMember: (member: string, email: string, team?: string | null) => sendChange<unknown>('POST', 'api/roster', { member, email }, team),
+  setRole: (member: string, role: RosterRole, team?: string | null) => sendChange<unknown>('PATCH', `api/roster/${seg(member)}`, { role }, team),
+  removeMember: (member: string, team?: string | null) => sendChange<unknown>('DELETE', `api/roster/${seg(member)}`, undefined, team),
+  /** M9 §2: create a team; the viewer becomes its first owner. */
+  createTeam: (body: { name: string; id?: string; owner_member_id: string }) => sendChange<{ team: string }>('POST', 'api/teams', body),
+  /** M9 §7.2: accept or decline an invitation. */
+  answerInvitation: (team: string, accept: boolean) => sendChange<unknown>('POST', `api/invitations/${seg(team)}`, { accept }),
+  /** M9 §7.7: an owner deletes the team; `confirm` is the id typed again. */
+  deleteTeam: (team: string, confirm: string) => sendChange<unknown>('DELETE', `api/teams/${seg(team)}`, { confirm }),
+  /** M9 §4: relay admins. */
+  adminTeams: (after: string | null, limit = 50) => {
+    const q = new URLSearchParams({ limit: String(limit) })
+    if (after !== null) q.set('after', after)
+    return getJson<AdminTeamsPage>(`api/admin/teams?${q.toString()}`)
+  },
+  adminDeleteTeam: (team: string, confirm: string) => sendChange<unknown>('DELETE', `api/admin/teams/${seg(team)}`, { confirm }),
+  activity: (since: string | null, limit = 200, team?: string | null) => {
     const q = new URLSearchParams({ limit: String(limit) })
     if (since !== null) q.set('since', since)
-    return getJson<ActivityPage>(`api/activity?${q.toString()}`)
+    return getJson<ActivityPage>(`api/activity?${q.toString()}`, team)
   },
-  request: (id: string) => {
+  request: (id: string, team?: string | null) => {
     if (!/^rq_[0-9a-f]{32}$/.test(id)) {
       return Promise.reject(new ApiError('not_found', null, 'Not a request id'))
     }
-    return getJson<RequestDetail>(`api/requests/${id}`)
+    return getJson<RequestDetail>(`api/requests/${id}`, team)
   },
 }

@@ -3,12 +3,14 @@ import { Monitor, Moon, Sun } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import { useApprovalsSummary, useConnection, useInboxSummary, useMe } from '@/hooks/queries'
+import { useNav } from '@/hooks/team'
 import { useNow } from '@/hooks/use-now'
 import { useTheme, type ThemeChoice } from '@/hooks/use-theme'
 import { formatAgo, formatClock } from '@/lib/time'
 import { approvalsLine, waitingLine } from '@/lib/waiting'
 import { cn } from '@/lib/utils'
 import { Avatar, RelayMark, StatusPill } from './primitives'
+import { TeamSwitcher } from './teams'
 
 const THEME_LABEL: Record<ThemeChoice, string> = {
   system: 'Theme follows the system',
@@ -149,16 +151,62 @@ function ApprovalsWaiting() {
   )
 }
 
+function Brand() {
+  return (
+    <div className="flex items-center gap-2">
+      <RelayMark />
+      <span className="text-[13.5px] font-semibold tracking-[-0.01em]">Team relay</span>
+    </div>
+  )
+}
+
+const HEADER_CLASS = 'sticky top-0 z-30 border-b bg-canvas/90 backdrop-blur-md supports-[backdrop-filter]:bg-canvas/75'
+
 export function Header() {
+  const nav = useNav()
+  if (nav.view === 'admin') {
+    // M9 §4: the admin page is about no one team: the switcher leads back to one.
+    return (
+      <header className={HEADER_CLASS}>
+        <div className="mx-auto flex h-12 max-w-[1440px] items-center gap-3 px-4 sm:px-6">
+          <Brand />
+          <span aria-hidden className="h-4 w-px bg-border" />
+          <TeamSwitcher />
+          <span className="rounded bg-muted px-1.5 py-0.5 text-[11px] font-medium text-subtle">Admin</span>
+          <div className="ml-auto flex items-center gap-2 sm:gap-3">
+            <ThemeButton />
+          </div>
+        </div>
+      </header>
+    )
+  }
+  return <TeamHeader multi={nav.teams !== null} />
+}
+
+function TeamHeader({ multi }: { multi: boolean }) {
   const me = useMe()
   return (
-    <header className="sticky top-0 z-30 border-b bg-canvas/90 backdrop-blur-md supports-[backdrop-filter]:bg-canvas/75">
+    <header className={HEADER_CLASS}>
       <div className="mx-auto flex h-12 max-w-[1440px] items-center gap-3 px-4 sm:px-6">
-        <div className="flex items-center gap-2">
-          <RelayMark />
-          <span className="text-[13.5px] font-semibold tracking-[-0.01em]">Team relay</span>
-        </div>
-        {me.data ? (
+        <Brand />
+        {multi ? (
+          <div className="flex min-w-0 items-center gap-3 text-[12.5px]">
+            <span aria-hidden className="h-4 w-px bg-border" />
+            <TeamSwitcher />
+            {me.data ? (
+              <>
+                <span aria-hidden className="hidden h-4 w-px bg-border sm:block" />
+                <span className="hidden items-center gap-1.5 sm:inline-flex">
+                  <Avatar member={me.data.member} you size="sm" />
+                  <span className="font-medium">{me.data.member}</span>
+                  <span className="text-subtle">(you)</span>
+                </span>
+                <InboxWaiting />
+                <ApprovalsWaiting />
+              </>
+            ) : null}
+          </div>
+        ) : me.data ? (
           <div className="flex min-w-0 items-center gap-3 text-[12.5px]">
             <span aria-hidden className="h-4 w-px bg-border" />
             <span className="truncate">

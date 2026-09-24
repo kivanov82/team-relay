@@ -1,19 +1,24 @@
-import { useMemo, useState } from 'react'
+import { useQueryClient } from '@tanstack/react-query'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 
 import { Activity } from '@/components/console/activity'
+import { AdminPage } from '@/components/console/admin'
 import { Agents } from '@/components/console/agents'
 import { Header } from '@/components/console/header'
 import { JoinPanel } from '@/components/console/join'
 import { Members } from '@/components/console/members'
 import { RequestSheet } from '@/components/console/request-sheet'
-import { Expired, MissingKey, NotOnTeam, SessionExpired, UnreachableBanner } from '@/components/console/states'
+import { Expired, Loading, MissingKey, NotOnTeam, SessionExpired, UnreachableBanner } from '@/components/console/states'
 import { mapMembers, TeamMap } from '@/components/console/team-map'
+import { CreateTeamDialog, NoTeamPage, TeamSettings } from '@/components/console/teams'
 import { consoleKey, isHosted } from '@/api/key'
-import { useActivity, useConnection, useDirectory, useMe, useRoster } from '@/hooks/queries'
+import { teamsKey, useActivity, useConnection, useDirectory, useMe, useRoster, useTeams } from '@/hooks/queries'
+import { NavContext, TeamContext, useNav, type ConsoleView, type Nav } from '@/hooks/team'
 import { useNow } from '@/hooks/use-now'
 import { sortedRequests } from '@/lib/activity'
 import { isOwner } from '@/lib/roster'
 import { effectiveRequest } from '@/lib/steps'
+import { pickTeam, rememberTeam } from '@/lib/teams'
 
 export function Console() {
   const me = useMe()
@@ -21,6 +26,8 @@ export function Console() {
   const activity = useActivity()
   const conn = useConnection()
   const roster = useRoster()
+  const nav = useNav()
+  const qc = useQueryClient()
   const localNow = useNow()
   const [openId, setOpenId] = useState<string | null>(null)
 
@@ -38,10 +45,16 @@ export function Console() {
   const owner = roster.data ? isOwner(roster.data, member) : me.data?.role === 'owner'
   // An older relay without a roster (404): no Members panel at all.
   const rosterMissing = roster.error?.kind === 'not_found'
+  // M9 §7.7: an owner's settings for a team the viewer holds (the relay refuses a file team).
+  const entry = nav.teams?.teams.find((t) => t.team === nav.team) ?? null
 
-  // M6 §4 (hosted): a signed-in account the relay does not know sees this, and no data.
+  // M6 §4 (hosted): a signed-in account the relay does not know sees this, and no data. With
+  // several teams (M9 §5) it means this team is no longer theirs: their teams are read again.
   const stranger = [me.error, directory.error, activity.error, roster.error].find((e) => e?.kind === 'not_on_team')
-  if (stranger) return <NotOnTeam email={stranger.email} />
+  useEffect(() => {
+    if (stranger && nav.teams) void qc.invalidateQueries({ queryKey: teamsKey })
+  }, [stranger, nav.teams, qc])
+  if (stranger) return nav.teams ? <NoTeamPage teams={nav.teams} lost={nav.team} /> : <NotOnTeam email={stranger.email} />
   if (conn.state === 'session_expired' || me.error?.kind === 'session_expired') return <SessionExpired />
   if (conn.state === 'unauthorized' || me.error?.kind === 'unauthorized') return <Expired />
 
@@ -64,14 +77,101 @@ export function Console() {
           <Members roster={roster.data} loading={roster.isPending} failed={roster.isError} me={member} owner={owner} />
         )}
         <Activity requests={requests} me={member} now={now} loading={activity.isPending} onOpen={setOpenId} />
+        {entry && entry.role === 'owner' && owner ? <TeamSettings entry={entry} /> : null}
       </main>
       <RequestSheet req={selected} me={member} now={now} onClose={() => setOpenId(null)} />
     </div>
   )
 }
 
+/** The view from the address: /admin is the admin page (M9 §4), anything else the team. */
+function viewFromLocation(): ConsoleView {
+  return /\/admin\/?$/.test(window.location.pathname) ? 'admin' : 'team'
+}
+
+function useView(): [ConsoleView, (v: ConsoleView) => void] {
+  const [view, setViewState] = useState<ConsoleView>(viewFromLocation)
+  useEffect(() => {
+    const onPop = () => setViewState(viewFromLocation())
+    window.addEventListener('popstate', onPop)
+    return () => window.removeEventListener('popstate', onPop)
+  }, [])
+  const setView = useCallback((v: ConsoleView) => {
+    setViewState(v)
+    if (viewFromLocation() === v) return
+    try {
+      const target = new URL(v === 'admin' ? 'admin' : './', window.location.href)
+      target.search = window.location.search
+      target.hash = ''
+      window.history.pushState(window.history.state, '', target.pathname + target.search)
+    } catch {
+      // A sandboxed document may refuse; the view still changes.
+    }
+  }, [])
+  return [view, setView]
+}
+
+/**
+ * The console with the viewer's teams (M9 §5): which team is shown (the one chosen, else the
+ * last one chosen in this browser, else the console's default, else the first), the admin
+ * page for relay admins, and the page for a viewer on no team. A console server without
+ * /api/teams serves one team: the console then names none, as before.
+ */
+function Teams() {
+  const teams = useTeams()
+  const [chosen, setChosen] = useState<string | null>(null)
+  const [view, setView] = useView()
+  const [creating, setCreating] = useState(false)
+
+  const data = teams.data
+  const team = data ? pickTeam(data, chosen) : null
+  const selectTeam = useCallback(
+    (t: string) => {
+      setChosen(t)
+      rememberTeam(t)
+      setView('team')
+    },
+    [setView],
+  )
+  const nav = useMemo<Nav>(
+    () => ({ teams: data ?? null, team, selectTeam, view, setView, openCreate: () => setCreating(true) }),
+    [data, team, selectTeam, view, setView],
+  )
+
+  if (teams.isPending) return <Loading />
+  if (!data) {
+    if (teams.error?.kind === 'session_expired') return <SessionExpired />
+    if (teams.error?.kind === 'unauthorized') return <Expired />
+  }
+
+  let body
+  if (data && view === 'admin' && data.admin) {
+    body = (
+      <div className="min-h-dvh">
+        <Header />
+        <AdminPage />
+      </div>
+    )
+  } else if (data && team === null) {
+    body = <NoTeamPage teams={data} />
+  } else {
+    // A team's view starts fresh: nothing of another team's stays on screen.
+    body = (
+      <TeamContext.Provider value={team}>
+        <Console key={team ?? ''} />
+      </TeamContext.Provider>
+    )
+  }
+  return (
+    <NavContext.Provider value={nav}>
+      {body}
+      {data?.can_manage_teams ? <CreateTeamDialog open={creating} onOpenChange={setCreating} /> : null}
+    </NavContext.Provider>
+  )
+}
+
 export function App() {
   // Hosted behind IAP (M3 §4) no key is needed; locally the link's key is.
   if (consoleKey() === null && !isHosted()) return <MissingKey />
-  return <Console />
+  return <Teams />
 }
